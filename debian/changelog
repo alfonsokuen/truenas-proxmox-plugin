@@ -38,8 +38,25 @@ truenas-proxmox-plugin (2.1.24~alpha1+idk1) unstable; urgency=medium
     nothing else - no new method, no changed signature - so the higher number
     would assert a validation nobody performed.
 
-  * t/nvme/02-host-whitelist.t: 27 offline tests for the above. Eleven of them
-    fail against the code as it stood before these changes.
+  * NVMe-oF: tell a target that refused us apart from a portal that is down.
+    Measured against a live nvmet target: a host missing from the subsystem's
+    allowed list, and an NQN the target does not have, both fail the fabrics
+    write with EIO in about 10ms, while a blackholed portal and an unreachable
+    address both time out after about 3s. Reported as an ordinary connect
+    failure, a locked-out node was indistinguishable from a dead fabric, and it
+    also invalidated the portal-sync cache - putting the plugin to work
+    rebuilding ports over an access list.
+
+  * NVMe-oF: a node the target refuses now recovers on its own. status() calls
+    _nvme_connect and never _nvme_ensure_subsystem, and registering this node's
+    host NQN is something only _ensure does, so a node that was not authorized
+    when the whitelist went on stayed out until someone started a VM on it.
+    Repair mode now registers the node once on a refusal and re-reads the
+    kernel's view.
+
+  * t/nvme/02-host-whitelist.t: 27 offline tests for the whitelist. Eleven of
+    them fail against the code as it stood before these changes. t/nvme/01
+    grows 8 more for the refusal classification.
 
  -- Alfonso Kuen <alfonsok@gmail.com>  Sun, 16 Aug 2026 23:55:00 +0000
 

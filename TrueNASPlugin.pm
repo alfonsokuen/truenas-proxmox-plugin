@@ -3298,6 +3298,24 @@ sub _nvme_allow_any_host {
     return $scfg->{tn_nvme_allow_any_host} ? 1 : 0;
 }
 
+# Did the target answer and refuse us, rather than being unreachable? Measured
+# against a live nvmet target, one 'nvme connect' per case:
+#
+#   host not in allowed_hosts   -> "Input/output error"    in 0.01s
+#   subsystem NQN not on target -> "Input/output error"    in 0.01s
+#   portal blackholed           -> "Connection timed out"  in 3.10s
+#   address unreachable         -> "Connection timed out"  in 3.07s
+#
+# The split is clean and it matters: a timeout is a fabric problem that retrying
+# may fix, while EIO means the portal is fine and the target rejected the
+# association. Retrying that on a timer changes nothing - it needs this node's
+# host NQN registered on the subsystem, or the right NQN configured.
+sub _nvme_connect_was_refused {
+    my ($stderr) = @_;
+    return 0 if !defined $stderr;
+    return $stderr =~ m{Input/output error|Connect Invalid Host|invalid host|not authoriz}i ? 1 : 0;
+}
+
 # Does this error mean "the row is already there"? It matters because
 # _api_call_mutate retries a mutation whose reply was lost, so a create that
 # already succeeded is re-sent as a matter of course. Matching only
@@ -4053,6 +4071,7 @@ sub _nvme_connect {
     my $dhchap_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_secret}, 'NVMe DH-HMAC secret');
     my $dhchap_ctrl_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_ctrl_secret}, 'NVMe controller DH-HMAC secret');
     my $connected_count = 0;
+    my $refused_count   = 0;
 
     for my $portal (@connect_list) {
         my ($host, $port) = _nvme_parse_portal($portal);
@@ -4128,6 +4147,23 @@ sub _nvme_connect {
                 # Controller exists but may be reconnecting — treat as success
                 _log($scfg, 1, 'info', "[TrueNAS] nvme_connect: portal $portal already connected (controller may be recovering)");
                 $connected_count++;
+            } elsif (_nvme_connect_was_refused($connect_stderr)) {
+                # The portal is reachable and the target said no. Reported at a
+                # level that survives the default tn_debug of 0, and named for
+                # what it is: reported as a generic connect failure this is
+                # indistinguishable from a dead portal, and the operator goes
+                # looking at the fabric while the cause is an access list.
+                $refused_count++;
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] nvme_connect: portal $portal refused the connection - the target "
+                    . "is reachable but rejected it. Either this node's host NQN is not "
+                    . "authorized on subsystem $nqn, or that subsystem is not present on the "
+                    . "target. Check tn_subsystem_nqn and the subsystem's allowed hosts.");
+                # Deliberately NOT invalidating the portal sync cache here: the
+                # ports are fine, and rebuilding them on every rejected connect
+                # is work that cannot help.
+                $_nvme_portal_backoff{"$hostkey|$portal"} = time();
+                next;
             } else {
                 my $detail = $connect_stderr ? " (stderr: $connect_stderr)" : '';
                 _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: failed to connect to portal $portal: $@$detail");
@@ -4140,6 +4176,27 @@ sub _nvme_connect {
             }
         }
         delete $_nvme_portal_backoff{"$hostkey|$portal"};
+    }
+
+    # A node the target refuses never recovers on its own: status() calls this
+    # function and never _nvme_ensure_subsystem, and registering this node's host
+    # NQN is something only _ensure does. So a node that was not authorized when
+    # the whitelist went on stays out until someone starts a VM on it or
+    # intervenes by hand. Repair mode is where API work belongs, so that is where
+    # it heals itself - once per call, then re-reading what the kernel holds.
+    if ($repair && $refused_count && !_nvme_allow_any_host($scfg)) {
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] nvme_connect: $refused_count portal(s) refused; registering this node "
+            . "on subsystem $nqn and retrying on the next poll");
+        if (eval { _nvme_ensure_subsystem($scfg); 1 }) {
+            # Clear the backoff so the next poll retries immediately rather than
+            # sitting out the window on portals that may now be authorized.
+            delete $_nvme_portal_backoff{"$hostkey|$_"} for @connect_list;
+            $ctrl = _nvme_controller_portals($scfg);
+        } else {
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] nvme_connect: could not register this node on subsystem $nqn: $@");
+        }
     }
 
     die "Failed to connect to any NVMe/TCP portal for subsystem $nqn\n"

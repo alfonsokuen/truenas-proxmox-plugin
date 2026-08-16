@@ -28,7 +28,8 @@ my $PKG  = 'PVE::Storage::Custom::TrueNASPlugin';
 my $OURS = 'nqn.2011-06.com.truenas:uuid:1111-2222:pve';
 
 my @RAN;
-my %CONNECT_FAILS;   # "host:port" => 1  -> nvme connect dies for that portal
+my %CONNECT_FAILS;   # "host:port" => 1  -> nvme connect dies, portal unreachable
+my %CONNECT_REFUSED; # "host:port" => 1  -> nvme connect dies, target refused us
 my $DNS_DOWN = 0;    # when true, every hostname lookup fails
 {
     no strict 'refs';
@@ -38,8 +39,15 @@ my $DNS_DOWN = 0;    # when true, every hostname lookup fails
         push @RAN, join(' ', @$cmd);
         if ($cmd->[0] eq 'nvme' && ($cmd->[1] // '') eq 'connect') {
             my %a = @{$cmd}[2 .. $#$cmd];
+            # The exact strings nvme-cli prints, measured against a live target.
+            if ($CONNECT_REFUSED{"$a{-a}:$a{-s}"}) {
+                $opts{errfunc}->("Failed to write to /dev/nvme-fabrics: Input/output error\n")
+                    if $opts{errfunc};
+                die "command 'nvme connect' failed: exit code 1\n";
+            }
             if ($CONNECT_FAILS{"$a{-a}:$a{-s}"}) {
-                $opts{errfunc}->('connect failed') if $opts{errfunc};
+                $opts{errfunc}->("Failed to write to /dev/nvme-fabrics: Connection timed out\n")
+                    if $opts{errfunc};
                 die "command 'nvme connect' failed: exit code 1\n";
             }
         }
@@ -537,6 +545,68 @@ sysfs(ctrl($LOGNQN, "traddr=192.0.2.10,trsvcid=4420,src_addr=192.0.2.10", "live"
     eval { $connect->($s) };
     is(scalar(grep { $_ == 0 } @warned), 1,
         "a portal that is genuinely missing still warns, visibly");
+}
+
+# ---------------------------------------------------------------------------
+# A target that refuses is not a portal that is down
+# ---------------------------------------------------------------------------
+
+# Measured against a live nvmet target, one connect per case: a host missing
+# from the subsystem's allowed list, and a subsystem NQN the target does not
+# have, both fail the fabrics write with EIO in about 10ms. A blackholed portal
+# and an unreachable address both time out after about 3s. The two are
+# distinguishable, and they call for opposite responses - one needs this node
+# registered on the subsystem, the other needs the fabric back.
+{
+    my $refused = $PKG->can('_nvme_connect_was_refused');
+    ok($refused->("Failed to write to /dev/nvme-fabrics: Input/output error\n"),
+        'the EIO a target returns when it refuses the association is recognised');
+    ok(!$refused->("Failed to write to /dev/nvme-fabrics: Connection timed out\n"),
+        'a timeout is not mistaken for a refusal');
+    ok(!$refused->(''),    'empty stderr is not a refusal');
+    ok(!$refused->(undef), 'and neither is undef');
+}
+
+# What the operator reads is the whole point: reported as an ordinary connect
+# failure, a host locked out of the subsystem is indistinguishable from a dead
+# fabric, and the search starts in the wrong place.
+sysfs(ctrl($OURS, 'traddr=192.0.2.10,trsvcid=4420,src_addr=192.0.2.10', 'live'));
+{
+    my @msgs;
+    no strict 'refs';
+    no warnings 'redefine';
+    local *{"${PKG}::_log"} = sub {
+        my (undef, $lvl, undef, $msg) = @_;
+        push @msgs, [$lvl, $msg];
+        1;
+    };
+
+    my $s = scfg();
+    $s->{tn_subsystem_nqn} = $OURS;
+
+    # repair mode: the hot path deliberately does not connect a missing portal
+    # while another is live, so it never reaches the failure being classified.
+    # A distinct address per case, because backoff is keyed per portal and the
+    # earlier scenarios have already marked the shared ones.
+    $s->{tn_portals} = '203.0.113.11:4420';
+    @msgs = ();
+    $CONNECT_REFUSED{'203.0.113.11:4420'} = 1;
+    eval { $connect->($s, repair => 1) };
+    ok(scalar(grep { $_->[0] == 0 && $_->[1] =~ /refused the connection/ } @msgs),
+        'a refusal says the target refused, at a level that survives tn_debug 0');
+    ok(!scalar(grep { $_->[1] =~ /failed to connect to portal/ } @msgs),
+        '...and is not also reported as an ordinary connect failure');
+    %CONNECT_REFUSED = ();
+
+    $s->{tn_portals} = '203.0.113.12:4420';
+    @msgs = ();
+    $CONNECT_FAILS{'203.0.113.12:4420'} = 1;
+    eval { $connect->($s, repair => 1) };
+    ok(scalar(grep { $_->[1] =~ /failed to connect to portal/ } @msgs),
+        'an unreachable portal is still reported as a connect failure');
+    ok(!scalar(grep { $_->[1] =~ /refused the connection/ } @msgs),
+        '...and is never called a refusal');
+    %CONNECT_FAILS = ();
 }
 
 done_testing();
