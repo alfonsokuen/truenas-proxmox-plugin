@@ -1,3 +1,48 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk1) unstable; urgency=medium
+
+  * Internal build: alpha + upstream PR #83 (NVMe-oF host whitelist and
+    DH-HMAC-CHAP) + the portal reconciliation work. Not an upstream offer.
+
+  * NVMe-oF whitelist: close the subsystem before authorizing the host, not
+    after. The target holds allow_any_host and an explicit host list as
+    mutually exclusive - linking a host into a subsystem that is still open is
+    refused with EINVAL, and so is reopening one that has hosts. Registering
+    first, which reads as the safe order, asks for the one state the target
+    cannot render, and that aborted render is the failure this feature exists
+    to fix. The window with the subsystem closed and nobody yet authorized
+    cannot be designed away; it is survivable because the host ACL is evaluated
+    at connect time, so controllers already established ride through it.
+
+  * NVMe-oF whitelist: key the reconcile cache per subsystem, not per server.
+    Two storages against one TrueNAS share a cache key, so a reconcile on one
+    sealed the cache for a subsystem that had never been touched - while the
+    configfs resync closed that subsystem by a path the cache never sees.
+
+  * NVMe-oF: the configfs resync writes back the value the subsystem already
+    has, never the configured one. It is called from four sites that know
+    nothing about the access model: writing the configured value closed
+    subsystems nobody had been authorized on, and against a subsystem hardened
+    by hand it wrote true over an explicit host list - which the kernel
+    refuses, aborting the very render the call exists to force.
+
+  * NVMe-oF: report a half-applied whitelist at a level that survives the
+    default tn_debug of 0, and treat a failed DH-CHAP key update as fatal
+    rather than warning past it into sealing a success cache.
+
+  * NVMe-oF: recognise what TrueNAS actually returns for a uniqueness
+    violation. _api_call_mutate re-sends a mutation whose reply was lost, so a
+    create that already succeeded is retried as a matter of course; matching
+    only /already exists/ turned that routine duplicate into a die.
+
+  * Keep TESTED_APIVER at 14. PR #83 bumped it to 15 in a commit that changes
+    nothing else - no new method, no changed signature - so the higher number
+    would assert a validation nobody performed.
+
+  * t/nvme/02-host-whitelist.t: 27 offline tests for the above. Eleven of them
+    fail against the code as it stood before these changes.
+
+ -- Alfonso Kuen <alfonsok@gmail.com>  Sun, 16 Aug 2026 23:55:00 +0000
+
 truenas-proxmox-plugin (2.1.24~alpha1) unstable; urgency=medium
 
   * NVMe/TCP: restore missing portals instead of stopping at the first live

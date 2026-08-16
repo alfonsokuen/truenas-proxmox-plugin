@@ -30,8 +30,17 @@ t/rate-limit/    # regression tests for the rate-limit defects; needs a real
 t/nvme/          # offline unit tests; needs neither. Run with: prove -v t/nvme/
 ```
 
-`t/nvme/` builds a fixture sysfs tree rather than talking to any hardware, so it
-runs anywhere the plugin's Perl dependencies are present.
+`t/nvme/` needs no hardware at all and runs anywhere the plugin's Perl
+dependencies are present:
+
+- `01-portal-reconcile.t` — NVMe/TCP portal reconciliation, against a fixture
+  sysfs tree.
+- `02-host-whitelist.t` — host whitelist and DH-HMAC-CHAP, against a stubbed
+  API layer. It asserts the *order* in which the subsystem is closed and the
+  host authorized, because the target holds `allow_any_host` and an explicit
+  host list as mutually exclusive: linking a host into a subsystem that is
+  still open is refused, and so is reopening one that has hosts. Only
+  close-then-authorize is accepted.
 
 ## Prerequisites
 

@@ -6,7 +6,7 @@ use warnings;
 # Plugin Version
 our $VERSION = '2.1.24~alpha1+idk1';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 15;
+our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -1861,12 +1861,6 @@ sub _tn_pool_health($scfg) {
 # serialization (#58, #65, #78). special_small_block_size must be 'INHERIT'
 # specifically - 0 fails a ZFS-level check, null fails Pydantic. Callers may layer
 # on optional fields (comments, compression) after.
-# All six of the explicit fields below must be sent, not omitted: TrueNAS
-# 25.10.4's legacy API shim leaves omitted optional fields as unresolved
-# _NotRequired sentinels instead of real defaults, crashing pool.dataset.create
-# both in validation and in audit-log serialization (#58, #65, #78).
-# special_small_block_size must be 'INHERIT' specifically - 0 fails a ZFS-level
-# check, null fails Pydantic.
 sub _tn_zvol_create_payload {
     my ($scfg, $full, $bytes, $blocksize) = @_;
     return {
@@ -3304,6 +3298,18 @@ sub _nvme_allow_any_host {
     return $scfg->{tn_nvme_allow_any_host} ? 1 : 0;
 }
 
+# Does this error mean "the row is already there"? It matters because
+# _api_call_mutate retries a mutation whose reply was lost, so a create that
+# already succeeded is re-sent as a matter of course. Matching only
+# /already exists/ missed what TrueNAS actually returns for a uniqueness
+# violation - see the API error notes above _is_retryable_error - and turned a
+# routine duplicate into a die.
+sub _nvme_err_is_duplicate {
+    my ($err) = @_;
+    return 0 if !defined $err;
+    return $err =~ /already exists|must be unique|UNIQUE constraint|IntegrityError|constraint failed|duplicate key/i ? 1 : 0;
+}
+
 # JSON boolean form of _nvme_allow_any_host, for API payloads.
 sub _nvme_allow_any_host_json {
     my ($scfg) = @_;
@@ -3313,15 +3319,28 @@ sub _nvme_allow_any_host_json {
 # Force TrueNAS to re-render the subsystem's configfs after a namespace change.
 # Issue #12: nvmet.namespace.create did not always sync to the running kernel
 # target on 25.10; writing the subsystem pokes middleware into re-rendering.
-# allow_any_host is written to its *configured* value, so this is a no-op for
-# access control (never flips a whitelisted subsystem back to open). Non-fatal.
+#
+# It writes back whatever the subsystem already has, never the configured
+# value. Writing the configured one made this a decision about access control,
+# taken from four call sites that know nothing about it: in whitelist mode it
+# closed a subsystem no one had been authorized on yet, and against a subsystem
+# hardened by hand it wrote true over an explicit host list, which the kernel
+# refuses - aborting the very render this call exists to force. Non-fatal, but
+# not silent: a failure here means a namespace change may not have reached the
+# running target.
 sub _nvme_resync_configfs {
     my ($scfg, $subsys_id, $label) = @_;
-    eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
-        [ $subsys_id, { allow_any_host => _nvme_allow_any_host_json($scfg) } ]) };
+    eval {
+        my $cur = _api_call($scfg, 'nvmet.subsys.query', [[["id", "=", $subsys_id]]]) // [];
+        die "subsystem $subsys_id not found\n" if !@$cur;
+        _api_call_mutate($scfg, 'nvmet.subsys.update',
+            [ $subsys_id, { allow_any_host => $cur->[0]{allow_any_host} ? JSON::PP::true
+                                                                        : JSON::PP::false } ]);
+    };
     if ($@) {
-        _log($scfg, 1, 'warning',
-            "[TrueNAS] " . ($label // 'nvme') . ": configfs resync failed (non-fatal): $@");
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] " . ($label // 'nvme') . ": configfs resync failed, a namespace "
+            . "change may not have reached the running target: $@");
     }
 }
 
@@ -3351,15 +3370,17 @@ sub _nvme_ensure_host_registered {
         if (defined $ctrl_secret && ($cur->{dhchap_ctrl_key} // '') ne $ctrl_secret) { $upd{dhchap_ctrl_key} = $ctrl_secret; }
         if (%upd) {
             eval { _api_call_mutate($scfg, 'nvmet.host.update', [$host_id, \%upd]) };
-            _log($scfg, 1, 'warning',
-                "[TrueNAS] nvme_ensure_host: failed to update DHCHAP keys for $hostnqn: $@") if $@;
+            # Fatal, not a warning execution walks past: the caller seals a
+            # success cache right after, so swallowing this recorded a key
+            # rotation that never happened as reconciled for the whole TTL.
+            die "nvme_ensure_host: failed to update DHCHAP keys for $hostnqn: $@" if $@;
         }
     } else {
         my $payload = { hostnqn => $hostnqn };
         $payload->{dhchap_key}      = $secret      if defined $secret;
         $payload->{dhchap_ctrl_key} = $ctrl_secret if defined $ctrl_secret;
         my $h = eval { _api_call_mutate($scfg, 'nvmet.host.create', [ $payload ]) };
-        if ($@ && $@ =~ /already exists/i) {
+        if ($@ && _nvme_err_is_duplicate($@)) {
             # Concurrent create from another node; re-query.
             my $again = _api_call($scfg, 'nvmet.host.query', [[["hostnqn", "=", $hostnqn]]]) // [];
             $host_id = $again->[0]{id} if @$again;
@@ -3377,7 +3398,7 @@ sub _nvme_ensure_host_registered {
     if (!@$assoc) {
         eval { _api_call_mutate($scfg, 'nvmet.host_subsys.create',
             [{ host_id => int($host_id), subsys_id => int($subsys_id) }]) };
-        if ($@ && $@ !~ /already exists/i) {
+        if ($@ && !_nvme_err_is_duplicate($@)) {
             die "nvme_ensure_host: failed to authorize host $hostnqn on subsystem: $@";
         }
     }
@@ -3388,8 +3409,9 @@ sub _nvme_ensure_host_registered {
 
 # Reconcile a subsystem's host-access model with configuration. Open mode
 # (default) is left to subsystem creation; this only acts in whitelist mode,
-# where it registers this node's host first (avoiding a lockout window) and
-# then enforces allow_any_host=false. Idempotent; safe on every ensure.
+# where it enforces allow_any_host=false and then registers this node's host -
+# in that order, because the target refuses the other one. Idempotent; safe on
+# every ensure.
 # $cur_allow_any_host, when known by the caller, lets us skip the subsys.update
 # round-trip if access is already tightened. TTL-cached per storage (mirrors
 # _nvme_sync_portals) so steady-state ensures cost zero round-trips.
@@ -3397,25 +3419,48 @@ sub _nvme_reconcile_host_whitelist {
     my ($scfg, $subsys_id, $cur_allow_any_host) = @_;
     return if _nvme_allow_any_host($scfg);   # open mode: nothing to reconcile
 
-    my $sid = _cache_host_key($scfg);
+    # Keyed per subsystem, not per server. Two storages against the same
+    # TrueNAS share a _cache_host_key, so one key let a reconcile on one
+    # storage seal the cache for a subsystem that had never been touched - and
+    # the tightening reaches that subsystem by other paths anyway.
+    my $sid = _cache_host_key($scfg) . "|$subsys_id";
     if (time() - ($_host_whitelist_last_ok{$sid} // 0) < $CACHE_TTL) {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_reconcile_host_whitelist: skipping (recently synced "
             . (time() - $_host_whitelist_last_ok{$sid}) . "s ago)");
         return;
     }
 
-    _nvme_ensure_host_registered($scfg, $subsys_id);
-
-    # Only write allow_any_host=false when it isn't already (or state unknown).
+    # Close first, authorize second. The kernel holds allow_any_host and an
+    # explicit host list as mutually exclusive: linking a host into a subsystem
+    # that is still open is refused with EINVAL, and so is reopening one that
+    # already has hosts. Registering first - which reads as the safe order -
+    # asks for the one state the target cannot render, and that aborted render
+    # is the very failure this feature exists to fix.
+    #
+    # So the window with the subsystem closed and nobody yet authorized cannot
+    # be designed away, only kept short. It is survivable: measured against a
+    # live nvmet target, tightening does not tear down controllers that are
+    # already established, because the host ACL is evaluated at connect time.
+    # Existing I/O rides through it; only a reconnect landing inside the window
+    # is refused.
     if (!defined($cur_allow_any_host) || $cur_allow_any_host) {
         eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
             [ $subsys_id, { allow_any_host => JSON::PP::false } ]) };
         if ($@) {
-            _log($scfg, 1, 'warning',
+            # Level 0: tn_debug defaults to 0 and _log drops anything above it.
+            # A subsystem left half-reconciled is not something to learn about
+            # later from a debug log.
+            _log($scfg, 0, 'warning',
                 "[TrueNAS] nvme: failed to set allow_any_host=false on subsys $subsys_id: $@");
             return;   # don't cache a partial reconcile
         }
     }
+
+    # Dies on failure, which is what we want here: the cache below is then not
+    # sealed, so the next ensure retries - and by then the subsystem is already
+    # closed, so it goes straight to authorizing.
+    _nvme_ensure_host_registered($scfg, $subsys_id);
+
     $_host_whitelist_last_ok{$sid} = time();
 }
 
