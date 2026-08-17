@@ -185,7 +185,19 @@ note "disco de datos en el invitado: /dev/$DATA"
 # ---------------------------------------------------------------------------
 
 say "V1 - el invitado relee su propio patron"
+# Establish the baseline rather than assume it. Another suite may have run
+# against this guest and left the disk holding a different seed, and then every
+# later verify fails with "the disk did not come back" - a harness problem
+# wearing the costume of a storage fault. Re-laying the pattern costs seconds
+# and makes the run independent of whatever happened before it.
 gexec "/root/i32-blockverify.pl verify /dev/$DATA $(( PAT_MIB * 1024 * 1024 )) $SEED_A" 300
+if [ "${GRC:-}" != 0 ]; then
+    note "el disco no trae la semilla $SEED_A (otra suite lo dejo en otro estado): se repone"
+    gexec "/root/i32-blockverify.pl write /dev/$DATA $(( PAT_MIB * 1024 * 1024 )) $SEED_A; R=\$?; sync; (exit \$R)" 600
+    [ "${GRC:-}" = 0 ] || { echo "refusing: no se pudo reponer la linea base" >&2; exit 2; }
+    gexec 'cd /; sync; echo 3 > /proc/sys/vm/drop_caches' 60
+    gexec "/root/i32-blockverify.pl verify /dev/$DATA $(( PAT_MIB * 1024 * 1024 )) $SEED_A" 300
+fi
 echo "$GOUT" | tail -3 | sed 's/^/      /'
 if [ "${GRC:-}" = 0 ]; then
     pass "V1: ${PAT_MIB} MiB escritos y releidos por el invitado, byte a byte"
@@ -219,6 +231,14 @@ if echo "$GOUT" | grep -q "$TOKEN"; then
 else
     fail "V2: no se pudo escribir la marca en RAM"
 fi
+
+# Read the guest's own clock right before the snapshot. After the rollback it
+# has to be SMALLER: a resumed guest carries on from the instant its RAM was
+# saved, so its uptime goes backwards. Nothing else in the suite can tell a
+# genuine resume from a cold boot that happened to leave the disk right.
+gexec 'cat /proc/uptime | cut -d" " -f1' 20
+UP_PRE="$(echo "$GOUT" | tr -d ' ' | grep -E '^[0-9]+\.[0-9]+$' | tail -1)"
+note "uptime del invitado antes del snapshot: ${UP_PRE:-?}s"
 
 note "tomando qm snapshot --vmstate con la VM corriendo..."
 t0=$(date +%s)
@@ -278,6 +298,15 @@ fi
 
 say "V4 - rollback en vivo"
 
+# The clock to compare against is the one the guest has RIGHT NOW, not the one
+# it had before the snapshot. The saved state was captured a few seconds after
+# that first reading, so the guest legitimately resumes at a slightly larger
+# number - and comparing against the earlier reading calls a correct resume a
+# failure. What has to go backwards is the distance travelled since.
+gexec 'cat /proc/uptime | cut -d" " -f1' 20
+UP_PRE_ROLL="$(echo "$GOUT" | tr -d ' ' | grep -E '^[0-9]+\.[0-9]+$' | tail -1)"
+note "uptime justo antes del rollback: ${UP_PRE_ROLL:-?}s"
+
 note "haciendo qm rollback (la VM se reinicia desde el estado guardado)..."
 t0=$(date +%s)
 if qm rollback "$VMID" viva --start 1 >/tmp/i32-liveroll.log 2>&1; then
@@ -304,10 +333,34 @@ else
     exit "$FAILURES"
 fi
 
-gexec 'uptime -p; cat /proc/uptime | cut -d" " -f1' 20
-note "uptime tras el rollback: $(echo "$GOUT" | tail -2 | tr '\n' ' ')"
+gexec 'cat /proc/uptime | cut -d" " -f1' 20
+UP_POST="$(echo "$GOUT" | tr -d ' ' | grep -E '^[0-9]+\.[0-9]+$' | tail -1)"
+note "uptime tras el rollback: ${UP_POST:-?}s (justo antes del rollback: ${UP_PRE_ROLL:-?}s; antes del snapshot: ${UP_PRE:-?}s)"
+# This is deliberately NOT an assertion, and the reason is worth writing down.
+# The obvious witness for "the saved RAM came back" is the guest's clock going
+# backwards. It does not: this guest runs on kvm-clock, which is anchored to the
+# host's clock, so after a resume /proc/uptime reports the wall time that passed
+# while the guest was not running. It moves forward across a perfectly correct
+# rollback. Asserting on it produced a confident, repeatable, and entirely false
+# failure - so it stays here as an observation only.
+#
+# The real witness is the marker pair in V4b below: a file written before the
+# snapshot has to still be in tmpfs, and one written after it has to be gone.
+# Only a restored memory image satisfies both; a cold boot fails the first and
+# a rollback that did nothing fails the second.
+if [ -n "${UP_POST:-}" ]; then
+    note "nota: el uptime no sirve como prueba aqui (kvm-clock sigue al reloj del host)"
+fi
 
 say "V4a - el disco"
+# Drop the guest's page cache first. --vmstate restored the guest's RAM, and
+# that RAM contains its cache of this very device: V1 read the whole pattern a
+# moment before the snapshot, so a large part of it is cached. Reading without
+# dropping it would confirm that the CACHE came back, which is not the claim.
+gexec 'sync; echo 3 > /proc/sys/vm/drop_caches; echo CACHE-VACIADA' 60
+echo "$GOUT" | grep -q CACHE-VACIADA \
+    && note "cache del invitado vaciada antes de releer" \
+    || fail "V4a: no se pudo vaciar la cache - la relectura no distingue disco de cache"
 gexec "/root/i32-blockverify.pl verify /dev/$DATA $(( PAT_MIB * 1024 * 1024 )) $SEED_A" 300
 echo "$GOUT" | tail -3 | sed 's/^/      /'
 if [ "${GRC:-}" = 0 ]; then

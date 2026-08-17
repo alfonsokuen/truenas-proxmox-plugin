@@ -78,6 +78,17 @@ manifest_hash() {
 # Block pattern, files, count and fsck - reported as one verdict per phase.
 guest_verify() {
     local label="$1" seed="$2" want_hash="${3:-}" ok=1
+    # Drop the guest's page cache first. A rollback taken with --vmstate
+    # restores the guest's RAM, and that RAM includes its cache of the block
+    # device - so a read that is allowed to hit cache cannot tell "the volume
+    # came back" from "the cache of the volume came back", which is precisely
+    # the distinction these phases exist to make.
+    # cd / first: the console is ONE long-lived shell, so a 'cd' left behind by
+    # an earlier step keeps the mount point busy and the umount inside the fsck
+    # check can never win. That is the harness holding the door shut, not the
+    # storage - and it looks exactly like a storage fault in the report.
+    gexec 'cd /; sync; echo 3 > /proc/sys/vm/drop_caches; echo CACHE-VACIADA' 60
+    echo "$GOUT" | grep -q CACHE-VACIADA || note "  aviso: no se pudo vaciar la cache del invitado"
     gexec "/root/i32-blockverify.pl verify \$(readlink -f /dev/disk/by-id/*i32blk) $(( PAT_MIB * 1024 * 1024 )) $seed" 400
     if [ "${GRC:-}" = 0 ]; then
         note "  bloques: intactos"
@@ -125,7 +136,7 @@ guest_mutate() {
     else
         fail "$tag: la reescritura del patron fallo (rc=${GRC:-?})"
     fi
-    gexec "cd /mnt/i32 && for i in \$(seq 1 $nfiles); do dd if=/dev/urandom of=d/${tag}\$i bs=1K count=256 status=none; done; sync; (cd /mnt/i32 && find d -type f | sort | xargs sha256sum) > /root/i32-manifest.sha256; sync; wc -l < /root/i32-manifest.sha256" 300
+    gexec "(cd /mnt/i32 && for i in \$(seq 1 $nfiles); do dd if=/dev/urandom of=d/${tag}\$i bs=1K count=256 status=none; done; sync); sync; (cd /mnt/i32 && find d -type f -print0 | LC_ALL=C sort -z | xargs -0r sha256sum) > /root/i32-manifest.sha256; sync; wc -l < /root/i32-manifest.sha256" 300
     note "  $tag: ahora hay $(echo "$GOUT" | tr -d ' ' | grep -E '^[0-9]+$' | tail -1) ficheros"
 }
 
@@ -204,6 +215,7 @@ fi
 SEED0=$SEED_A
 SEED1=$(( SEED_A + 1 ))
 SEED2=$(( SEED_A + 2 ))
+SEED3=$(( SEED_A + 3 ))
 
 say "estado inicial"
 # Re-established rather than assumed, so the script can be run again after a
@@ -302,13 +314,27 @@ if has_phase D2; then
                 # so this is a crash-consistent image: mounting replays the
                 # journal, which is exactly the recovery a real restore does.
                 mkdir -p /mnt/i32-verify
+                # Look at the image BEFORE mounting it. Mounting replays the
+                # journal and unmounting marks the superblock clean, so a fsck
+                # run only afterwards is a check on the repair, not on what the
+                # backup actually contained. A dirty journal here is the
+                # expected and welcome result: it is the proof the snapshot was
+                # taken while the filesystem was live.
+                pout="$(fsck.ext4 -fn "$NBD" 2>&1)"; prc=$?
+                if [ "$prc" = 0 ]; then
+                    note "pre-fsck del restaurado: rc=0, el journal estaba limpio"
+                elif echo "$pout" | grep -qiE 'recovery flag|needs journal recovery|journal.*recover'; then
+                    note "pre-fsck del restaurado: rc=$prc, journal sucio (esperado en un backup en caliente)"
+                else
+                    note "pre-fsck del restaurado: rc=$prc $(echo "$pout" | tail -1)"
+                fi
                 if mount "$NBD" /mnt/i32-verify 2>/tmp/i32-mnt.log; then
                     pass "D2b: el sistema de ficheros restaurado monta (el journal se reprodujo)"
                     # Recomputed here, independently, with the same command the
                     # guest used - so matching the guest's hash means the whole
                     # set of files survived, not just that a manifest travelled
                     # alongside them.
-                    ( cd /mnt/i32-verify && find d -type f | sort | xargs sha256sum ) > /tmp/i32-host-manifest 2>/dev/null
+                    ( cd /mnt/i32-verify && find d -type f -print0 | LC_ALL=C sort -z | xargs -0r sha256sum ) > /tmp/i32-host-manifest 2>/dev/null
                     HH="$(sha256sum /tmp/i32-host-manifest | cut -c1-16)"
                     NH="$(wc -l < /tmp/i32-host-manifest)"
                     note "recalculado en el host: $NH ficheros, hash $HH"
@@ -317,6 +343,28 @@ if has_phase D2; then
                     else
                         fail "D2b: el manifiesto recalculado ($HH) no coincide con el del invitado ($H0)"
                     fi
+
+                    # The manifest covers files that were sitting still. This
+                    # covers the ones that were not: an append-only counter the
+                    # guest kept writing throughout the backup, each line made
+                    # durable before the next. Ending early is correct - the
+                    # copy was taken at an instant. A gap in the middle means an
+                    # acknowledged, durable write was lost or reordered.
+                    if [ -f /mnt/i32-verify/journal ]; then
+                        JN="$(wc -l < /mnt/i32-verify/journal)"
+                        JGAP="$(awk 'NR==1{p=$1+0; first=$1+0; next}
+                                     {c=$1+0; if (c != p+1) {print "hueco en " p " -> " c; bad=1; exit}; p=c}
+                                     END{ if (!bad) print "" }' /mnt/i32-verify/journal)"
+                        if [ "$JN" -lt 3 ]; then
+                            fail "D2b: el diario en vuelo solo tiene $JN lineas - no hubo escritura concurrente que comprobar"
+                        elif [ -z "$JGAP" ]; then
+                            pass "D2b: el diario escrito DURANTE el backup llega entero hasta el corte ($JN lineas, sin huecos)"
+                        else
+                            fail "D2b: el backup perdio una escritura ya confirmada: $JGAP"
+                        fi
+                    else
+                        fail "D2b: no hay diario en vuelo en el restaurado - la escritura concurrente no se comprobo"
+                    fi
                     umount /mnt/i32-verify
                 else
                     fail "D2b: el sistema de ficheros restaurado no monta"
@@ -324,8 +372,16 @@ if has_phase D2; then
                 fi
                 fout="$(fsck.ext4 -fn "$NBD" 2>&1)"; frc=$?
                 note "fsck del restaurado: rc=$frc $(echo "$fout" | tail -1)"
-                [ "$frc" -le 1 ] && pass "D2b: fsck limpio sobre el sistema de ficheros restaurado" \
-                                 || fail "D2b: fsck encuentra problemas en el restaurado (rc=$frc)"
+                # With -n nothing is repaired, so rc=1 does not mean "errors
+                # corrected" - it means errors are there and were left alone.
+                # After a successful mount and umount the only clean answer is 0.
+                if echo "$fout" | grep -qiE 'check aborted|is mounted'; then
+                    fail "D2b: el fsck se abortó (dispositivo ocupado): no comprobo nada"
+                elif [ "$frc" = 0 ]; then
+                    pass "D2b: fsck limpio sobre el sistema de ficheros restaurado"
+                else
+                    fail "D2b: fsck encuentra problemas en el restaurado (rc=$frc)"
+                fi
                 nbd_detach
             else
                 fail "D2b: no se pudo abrir el disco de ficheros restaurado"
@@ -397,18 +453,42 @@ if has_phase D1; then
     # That is a real constraint on how snapshots can be used here, so it is
     # tested for the refusal and for the data being untouched by the attempt.
     say "D1b - pedir vuelta a un snapshot que no es el ultimo"
+    # The reason matters. "Refused because it is not the newest snapshot" is the
+    # constraint being documented; "failed because the chain broke when c2 was
+    # deleted" is the bug this whole phase exists to catch - and they arrive
+    # through the same non-zero exit. Passing on any failure would file the
+    # second one as the first.
     if qm rollback "$VMID" c1 --start 1 >/tmp/i32-d1roll.log 2>&1; then
         pass "D1b: este almacenamiento SI permite volver a un snapshot antiguo"
         OLDROLL=1
     else
         reason="$(grep -v 'older storage API' /tmp/i32-d1roll.log | tail -1)"
         note "rechazado: $reason"
-        pass "D1b: rechaza volver a un snapshot que no es el mas reciente, y lo dice claro"
+        if grep -qiE "not (the )?most recent|only rollback to the (last|most recent)|is not.*most recent snapshot" \
+                /tmp/i32-d1roll.log; then
+            pass "D1b: rechaza volver a un snapshot que no es el mas reciente, y lo dice claro"
+        else
+            fail "D1b: el rollback fallo por OTRA razon (no es el limite conocido): $reason"
+        fi
         OLDROLL=0
     fi
 
     if [ "$OLDROLL" = 0 ]; then
         guest_verify "D1b: el intento rechazado no toca los datos" "$SEED2" "$H2"
+
+        # Nothing has changed the disks since c3 was taken, so rolling back to
+        # c3 right now would pass identically if it did nothing at all. Write a
+        # third state first: then the rollback has something to undo, and the
+        # verify against state 2 can only pass if it actually undid it.
+        say "D1c - escribir un estado 3 para que el rollback tenga algo que deshacer"
+        guest_mutate e3 20 "$SEED3"
+        H3="$(manifest_hash)"
+        note "hash tras la tercera mutacion: $H3"
+        if [ -n "$H3" ] && [ "$H3" != "$H2" ]; then
+            pass "D1c: el estado 3 esta escrito y difiere del 2 (el rollback no puede ser un no-op)"
+        else
+            fail "D1c: el estado 3 no llego a escribirse ($H3 vs $H2) - el rollback no probaria nada"
+        fi
 
         say "D1c - volver al snapshot mas reciente, que si esta permitido"
         if qm rollback "$VMID" c3 --start 1 >/tmp/i32-d1roll3.log 2>&1; then

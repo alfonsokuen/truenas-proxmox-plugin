@@ -108,7 +108,12 @@ ${BV_B64}
           dd if=/dev/urandom of="\$I32MNT/d/big\$i" bs=1M count=64 status=none
       done
       sync
-      ( cd "\$I32MNT" && find d -type f | sort | xargs sha256sum ) > /root/i32-manifest.sha256
+      # -print0 / sort -z / xargs -0r on both sides: the hypervisor recomputes
+      # this exact command over the restored disk and compares the hash, so the
+      # two have to agree byte for byte. A plain sort would agree only as long
+      # as every filename stays ASCII and the two machines share a locale, and
+      # a bare xargs would sit reading stdin if the list ever came back empty.
+      ( cd "\$I32MNT" && find d -type f -print0 | LC_ALL=C sort -z | xargs -0r sha256sum ) > /root/i32-manifest.sha256
       sync
       n=\$(wc -l < /root/i32-manifest.sha256)
       h=\$(sha256sum /root/i32-manifest.sha256 | cut -c1-16)
@@ -137,13 +142,42 @@ ${BV_B64}
       echo "I32-FS ficheros=\$n presentes=\$have malos=\$bad hash=\$h"
       [ "\$bad" = 0 ] || rc=1
       [ "\$have" = "\$n" ] || rc=1
-      # fsck needs the filesystem unmounted to say anything trustworthy.
-      umount "\$I32MNT" 2>/dev/null
-      out=\$(fsck.ext4 -fn "\$I32FS" 2>&1)
-      frc=\$?
-      echo "I32-FSCK rc=\$frc \$(echo "\$out" | tail -2 | tr '\\n' ' ')"
-      [ "\$frc" -le 1 ] || rc=1
+      # fsck needs the filesystem unmounted to say anything trustworthy. On a
+      # mounted device e2fsck answers "no" to its own "continue?" prompt, prints
+      # "check aborted" and exits 0 - a clean-looking result that checked
+      # nothing at all. The background load writes here every second, so the
+      # umount has to be retried and, if it never wins, reported as a failure
+      # rather than quietly skipped.
+      # Stop the background load first rather than race it. The load writes on
+      # a one-second cycle and a one-second retry loop locks in phase with it,
+      # so every attempt lands mid-write and the umount never wins. The load is
+      # there to make the storage OPERATIONS hard, not to make verification
+      # impossible - so it is stopped for the check and started again after.
+      pkill -f i32-guest-load.sh 2>/dev/null
+      for t in 1 2 3 4 5 6 7 8 9 10; do
+          pgrep -f i32-guest-load.sh >/dev/null 2>&1 || break
+          sleep 1
+      done
+      um=0
+      for t in 1 2 3 4 5 6 7 8 9 10; do
+          umount "\$I32MNT" 2>/dev/null && { um=1; break; }
+          sleep 0.7
+      done
+      if [ "\$um" = 0 ]; then
+          echo "I32-FSCK rc=SIN-DESMONTAR el fs sigue montado, no se comprobo"
+          rc=1
+      else
+          out=\$(fsck.ext4 -fn "\$I32FS" 2>&1)
+          frc=\$?
+          echo "I32-FSCK rc=\$frc \$(echo "\$out" | tail -2 | tr '\\n' ' ')"
+          # With -n nothing is repaired, so rc=1 means errors are present and
+          # were left alone - not that they were fixed. Only 0 is clean.
+          [ "\$frc" = 0 ] || rc=1
+          echo "\$out" | grep -qiE 'check aborted|is mounted' && rc=1
+      fi
       mount "\$I32FS" "\$I32MNT" 2>/dev/null
+      pgrep -f i32-guest-load.sh >/dev/null 2>&1 || \\
+          nohup /usr/local/bin/i32-guest-load.sh >/dev/null 2>&1 &
       echo "I32-FS-RC=\$rc"
       exit \$rc
 
@@ -172,17 +206,34 @@ ${BV_B64}
     content: |
       #!/bin/bash
       # Keep both disks genuinely busy while snapshots and migrations happen.
-      # Everything it touches is outside the verified pattern and outside the
-      # manifest, so a crash-consistent copy still contains intact data - the
-      # load is there to make the operation hard, not to make it ambiguous.
+      # The bulk churn is outside the verified pattern and outside the manifest,
+      # so a crash-consistent copy still contains intact data - that load is
+      # there to make the operation hard, not to make it ambiguous.
+      #
+      # But load that is never verified proves nothing about the data that was
+      # in flight, which is the only data a snapshot can actually get wrong.
+      # So it also keeps an append-only journal: one line per tick, a counter
+      # that only ever goes up, each line made durable before the next is
+      # written. Losing the tail of that file is normal and expected - a copy
+      # taken at an instant simply ends somewhere. A HOLE in the middle is not:
+      # it means a write that was acknowledged and durable was dropped or
+      # reordered by the snapshot path. That is the failure worth catching.
       set -u
       . /usr/local/bin/i32-paths.sh
       OFF=\$(( ${PAT_MIB} + 64 ))
+      # Resume the counter where the file left off. The verify stops and
+      # restarts this loop, and a counter that restarted at zero would put a
+      # step backwards in the middle of the journal - which the restore check
+      # would read as the very data loss it is looking for.
+      SEQ=\$(tail -1 "\$I32MNT/journal" 2>/dev/null | tr -dc '0-9' | sed 's/^0*//')
+      [ -n "\$SEQ" ] || SEQ=0
       while :; do
           dd if=/dev/urandom of="\$I32BLK" bs=1M seek=\$OFF count=8 \\
              oflag=direct conv=notrunc status=none 2>/dev/null
           if mountpoint -q "\$I32MNT"; then
               dd if=/dev/urandom of="\$I32MNT/scratch/churn" bs=1M count=8 status=none 2>/dev/null
+              SEQ=\$(( SEQ + 1 ))
+              printf '%08d\\n' "\$SEQ" >> "\$I32MNT/journal"
               sync
           fi
           sleep 1
