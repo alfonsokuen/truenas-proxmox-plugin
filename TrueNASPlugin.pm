@@ -1922,8 +1922,20 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
 }
 
 # Helper identifying API calls that mutate TrueNAS state
-sub _api_call_mutate($scfg, $ws_method, $ws_params) {
-    return _api_call($scfg, $ws_method, $ws_params);
+# $opts goes straight to _api_call, which is how a caller turns the retry layer
+# off for a mutation that cannot survive being replayed. Most mutations here are
+# idempotent by construction - setting device_path to a value it already holds,
+# or enabled to a state it is already in, costs nothing on a second delivery -
+# but pool.dataset.rename and pool.snapshot.create are not, and retrying either
+# after a lost response reports a failure for work that already succeeded. A
+# caller that passes this has to be ready to find out what happened by other
+# means, because the API offers no idempotency keys.
+#
+# Note the shape: { retry_opts => { retry_max => 0 } }. _api_call reads
+# $opts->{retry_opts}, so a bare { retry_max => 0 } is accepted, ignored, and
+# leaves the call on the default three retries.
+sub _api_call_mutate($scfg, $ws_method, $ws_params, $opts = undef) {
+    return _api_call($scfg, $ws_method, $ws_params, $opts);
 }
 
 # ======== TrueNAS API ops (WebSocket) ========
@@ -8304,15 +8316,43 @@ sub create_base {
     # because TN's safety check refuses to rename a dataset that an
     # iSCSI extent or nvmet namespace references; we override because
     # we are about to update the share in step 3.
+    # No retries. A rename is not idempotent and it destroys its own
+    # precondition: if it commits server-side and the response is lost, the
+    # retry asks to rename a dataset that no longer exists, gets "does not
+    # exist", which is classified non-retryable, and the whole call dies -
+    # reporting a failure for work that had in fact succeeded, and naming a
+    # cause that points the reader at entirely the wrong thing. With retries
+    # off, a failure here means "unknown", and the handler below has to find
+    # out what actually happened by looking.
     eval {
         _api_call_mutate(
             $scfg,
             'pool.dataset.rename',
             [ $old_full, { new_name => $new_full, force => JSON::PP::true } ],
+            { retry_opts => { retry_max => 0 } },
         );
     };
-    if ($@) {
-        my $err = $@;
+    my $rename_err = $@;
+    if ($rename_err) {
+        # With retries off, a failure here means "unknown", not "it did not
+        # happen" - so find out by looking. Ask about both names: present at
+        # the new one and absent at the old one is a lost response to a rename
+        # that worked, and continuing is then correct. That is the case which
+        # otherwise leaves the disk offline with nothing to repair it. Asking
+        # about only the new name would not distinguish a completed rename from
+        # something else already sitting there, and an incoherent answer -
+        # both present, or neither - is one to stop on rather than act on.
+        my $at_new = eval { _tn_dataset_get($scfg, $new_full) };
+        my $at_old = eval { _tn_dataset_get($scfg, $old_full) };
+        if ($at_new && !$at_old) {
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] create_base: the rename of '$old_full' to '$new_full' "
+              . "reported a failure but has in fact taken effect; continuing. "
+              . "original error: $rename_err");
+            $rename_err = undef;
+        }
+    }
+    if ($rename_err) {
         if ($mode eq 'nvme-tcp') {
             # Re-enable namespace so we don't leave it disabled.
             eval {
@@ -8323,7 +8363,7 @@ sub create_base {
                 );
             };
         }
-        die "create_base: pool.dataset.rename '$old_full' -> '$new_full' failed: $err";
+        die "create_base: pool.dataset.rename '$old_full' -> '$new_full' failed: $rename_err";
     }
 
     # Step 3: rewire the transport share to point at the new zvol path.
@@ -8350,24 +8390,49 @@ sub create_base {
     if ($@) {
         my $err = $@;
         _log($scfg, 0, 'err',
-            "[TrueNAS] create_base: $rewire_method failed; rolling back rename: $err");
-        eval {
-            _api_call_mutate(
-                $scfg,
-                'pool.dataset.rename',
-                [ $new_full, { new_name => $old_full, force => JSON::PP::true } ],
-            );
+            "[TrueNAS] create_base: $rewire_method failed; rolling back rename+rewire: $err");
+        # The same four-step dance the step 4 rollback below already performs,
+        # and for the same reason. This one used to rename back and then only
+        # re-enable, never restoring device_path - but the rewire it is undoing
+        # is two mutations, device_path and then enabled, and it can fail with
+        # the first of them committed. In that case the namespace is left
+        # pointing at the new path while the dataset has just been renamed back
+        # to the old one, so the enable is judged against a path that no longer
+        # exists and fails too. The disk ends up disabled, pointing nowhere,
+        # with the PVE config untouched and nothing anywhere that repairs it.
+        # Disable first, while the path the namespace currently holds is still
+        # the one that exists, then rename, then re-point, then enable.
+        my $rolled_back = eval {
+            if ($mode eq 'nvme-tcp') {
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::false } ]);
+                _api_call_mutate($scfg, 'pool.dataset.rename',
+                    [ $new_full, { new_name => $old_full, force => JSON::PP::true } ],
+                    { retry_opts => { retry_max => 0 } });
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { device_path => $old_zvol_path } ]);
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::true } ]);
+            } else {
+                _api_call_mutate($scfg, 'pool.dataset.rename',
+                    [ $new_full, { new_name => $old_full, force => JSON::PP::true } ],
+                    { retry_opts => { retry_max => 0 } });
+                _api_call_mutate($scfg, 'iscsi.extent.update',
+                    [ $transport_id, { disk => $old_zvol_path } ]);
+            }
+            1;
         };
-        if ($mode eq 'nvme-tcp') {
-            # After rename rollback, old device_path is valid again. Try
-            # to re-enable the namespace so we don't leave it disabled.
-            eval {
-                _api_call_mutate(
-                    $scfg,
-                    'nvmet.namespace.update',
-                    [ $transport_id, { enabled => JSON::PP::true } ],
-                );
-            };
+        if ($rolled_back) {
+            _clear_cache(_cache_host_key($scfg));
+            _log($scfg, 1, 'info',
+                "[TrueNAS] create_base: rolled back to $old_full after rewire failure");
+        } else {
+            # Say exactly what to look at. A half-undone rollback is the one
+            # state an operator cannot infer from the original error.
+            _log($scfg, 0, 'err',
+                "[TrueNAS] create_base: rollback did NOT complete ($@); the volume may be "
+              . "left as $new_full, or as $old_full with its $share_label still pointing at "
+              . "$new_zvol_path — inspect both before retrying");
         }
         die "create_base: $share_label rewire to $new_zvol_path failed: $err";
     }
@@ -8379,8 +8444,32 @@ sub create_base {
             $scfg,
             'pool.snapshot.create',
             [ { dataset => $new_full, name => '__base__', recursive => JSON::PP::false } ],
+            # No retries, for a reason worse than the rename's. A lost response
+            # to a snapshot that committed replays as "already exists", which is
+            # classified non-retryable, so the rollback below fires and undoes
+            # the conversion because of the one step that actually worked. And
+            # ZFS snapshots follow their dataset through a rename, so the stray
+            # __base__ lands back on the vm- name and every later attempt at
+            # this template fails the same way, permanently.
+            { retry_opts => { retry_max => 0 } },
         );
     };
+    if ($@ && $@ =~ /already exists|EEXIST/i) {
+        # The snapshot we were asked to create is there. Whether this attempt
+        # made it or a lost response from a previous one did, the postcondition
+        # holds, and rolling back would destroy a template that is complete.
+        my $snap_id = "$new_full\@__base__";
+        my $exists = eval {
+            _api_call($scfg, 'pool.snapshot.query',
+                [ [ [ 'id', '=', $snap_id ] ], { select => [ 'id' ] } ]);
+        };
+        if (!$@ && ref($exists) eq 'ARRAY' && @$exists) {
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] create_base: $snap_id already existed; treating the template "
+              . "as complete rather than rolling back");
+            $@ = '';
+        }
+    }
     if ($@) {
         my $err = $@;
         # The __base__ snapshot IS the point of a base image, so a failure here
