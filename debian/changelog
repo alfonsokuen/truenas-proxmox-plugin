@@ -44,6 +44,65 @@ truenas-proxmox-plugin (2.1.24~alpha1+idk3) unstable; urgency=medium
     local upstream that can be told to go quiet while holding the socket open.
     Requires no privileges and no TrueNAS.
 
+  * broker: bound the CLIENT read too, and cap it. Bounding the upstream and
+    not this left the daemon just as wedgeable from the near side: measured
+    against that build, a local client that connected and sent a request
+    without its trailing newline stopped the accept loop dead, and a healthy
+    client behind it went unanswered for as long as it waited. A client that
+    dies is harmless - the socket reports EOF - but one that merely stops, is
+    stopped, or is blocked in D state on the very storage this daemon serves,
+    is not.
+
+  * broker: write the whole buffer, everywhere. syswrite is not obliged to
+    take it all and on TLS it does not - measured on IO::Socket::SSL 2.085,
+    8 KB and 16 KB went out whole while 64 KB and 256 KB both returned 16384.
+    The daemon called syswrite once and discarded the count, so any larger
+    frame went out truncated and the far end waited for the rest of a frame
+    that was never coming; the request then died on its own deadline blaming
+    the network. The same short write happens on a Unix socket once the reader
+    stops draining, which is the reply path.
+
+  * broker: SO_RCVTIMEO and SO_SNDTIMEO on the upstream socket. The
+    select-based deadlines cannot see everything on TLS: select fires on
+    ciphertext and SSL_read then needs a whole record, so a connection cut in
+    the middle of one can still block inside a single sysread. The kernel
+    bounds that regardless of what the SSL layer is doing.
+
+  * broker: a timed-out connection no longer goes back into the pool. Only the
+    die path evicted; a read that merely gave up left a connection of unknown
+    state - possibly mid-frame - for the next request to inherit, and charged
+    every later request the probe timeout for the whole outage.
+
+  * broker: mask the pong. RFC 6455 requires every frame a client sends to be
+    masked and obliges the server to fail the connection on an unmasked one -
+    and a dropped session means a fresh login, which is the rate-limit spiral
+    this daemon exists to prevent.
+
+  * broker: cap the declared frame length. Now that a read can expire part-way
+    through a payload the stream can resume mis-aligned, and sysread pre-grows
+    its target to whatever length it is handed, so a bogus 64-bit value is an
+    immediate out-of-memory abort - on a hypervisor, with the OOM killer
+    choosing the largest process on the node.
+
+  * broker: report a rate-limit lockout as one. It arrives as a structured
+    error just as a bad key does, and calling it a rejected key sends someone
+    rotating credentials in the middle of an outage that has nothing to do
+    with credentials.
+
+  * Fix Socket::gethostbyname, which does not exist. Verified on the Perl a
+    PVE node actually runs (5.38.2): the package-qualified call falls into
+    Socket's constant AUTOLOAD and dies with "Usage: Socket::AUTOLOAD()",
+    while the core builtin returns normally. _host_ipv4 returns early for an
+    IPv4 literal, so this only ever fired for a host configured by name - and
+    then it failed every connection attempt. Present in both the plugin and
+    the broker.
+
+  * Declare tn_broker_timeout in properties() and options(). It was read in
+    three places and declared in neither, and PVE rejects undeclared keys, so
+    the timeout it documents could not actually be set. The broker now honours
+    a client budget in both directions rather than only downwards, so raising
+    it on the plugin side is enough on its own.
+
  -- IDKmanager <gerencia@idkmanager.com>  Sun, 16 Aug 2026 21:20:00 -0500
 
 truenas-proxmox-plugin (2.1.24~alpha1+idk2) unstable; urgency=medium

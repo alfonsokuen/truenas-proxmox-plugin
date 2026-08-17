@@ -566,6 +566,14 @@ sub properties {
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
+        tn_broker_timeout => {
+            description => "How long to wait for the session broker to answer one " .
+                          "call, in seconds. The broker is told this value and aims " .
+                          "to reply just inside it, so raising it here also gives the " .
+                          "broker longer upstream. Raise for arrays that are slow " .
+                          "under load. Default: 30.",
+            type => 'integer', optional => 1, default => 30, minimum => 5, maximum => 600,
+        },
         tn_storage_lock_timeout => {
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120.",
@@ -670,6 +678,7 @@ sub options {
         # Retry configuration
         tn_api_retry_max => { optional => 1 },
         tn_api_retry_delay => { optional => 1 },
+        tn_broker_timeout => { optional => 1 },
 
         # Concurrency
         tn_storage_lock_timeout => { optional => 1 },
@@ -894,7 +903,7 @@ sub check_config {
 # ======== DNS/IPv4 helper ========
 sub _host_ipv4($host) {
     return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
-    my @ent = Socket::gethostbyname($host); # A-record lookup
+    my @ent = gethostbyname($host); # A-record lookup
     if (@ent && defined $ent[4]) {
         my $ip = inet_ntoa($ent[4]);
         return $ip if $ip;

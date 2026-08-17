@@ -100,8 +100,11 @@ if (!$upstream_pid) {
             my $o = eval { decode_json($pl) } or next;
             # The failure being reproduced: stop answering, stay connected.
             next if -e $MUTE;
+            # test.size reports how many bytes of request actually arrived, so
+            # a truncated send is visible from the client end.
             my $result = $o->{method} eq 'auth.login_with_api_key' ? JSON::PP::true()
                        : $o->{method} eq 'core.ping'               ? 'pong'
+                       : $o->{method} eq 'test.size'               ? length($pl)
                        :                                            { ok => 1 };
             my $txt = encode_json({ jsonrpc => '2.0', id => $o->{id}, result => $result });
             my $l = length($txt);
@@ -161,7 +164,14 @@ sub call_broker {
     };
     # Older clients omit this field entirely; exercised below.
     $env->{timeout} = $budget unless $a{omit_timeout};
-    $s->syswrite(encode_json($env) . "\n");
+    $env->{params} = $a{params} if $a{params};
+    my $payload = encode_json($env) . "\n";
+    my $off = 0;
+    while ($off < length($payload)) {
+        my $n = $s->syswrite(substr($payload, $off));
+        last if !defined $n || $n == 0;
+        $off += $n;
+    }
 
     my $sel = IO::Select->new($s);
     my $deadline = time() + $budget;
@@ -249,6 +259,48 @@ unlink $MUTE;
         'the daemon recovers by itself once the upstream answers again')
         or diag("after ${el}s: " . ($why // 'no result'));
     cmp_ok($el, '<', 10, '...without waiting out another timeout');
+}
+
+# ---------------------------------------------------------------------------
+# A local client that stops mid-request must not take the daemon with it
+# ---------------------------------------------------------------------------
+
+# The upstream read was bounded first and this one was not, which left the
+# daemon just as wedgeable from the near side: measured against that build, a
+# client that connected and sent a request WITHOUT its trailing newline stopped
+# the accept loop dead, and a healthy client behind it went unanswered for as
+# long as it cared to wait. A client that dies is harmless - the socket reports
+# EOF - but one that merely stops is not.
+{
+    my $stalled = IO::Socket::UNIX->new(Peer => $SOCK, Type => SOCK_STREAM);
+    ok($stalled, 'a client can connect and then stall');
+    $stalled->syswrite('{"scfg":{"api_host":"127.0.0.1"');   # no newline, ever
+
+    my ($el, $r, $why) = call_broker(budget => 20);
+    ok(defined $r, 'a healthy client is still served while another sits half-spoken')
+        or diag("client gave up after ${el}s: " . ($why // 'unknown'));
+    cmp_ok($el, '<', 20, '...without waiting out the stalled one');
+    $stalled->close() if $stalled;
+}
+
+# ---------------------------------------------------------------------------
+# A request larger than one TLS record must arrive whole
+# ---------------------------------------------------------------------------
+
+# syswrite is not obliged to take the whole buffer and on TLS it does not:
+# measured on IO::Socket::SSL 2.085, 8 KB and 16 KB went out whole while 64 KB
+# and 256 KB both returned 16384. The daemon called syswrite once and discarded
+# the count, so a large request left as a truncated frame the far end then
+# waited forever to finish - failing on its own deadline, blaming the network.
+# This runs over plain TCP, where the same short-write happens once the socket
+# buffer fills.
+{
+    my $big = 'y' x (256 * 1024);
+    my ($el, $r, $why) = call_broker(method => 'test.size', params => [$big], budget => 30);
+    ok(defined $r, 'a request larger than one TLS record gets an answer')
+        or diag("client gave up after ${el}s: " . ($why // 'unknown'));
+    cmp_ok(ref($r) eq 'HASH' ? ($r->{result} // 0) : 0, '>', 256 * 1024,
+        '...and the upstream received all of it, not just the first record');
 }
 
 # ---------------------------------------------------------------------------
