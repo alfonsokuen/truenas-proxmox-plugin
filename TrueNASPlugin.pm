@@ -1148,15 +1148,54 @@ sub _ws_rpc {
 # names; we map this branch's `tn_api_*` scfg keys to that wire shape at
 # send time so the broker daemon never needs to know about the rename.
 use constant BROKER_SOCKET_PATH => '/run/truenas-plugin/broker.sock';
+# How long to keep trying to reach the broker before giving up. Short: the
+# socket is local, and a broker that cannot accept within this is one whose
+# diagnosis belongs in the error, not in a longer wait.
+use constant BROKER_CONNECT_TIMEOUT_S => 5;
 
+# Connect to the broker, bounded.
+#
+# A blocking connect() here had no timeout of any kind, and the round-trip
+# deadline in _broker_rpc is only established afterwards - so it did not cover
+# this. That matters because AF_UNIX does not behave like TCP: when the
+# listener's backlog is full, connect() does not refuse, it sleeps, and with a
+# blocking socket it sleeps forever. Measured against the daemon with its
+# Listen => 32, stopped so that it accepted nothing: connections 1 to 33
+# returned in 0.00 s and the 34th never returned at all.
+#
+# So a broker that is alive but not accepting - which is the exact failure the
+# deadline work was done to survive - would hang every PVE process on the node
+# from the 34th onwards, before any deadline existed to save them. And the
+# broker is not optional: _ws_get_persistent refuses to run without it.
+#
+# Timeout puts IO::Socket into non-blocking connect, which returns rather than
+# sleeping (measured: the 34th connection aborted in 0.00 s). Since a full
+# backlog is a transient condition, retry briefly instead of failing on the
+# first refusal.
 sub _broker_open_socket {
+    my ($timeout) = @_;
+    $timeout = BROKER_CONNECT_TIMEOUT_S if !defined($timeout) || $timeout <= 0;
     return undef unless -S BROKER_SOCKET_PATH;
     require IO::Socket::UNIX;
-    my $sock = IO::Socket::UNIX->new(
-        Peer => BROKER_SOCKET_PATH,
-        Type => 1,    # SOCK_STREAM
-    );
-    return $sock;
+
+    my $deadline = time() + $timeout;
+    my $delay = 0.05;
+    while (1) {
+        my $remaining = $deadline - time();
+        last if $remaining <= 0;
+        my $sock = IO::Socket::UNIX->new(
+            Peer    => BROKER_SOCKET_PATH,
+            Type    => SOCK_STREAM,
+            Timeout => $remaining,
+        );
+        return $sock if $sock;
+        $remaining = $deadline - time();
+        last if $remaining <= 0;
+        select(undef, undef, undef, $delay < $remaining ? $delay : $remaining);
+        $delay *= 2;
+        $delay = 0.5 if $delay > 0.5;
+    }
+    return undef;
 }
 
 # Try to obtain a broker-proxied connection wrapper for this $scfg.
@@ -5399,15 +5438,34 @@ sub _nvme_delete_namespace {
 
     return unless $namespaces && @$namespaces;
 
+    my @failed;
     for my $ns (@$namespaces) {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_delete_namespace: deleting namespace id=$ns->{id}");
         eval {
             _api_call($scfg, 'nvmet.namespace.delete', [$ns->{id}]);
         };
-        if ($@) {
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme_delete_namespace: failed to delete namespace $ns->{id}: $@");
+        if (my $err = $@) {
+            chomp(my $msg = $err);
+            _log($scfg, 0, 'warning', "[TrueNAS] nvme_delete_namespace: failed to delete namespace $ns->{id}: $msg");
+            push @failed, "namespace $ns->{id}: $msg";
         }
     }
+
+    # Report the failure instead of returning as though the export were gone.
+    #
+    # Every error here used to be swallowed into a log line, so the caller's
+    # `my $ok = eval { _nvme_delete_namespace(...); 1 }` was true whenever the
+    # *query* succeeded, no matter how many deletes had failed. That made the
+    # whole in-use/disconnect/retry branch below it unreachable for real
+    # failures, and sent execution on to destroy the dataset with
+    # force => true - tearing the zvol out from under a namespace that still
+    # pointed at it, and any initiator still attached to it. A denied
+    # permission, a timeout, or a transport blip was enough.
+    #
+    # The log line was also level 1, which tn_debug's default of 0 discards, so
+    # the only record of it did not survive either. It is level 0 now.
+    die "failed to delete NVMe namespace(s) for $zname: " . join('; ', @failed) . "\n"
+        if @failed;
 }
 
 # ======== Required storage interface ========
@@ -6383,9 +6441,20 @@ sub _free_image_nvme {
         if ($scfg->{tn_force_delete_on_inuse} && $in_use->($err)) {
             $need_force_disconnect = 1;
             _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: namespace deletion blocked (in use), will retry after disconnect: $err");
-        } elsif ($err !~ /does not exist|ENOENT|not found/i) {
-            # Only warn if resource actually exists
-            warn "warning: delete NVMe namespace failed: $err";
+        } elsif ($err =~ /does not exist|ENOENT|not found/i) {
+            # Already gone. That is the outcome we wanted, so carry on.
+            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: namespace already absent: $err");
+        } else {
+            # Anything else - denied, timed out, transport lost - means we do
+            # not know that the export is gone, and step 3 below destroys the
+            # dataset with force => true. Warning and continuing pulled the
+            # zvol out from under a namespace that might still point at it,
+            # and any initiator still attached. Refuse instead: an undeleted
+            # volume is recoverable, a destroyed one that is still exported is
+            # not. The operator can retry once the cause is addressed.
+            die "[TrueNAS] refusing to destroy $full_ds: its NVMe namespace could not be "
+              . "removed, so the volume may still be exported. Resolve this and retry.\n"
+              . "  cause: $err";
         }
     }
 
