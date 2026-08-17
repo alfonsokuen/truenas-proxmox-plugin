@@ -44,6 +44,11 @@ truenas-proxmox-plugin (2.1.24~alpha1+idk3) unstable; urgency=medium
     local upstream that can be told to go quiet while holding the socket open.
     Requires no privileges and no TrueNAS.
 
+  * t/broker/02-tls-short-write.t: the short-write case over TLS, which is
+    where it actually happens - and which the plain-ws test in 01 cannot
+    reach, because over plain TCP a large syswrite to a draining peer takes
+    the whole buffer in one call.
+
   * broker: bound the CLIENT read too, and cap it. Bounding the upstream and
     not this left the daemon just as wedgeable from the near side: measured
     against that build, a local client that connected and sent a request

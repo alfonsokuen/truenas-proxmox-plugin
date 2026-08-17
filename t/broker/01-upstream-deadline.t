@@ -287,13 +287,14 @@ unlink $MUTE;
 # A request larger than one TLS record must arrive whole
 # ---------------------------------------------------------------------------
 
-# syswrite is not obliged to take the whole buffer and on TLS it does not:
-# measured on IO::Socket::SSL 2.085, 8 KB and 16 KB went out whole while 64 KB
-# and 256 KB both returned 16384. The daemon called syswrite once and discarded
-# the count, so a large request left as a truncated frame the far end then
-# waited forever to finish - failing on its own deadline, blaming the network.
-# This runs over plain TCP, where the same short-write happens once the socket
-# buffer fills.
+# A smoke test only. It is NOT the coverage for the short-write bug, and
+# saying so here because it looked like it was: run against the build that
+# still had that bug, these two assertions passed. This file drives the broker
+# over plain ws, and over plain TCP a 256 KB syswrite to a peer that is
+# draining promptly takes the lot in one go, so the truncation never happens.
+# It only appears on TLS, where one syswrite is capped at a single record -
+# and TLS is what a real deployment uses. That case lives in
+# 02-tls-short-write.t, where it fails against the unfixed build as it should.
 {
     my $big = 'y' x (256 * 1024);
     my ($el, $r, $why) = call_broker(method => 'test.size', params => [$big], budget => 30);
