@@ -1,3 +1,18 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk2) unstable; urgency=medium
+
+  * NVMe-oF: identify a namespace by its UUID, not by a recyclable NSID. The
+    selector matched on NGUID and, failing that, on the bare NSID - which the
+    target reuses, so a deleted-and-recreated namespace can hand back a device
+    belonging to another volume, and nothing downstream re-checks it. Measured
+    against a live target: an all-zero device_nguid means the sysfs nguid
+    attribute is absent entirely, while uuid is always present, and an all-zero
+    NGUID passes the plugin's format check - so a namespace created outside the
+    plugin took the unguarded NSID path. All zeros is now the "no identity"
+    sentinel it is, the namespace UUID is a matching tier of its own ahead of
+    NSID, and a device carrying a foreign UUID disqualifies an NSID match.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Sun, 16 Aug 2026 20:45:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk1) unstable; urgency=medium
 
   * Internal build: alpha + upstream PR #83 (NVMe-oF host whitelist and
