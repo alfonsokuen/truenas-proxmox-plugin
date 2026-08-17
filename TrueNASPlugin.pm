@@ -4574,8 +4574,16 @@ sub _nvme_select_namespace_device {
     if ($ns_info && defined $ns_info->{device_nguid}) {
         my $target_nguid = $ns_info->{device_nguid};
 
+        (my $nguid_digits = $target_nguid) =~ s/[-:]//g;
         if ($target_nguid !~ /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i) {
             _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: invalid NGUID format from API: $target_nguid");
+        } elsif ($nguid_digits !~ /[1-9a-f]/i) {
+            # All zeros passes the format check - it is hex and hyphens in the
+            # right shape - but it is the "no identity assigned" sentinel, not an
+            # identity. Treated as usable it could never match any device, and the
+            # selector fell through to NSID, which is recycled. Namespaces created
+            # outside this plugin routinely have it.
+            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: API reports an all-zero NGUID, no identity to match on");
         } else {
             $usable_nguid = 1;
             _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: attempting NGUID match for $target_nguid");
@@ -4608,6 +4616,30 @@ sub _nvme_select_namespace_device {
         }
     }
 
+    # Exact identity, same standing as the NGUID, and present on both sides even
+    # when the NGUID is not: the API returns device_uuid and the kernel exposes
+    # /sys/block/<dev>/uuid. Tried before NSID so that a recycled NSID stops
+    # being reachable whenever either identity is available.
+    if (defined($device_uuid) && $device_uuid ne '') {
+        for my $dev (@$devices) {
+            next if !defined($dev->{uuid}) || $dev->{uuid} eq '';
+            if (lc($dev->{uuid}) eq lc($device_uuid)) {
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by namespace UUID (NSID: $dev->{nsid})");
+                return _nvme_selector_result(
+                    selected_device_path => $dev->{path},
+                    linux_device_count => $linux_device_count,
+                    api_namespace_count => $api_namespace_count,
+                    match_tier => 'uuid',
+                    selector_outcome => 'exact_match',
+                );
+            }
+            # A device carrying a real UUID that is not ours says the kernel's
+            # view is for a different namespace - the same reasoning as the NGUID
+            # contradiction, and it must equally disqualify a bare NSID match.
+            $nguid_contradicted = 1 if !$nguid_contradicted && $dev->{uuid} =~ /[1-9a-f]/i;
+        }
+    }
+
     if ($ns_info && defined $ns_info->{nsid}) {
         my $target_nsid = $ns_info->{nsid};
         $usable_nsid = 1;
@@ -4628,6 +4660,22 @@ sub _nvme_select_namespace_device {
                             . "but device NGUID $dev->{nguid} contradicts API — skipping stale device");
                         next;
                     }
+                }
+                # The same on the UUID, which stands on its own: a device carrying
+                # a real namespace UUID that is not the one we asked for is not our
+                # namespace, whatever its NSID says - and an NSID agreeing is
+                # precisely the coincidence that recycling produces. Checked
+                # separately from the NGUID because a target that leaves NGUID at
+                # zero publishes no nguid attribute at all, which is the case where
+                # a bare NSID match was the only thing left.
+                if (defined($dev->{uuid}) && $dev->{uuid} =~ /[1-9a-f]/i
+                    && defined($device_uuid) && $device_uuid ne ''
+                    && lc($dev->{uuid}) ne lc($device_uuid)) {
+                    $nsid_rejected_by_nguid = 1;
+                    _log($scfg, 1, 'warning',
+                        "[TrueNAS] nvme_find_device: NSID $target_nsid matched $dev->{path} "
+                        . "but its namespace UUID $dev->{uuid} is not $device_uuid — skipping stale device");
+                    next;
                 }
                 _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NSID (NSID: $dev->{nsid}, type: $dev->{type})");
                 return _nvme_selector_result(
@@ -4791,11 +4839,25 @@ sub _nvme_find_device_by_subsystem {
                     chomp($val);
                     return $val;
                 };
+                # The namespace UUID, which the kernel exposes alongside nguid and
+                # the API returns as device_uuid. Measured against a live target:
+                # when the target's device_nguid is all zeros the nguid attribute
+                # does not exist at all, while uuid is always there. Without this
+                # the selector had no identity left to match on and fell through
+                # to NSID, which is recycled.
+                my $sysfs_uuid = eval {
+                    open my $fh, '<', "/sys/block/$entry/uuid" or return undef;
+                    my $val = <$fh>;
+                    close $fh;
+                    chomp($val);
+                    return $val;
+                };
 
                 push @devices, {
                     path => "/dev/$entry",
                     nsid => $sysfs_nsid,
                     nguid => $sysfs_nguid,
+                    uuid => $sysfs_uuid,
                     type => $type,
                     name => $entry
                 };
