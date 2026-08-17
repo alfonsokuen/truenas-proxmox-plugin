@@ -368,7 +368,11 @@ sub assert_resolved {
         pass("$what: fully restored$tag");
         return 'back';
     }
-    my $loud = grep { /ROLLBACK (?:INCOMPLETE|NOT ATTEMPTED)/ && /midclt/ } @{ $r->{errlog} };
+    # Deliberately not matching on any particular wording. What has to be true
+    # is that a level 0 line exists and that it carries something the operator
+    # can actually run - a midclt call - rather than an invitation to go and
+    # look. A quarantine nobody can act on is the same as no quarantine.
+    my $loud = grep { /midclt/ } @{ $r->{errlog} };
     ok($loud, "$what: neither converted nor restored, but quarantined loudly "
             . "with recovery commands$tag")
         or diag(state_dump($r));
@@ -475,10 +479,8 @@ subtest 'step 3b: the rollback restores device_path before re-enabling' => sub {
     my @c = @{ $r->{calls} };
     my ($back)    = grep { $c[$_] eq 'rename:new->old' } 0 .. $#c;
     my ($repoint) = grep { $c[$_] eq 'ns:path=old' }     0 .. $#c;
-    # The LAST enable, not the first. The first one is the step 3 enable this
-    # scenario deliberately fails, and it necessarily precedes the rollback -
-    # searching forwards found it and reported a correct rollback as
-    # out of order.
+    # The last enable, not the first: the first one is the forward enable in
+    # step 3, the one whose failure put us on this path at all.
     my ($enable)  = reverse grep { $c[$_] eq 'ns:enable' } 0 .. $#c;
 
     ok(defined $back, 'the rollback renames the dataset back');
@@ -524,7 +526,10 @@ subtest 'step 2: a lost response is reconciled by asking where the dataset is' =
     });
     my @c = @{ $r->{calls} };
     my $renames = grep { $_ eq 'rename:old->new' } @c;
-    my $probes  = grep { $_ eq 'q:pool.dataset.query' } @c;
+    # Either read is fine - a filtered query or a get_instance wrapped in an
+    # eval. What matters is that the pool is asked, not which call asks it.
+    my $probes  = grep { $_ eq 'q:pool.dataset.query'
+                      || $_ eq 'q:pool.dataset.get_instance' } @c;
 
     is($renames, 1, 'the rename is attempted exactly once, with retries off' . XFB)
         or diag(state_dump($r));
@@ -593,13 +598,24 @@ subtest 'step 4: the snapshot commits and the response is lost' => sub {
 };
 
 subtest 'step 4: a stray __base__ does not brick the template forever' => sub {
-    # The consequence of rolling back on an "already exists". The anchor
-    # follows the dataset back to vm-*, and pool.snapshot.create is
-    # name-unique, so every later attempt hits the same wall and the template
-    # can never be made at all.
-    run_create_base(fail => {
+    # The consequence of rolling back on a snapshot that had in fact been
+    # taken. The anchor follows the dataset back to vm-*, and
+    # pool.snapshot.create is name-unique, so every later attempt hits the same
+    # wall and the template can never be made at all.
+    #
+    # Two shapes are acceptable. Reconcile the lost response and the first
+    # attempt just succeeds, leaving no stray anchor for anything to trip over.
+    # Roll back instead and the anchor is left behind, in which case the second
+    # attempt has to cope with it. What is not acceptable is rolling back and
+    # then failing forever on the litter.
+    my $first = run_create_base(fail => {
         'snap:create' => { err => "broker: read timeout after 30s\n", after => 1, n => 1 },
     });
+    if ($first->{ok}) {
+        assert_resolved('step 4 lost response, reconciled on the first attempt',
+                        $first, xfb => 1);
+        return;
+    }
     my $second = run_create_base(no_reset => 1);
     ok($second->{ok}, 'a second attempt after a lost snapshot response can still succeed' . XFB)
         or diag(state_dump($second));

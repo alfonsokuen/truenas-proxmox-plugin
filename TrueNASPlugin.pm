@@ -8300,15 +8300,38 @@ sub create_base {
     # there is no equivalent restriction; extent.update happily
     # rewrites `disk` on a live extent.
     if ($mode eq 'nvme-tcp') {
-        eval {
+        my $disabled = eval {
             _api_call_mutate(
                 $scfg,
                 'nvmet.namespace.update',
                 [ $transport_id, { enabled => JSON::PP::false } ],
             );
+            1;
         };
-        if ($@) {
-            die "create_base: nvmet.namespace.update enabled=false (ns=$transport_id) failed: $@";
+        if (!$disabled) {
+            my $err = $@;
+            # A disable that never happened and one whose response was lost look
+            # the same from here, and the retry layer only covers the second
+            # while it still has attempts left. Exhaust them - four broker
+            # deadlines against a slow TrueNAS - and the namespace is off with
+            # nothing left in this function to turn it back on. Nothing has been
+            # renamed yet, so the stored device_path still resolves and an
+            # enable will validate; enabling one that was never disabled is a
+            # no-op, which is what makes it safe to send without knowing which
+            # case this is.
+            eval {
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::true } ]);
+            };
+            if ($@) {
+                chomp(my $m = $@);
+                _log($scfg, 0, 'err',
+                    "[TrueNAS] create_base: could not disable $share_label and could not turn "
+                  . "it back on ($m); $old_full may be left offline with its namespace "
+                  . "disabled. Recover with: midclt call nvmet.namespace.update "
+                  . "'[$transport_id, {\"enabled\": true}]'");
+            }
+            die "create_base: nvmet.namespace.update enabled=false (ns=$transport_id) failed: $err";
         }
     }
 
@@ -8404,8 +8427,29 @@ sub create_base {
         # the one that exists, then rename, then re-point, then enable.
         my $rolled_back = eval {
             if ($mode eq 'nvme-tcp') {
-                _api_call_mutate($scfg, 'nvmet.namespace.update',
-                    [ $transport_id, { enabled => JSON::PP::false } ]);
+                # Only disable it if it is actually on. The rewire being undone
+                # here is two mutations and this handler runs after either of
+                # them, so the namespace may already be off - and an update that
+                # carries no device_path is judged against the one already
+                # stored. When the re-point is what failed, that stored path is
+                # still the old one while the dataset is already at the new
+                # name, so a redundant disable fails validation and takes the
+                # rollback down with it before anything has been renamed back,
+                # leaving the volume at $new_full with its share pointing at
+                # $old_zvol_path - worse than the bug this rollback exists to
+                # fix, because PVE's vm-* name then resolves to nothing.
+                # Measured: ns:disable, rename, ns:path=new, ns:disable, EINVAL,
+                # stranded. Ask before sending it; if the namespace cannot be
+                # read, send it anyway rather than skip one that was needed.
+                my $live = eval {
+                    _api_call($scfg, 'nvmet.namespace.query',
+                        [ [ [ 'id', '=', $transport_id ] ] ]);
+                };
+                my $ns = (!$@ && ref($live) eq 'ARRAY' && @$live) ? $live->[0] : undef;
+                if (!$ns || $ns->{enabled}) {
+                    _api_call_mutate($scfg, 'nvmet.namespace.update',
+                        [ $transport_id, { enabled => JSON::PP::false } ]);
+                }
                 _api_call_mutate($scfg, 'pool.dataset.rename',
                     [ $new_full, { new_name => $old_full, force => JSON::PP::true } ],
                     { retry_opts => { retry_max => 0 } });
@@ -8454,20 +8498,34 @@ sub create_base {
             { retry_opts => { retry_max => 0 } },
         );
     };
-    if ($@ && $@ =~ /already exists|EEXIST/i) {
-        # The snapshot we were asked to create is there. Whether this attempt
-        # made it or a lost response from a previous one did, the postcondition
-        # holds, and rolling back would destroy a template that is complete.
+    if (my $snap_err = $@) {
+        # Do not decide this from the error text. The guard used to match
+        # /already exists|EEXIST/, but with retries off that reply is exactly
+        # what the call can no longer produce: a lost response now surfaces as
+        # the transport error itself, so the guard never fired on the case that
+        # turning retries off created, and a template that was complete got
+        # rolled back - telling the operator it had failed and leaving a stray
+        # __base__ that follows the dataset back to its vm- name.
+        #
+        # Ask the pool instead. The postcondition either holds or it does not,
+        # and that is a question with an answer. Save the original error first:
+        # the query's own eval clobbers $@, so testing $@ afterwards reported
+        # success whenever the query came back empty - which is create_base
+        # returning a template with no __base__ snapshot at all.
         my $snap_id = "$new_full\@__base__";
         my $exists = eval {
             _api_call($scfg, 'pool.snapshot.query',
                 [ [ [ 'id', '=', $snap_id ] ], { select => [ 'id' ] } ]);
         };
-        if (!$@ && ref($exists) eq 'ARRAY' && @$exists) {
+        my $query_err = $@;
+        if (!$query_err && ref($exists) eq 'ARRAY' && @$exists) {
             _log($scfg, 0, 'warning',
-                "[TrueNAS] create_base: $snap_id already existed; treating the template "
-              . "as complete rather than rolling back");
+                "[TrueNAS] create_base: $snap_id is present despite the error reported by "
+              . "pool.snapshot.create; treating the template as complete rather than "
+              . "rolling it back. original error: $snap_err");
             $@ = '';
+        } else {
+            $@ = $snap_err;
         }
     }
     if ($@) {
