@@ -5680,6 +5680,68 @@ sub _untaint_dev($dev) {
     return $1;
 }
 
+# The one place that knows how the stable NVMe link is spelled, so path() and
+# the wait in activate_volume cannot drift apart.
+sub _nvme_uuid_link($uuid) {
+    return "/dev/disk/by-id/nvme-uuid.$uuid";
+}
+
+# Wait for udev to publish that link.
+#
+# The block device and the link do not appear together: devtmpfs creates
+# /dev/nvmeXnY the moment the namespace is live, while the by-id symlink is
+# udev's work and lands later. path() now returns the link, so activation is
+# not finished until the link is there - otherwise a caller can resolve a path
+# that does not exist yet, and one of them is `qemu-img dd`, which CREATES its
+# output file. That turns a race into a regular file sitting in /dev/disk/by-id
+# holding a cloud-init image, a VM booting without its configuration, and a
+# name udev can no longer claim.
+#
+# It also catches a target that does not publish the UUID descriptor at all -
+# where the kernel names the link nvme-nguid.* or nvme-eui.* instead and this
+# one will never appear. The device selector handles that case by other means;
+# a path built from the UUID cannot, so it has to fail here, loudly, rather
+# than at first write.
+sub _nvme_wait_for_uuid_link {
+    my ($scfg, $uuid, $dev) = @_;
+
+    my $link = _nvme_uuid_link($uuid);
+
+    # -b, not -e. The whole point of this wait is that a caller which loses the
+    # race can leave a REGULAR FILE at this name - qemu-img creates its output
+    # if it is missing - and -e is true for that file. The check written to
+    # prevent the failure would have accepted it, returned instantly, and let a
+    # VM run against a file in RAM: writes that never reach the zvol, reads that
+    # come back as zeros, and nothing anywhere reporting an error. -b follows
+    # the symlink, so it is false for a regular file and false for a dangling
+    # link, which are the two things that must not pass.
+    my $bad_squatter = sub {
+        return if !-e $link || -b $link;
+        die "$link exists but is not a block device.\n"
+          . "A regular file is squatting the udev name - almost certainly written "
+          . "by something that resolved this path before udev created the link, "
+          . "in which case its contents went to RAM and not to the volume. "
+          . "Remove it before continuing.\n";
+    };
+
+    $bad_squatter->();
+    return $link if -b $link;
+
+    for my $i (1 .. 50) {
+        eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) }
+            if $i == 5;
+        $bad_squatter->();
+        return $link if -b $link;
+        usleep(100_000);
+    }
+
+    die "the namespace for $uuid is present as " . ($dev // 'a block device')
+      . ", but udev never created $link.\n"
+      . "This plugin addresses NVMe volumes by that link, so it cannot be used "
+      . "without it. If the link is instead named nvme-nguid.* or nvme-eui.*, "
+      . "the TrueNAS target is not publishing the namespace UUID descriptor.\n";
+}
+
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
     # Note: snapname is used during clone operations - we support snapshots via ZFS
@@ -5728,11 +5790,32 @@ sub path {
         return (_untaint_dev($dev), $vmid, 'images');
 
     } elsif ($mode eq 'nvme-tcp') {
-        # NVMe: metadata is device_uuid
+        # NVMe: metadata is the namespace UUID, and udev names a stable symlink
+        # after it. That makes this pure name resolution - no connect, no
+        # discovery, no failure - which is what PVE's storage API expects of
+        # path(): every native plugin builds its path from the volume name and
+        # returns it without checking that anything is there.
+        #
+        # Doing I/O here had a cost that only showed up from the outside: a
+        # volume deleted behind PVE's back made path() die, and with it every
+        # command that resolves a path before doing anything - including
+        # `qm destroy`, which then could not remove a VM whose disk was already
+        # gone. On local-zfs the same sequence just works. Measured on both.
+        #
+        # activate_volume still connects, still resolves through the full
+        # identity selector, and now also waits for this exact link, so the
+        # device is there by the time anyone uses what this returns.
         my $uuid = $metadata;
-        _nvme_connect($scfg);
-        my $dev = _nvme_device_for_uuid($scfg, $uuid);
-        return (_untaint_dev($dev), $vmid, 'images');
+        # Bifurcation here is on tn_transport_mode, not on the volume name, so a
+        # storage switched to nvme-tcp with iSCSI volumes still on it would hand
+        # us a LUN number and we would build /dev/disk/by-id/nvme-uuid.0 - a
+        # plausible path to nothing, which is worse than an error because of
+        # what qemu-img dd does with a path that does not exist.
+        die "volume '$volname' does not carry an NVMe namespace UUID "
+          . "(got '" . (defined($uuid) ? $uuid : '') . "'); is tn_transport_mode correct?\n"
+            if !defined($uuid)
+            || $uuid !~ /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+        return (_untaint_dev(_nvme_uuid_link($uuid)), $vmid, 'images');
 
     } else {
         die "Unknown transport mode: $mode\n";
@@ -6190,9 +6273,19 @@ sub _alloc_image_nvme {
         eval { _nvme_rescan_subsystem_controllers($deferred_scfg) };
         my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
         if ($dev) {
-            _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image_nvme deferred: device ready at $dev");
+            _log($deferred_scfg, 1, q{info}, "[TrueNAS] alloc_image_nvme deferred: device ready at $dev");
+            # And wait for the by-id link, not just the block device. path()
+            # hands out that link now, and the caller of a fresh alloc or clone
+            # is often qemu-img convert - which CREATES its destination if the
+            # name is not there yet. Losing this race does not fail: it writes
+            # the copy into a regular file in /dev/disk/by-id and reports
+            # success. Waiting here closes the window before the volid is ever
+            # handed back.
+            eval { _nvme_wait_for_uuid_link($deferred_scfg, $deferred_uuid, $dev) };
+            _log($deferred_scfg, 0, q{err},
+                 "[TrueNAS] alloc_image_nvme deferred: the stable by-id link never appeared: $@") if $@;
         } else {
-            _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image_nvme deferred: device not yet visible (activate_volume will handle)");
+            _log($deferred_scfg, 0, q{warning}, "[TrueNAS] alloc_image_nvme deferred: device not yet visible (activate_volume will handle)");
         }
     });
 
@@ -7843,6 +7936,10 @@ sub activate_volume {
         eval {
             my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
+            # path() hands out the by-id link, and udev publishes it after the
+            # block device exists. Activation is not done until it is there.
+            my $link = _nvme_wait_for_uuid_link($scfg, $device_uuid, $dev);
+            _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: stable link ready at $link");
         };
         if ($@) {
             my $err = $@;
@@ -8267,9 +8364,19 @@ sub _clone_image_nvme {
         eval { _nvme_rescan_subsystem_controllers($deferred_scfg) };
         my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
         if ($dev) {
-            _log($deferred_scfg, 1, 'info', "[TrueNAS] clone_image_nvme deferred: device ready at $dev");
+            _log($deferred_scfg, 1, q{info}, "[TrueNAS] clone_image_nvme deferred: device ready at $dev");
+            # And wait for the by-id link, not just the block device. path()
+            # hands out that link now, and the caller of a fresh alloc or clone
+            # is often qemu-img convert - which CREATES its destination if the
+            # name is not there yet. Losing this race does not fail: it writes
+            # the copy into a regular file in /dev/disk/by-id and reports
+            # success. Waiting here closes the window before the volid is ever
+            # handed back.
+            eval { _nvme_wait_for_uuid_link($deferred_scfg, $deferred_uuid, $dev) };
+            _log($deferred_scfg, 0, q{err},
+                 "[TrueNAS] clone_image_nvme deferred: the stable by-id link never appeared: $@") if $@;
         } else {
-            _log($deferred_scfg, 1, 'info', "[TrueNAS] clone_image_nvme deferred: device not yet visible (activate_volume will handle)");
+            _log($deferred_scfg, 0, q{warning}, "[TrueNAS] clone_image_nvme deferred: device not yet visible (activate_volume will handle)");
         }
     });
 
