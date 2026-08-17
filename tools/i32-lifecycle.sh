@@ -62,7 +62,17 @@ BV="$(dirname "$0")/i32-blockverify.pl"
 
 SEED_A=$(( VMID * 100 + 11 ))
 SEED_B=$(( VMID * 100 + 22 ))
-PAT_MIB=2048
+# Derived, not fixed: a hard 2048 with --size 2 writes past the end of the disk
+# and every phase fails for a reason that has nothing to do with the storage.
+# Half the disk, capped, so the run stays short on a large one.
+PAT_MIB=$(( SIZE * 1024 / 2 ))
+if [ "$PAT_MIB" -gt 2048 ]; then
+    PAT_MIB=2048
+fi
+if [ "$PAT_MIB" -lt 64 ]; then
+    echo "refusing: --size $SIZE is too small to test anything useful" >&2
+    exit 2
+fi
 NBD=""
 LOADED_NBD=0
 FAILURES=0
@@ -84,6 +94,19 @@ activate_vol() {
 
 volid_of() { qm config "$1" 2>/dev/null | sed -n 's/^scsi0: \([^,]*\).*/\1/p'; }
 
+# "No matching lines" and "the listing failed" are indistinguishable once piped
+# into wc -l, and they mean opposite things: one is a storage with nothing on
+# it, the other a storage nobody could read. Reading a failed listing as
+# "nothing there" makes the preflight proceed where it should refuse, and makes
+# the teardown claim a clean exit while orphans sit on a storage whose broker
+# is down. Sets VOLS_OUT; returns 1 if the storage could not be listed.
+vols_for() {
+    local s="$1" v="$2" out
+    out="$(pvesm list "$s" 2>/dev/null)" || return 1
+    VOLS_OUT="$(echo "$out" | awk -v x="$v" '$1 ~ ("(vm|base)-" x "-")')"
+    return 0
+}
+
 nbd_attach() {
     local path="$1" fmt="$2" i w
     for i in 0 1 2 3 4 5 6 7; do
@@ -94,7 +117,12 @@ nbd_attach() {
                     [ "$(blockdev --getsize64 "$NBD" 2>/dev/null || echo 0)" -gt 0 ] && return 0
                     sleep 0.3
                 done
-                return 0
+                # Still zero-sized: the attach never came up. Reporting success
+                # would hand every later step a device that fails every I/O,
+                # and those failures would then be read as damage.
+                qemu-nbd --disconnect "$NBD" >/dev/null 2>&1 || true
+                NBD=""
+                return 1
             fi
         fi
     done
@@ -127,16 +155,43 @@ open_vol() {
     # device is created fresh each time, so the cache is cold anyway; on a raw
     # zvol opened directly it is not, and a read could be answered by whatever
     # the write left in memory instead of by the storage.
-    blockdev --flushbufs "$OPENED" 2>/dev/null || true
+    #
+    # blockdev only works on block devices. On a directory-backed storage the
+    # path is a regular file, where it fails silently and leaves the cache
+    # exactly as warm as it was - so that case drops the caches globally
+    # instead, which is heavier but is the only thing that works there.
+    if [ -b "$OPENED" ]; then
+        blockdev --flushbufs "$OPENED" 2>/dev/null || true
+    else
+        sync
+        echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    fi
     return 0
 }
 
 # PVE's own answer, not an inference from the volume name.
+#
+# Three outcomes, not two. Collapsing "the query failed" into "no" is what makes
+# a broken checker agree with itself: ask before and after an operation, get an
+# error both times, read it as "unchanged", and report that nothing was lost
+# while the capability is gone. 0 yes, 1 no, 2 could not tell.
 can_snapshot() {
     perl -e 'use PVE::Storage;
-             my $cfg = PVE::Storage::config();
+             my $cfg = eval { PVE::Storage::config() };
+             exit(2) if $@ || !$cfg;
              my $r = eval { PVE::Storage::volume_has_feature($cfg, "snapshot", $ARGV[0], undef, 0) };
+             exit(2) if $@;
              exit($r ? 0 : 1);' "$1" 2>/dev/null
+}
+
+# yes | no | ? - and "?" must never compare equal to anything, including itself.
+snap_state() {
+    can_snapshot "$1"
+    case $? in
+        0) echo si ;;
+        1) echo no ;;
+        *) echo "?" ;;
+    esac
 }
 close_vol() { [ "${OPENED_NBD:-0}" = 1 ] && nbd_detach; OPENED=""; OPENED_NBD=0; }
 
@@ -201,9 +256,19 @@ for v in "$VMID" "$CLONE" "$LINKED" "$RESTORE"; do
     if pvesh get /cluster/resources --type vm --output-format json 2>/dev/null | grep -q "\"vmid\":$v,"; then
         echo "refusing: VMID $v is in use in the cluster" >&2; exit 2
     fi
-    n="$(pvesm list "$STORAGE" 2>/dev/null | awk -v x="$v" '$1 ~ ("(vm|base)-" x "-")' | wc -l)"
-    if [ "$n" -gt 0 ]; then
-        echo "refusing: $n leftover volume(s) for $v on $STORAGE" >&2; exit 2
+    VOLS_OUT=""
+    if ! vols_for "$STORAGE" "$v"; then
+        echo "refusing: cannot list $STORAGE - unable to tell whether leftovers exist" >&2; exit 2
+    fi
+    if [ -n "$VOLS_OUT" ]; then
+        echo "refusing: leftover volume(s) for $v on $STORAGE" >&2
+        echo "$VOLS_OUT" >&2
+        exit 2
+    fi
+    # A backup left by an earlier run with this same VMID would restore and
+    # verify clean, because the seeds are derived from the VMID and would match.
+    if pvesm list "$BKP" --content backup 2>/dev/null | awk -v x="$v" '$1 ~ ("qemu-" x "-")' | grep -q .; then
+        echo "refusing: a leftover backup for $v already exists on $BKP" >&2; exit 2
     fi
 done
 note "los cuatro vmids libres y sin restos"
@@ -339,8 +404,11 @@ if has_phase L4; then
         # format having quietly lost the ability to snapshot - which is exactly
         # what qm move-disk does without an explicit --format.
         ORIG_VOLID="$(volid_of "$CLONE")"
-        ORIG_SNAP=no; can_snapshot "$ORIG_VOLID" && ORIG_SNAP=si
+        ORIG_SNAP="$(snap_state "$ORIG_VOLID")"
         note "antes de moverlo: $ORIG_VOLID (snapshot: $ORIG_SNAP)"
+        if [ "$ORIG_SNAP" = "?" ]; then
+            fail "L4: no se puede consultar la capacidad de snapshot - la comparacion posterior no valdria"
+        fi
 
         if qm move-disk "$CLONE" scsi0 "$ALT" --delete 1 >/tmp/i32-move1.log 2>&1; then
             pass "L4: disco movido a $ALT"
@@ -357,9 +425,11 @@ if has_phase L4; then
             note "ahora en : $MV2"
             check_pattern "L4: y sobreviven tambien a la vuelta" "$MV2" "$PAT_MIB" "$SEED_A"
 
-            BACK_SNAP=no; can_snapshot "$MV2" && BACK_SNAP=si
+            BACK_SNAP="$(snap_state "$MV2")"
             note "volvio como  : $MV2 (snapshot: $BACK_SNAP)"
-            if [ "$BACK_SNAP" = "$ORIG_SNAP" ]; then
+            if [ "$ORIG_SNAP" = "?" ] || [ "$BACK_SNAP" = "?" ]; then
+                fail "L4: la capacidad de snapshot no se pudo consultar (antes=$ORIG_SNAP despues=$BACK_SNAP)"
+            elif [ "$BACK_SNAP" = "$ORIG_SNAP" ]; then
                 pass "L4: el volumen vuelve con las mismas capacidades que tenia"
             else
                 fail "L4: salio con snapshot=$ORIG_SNAP y vuelve con snapshot=$BACK_SNAP - los datos estan, la capacidad no"
@@ -371,16 +441,22 @@ if has_phase L4; then
         fi
 
         # And the same hop done right, to show the flag is the whole difference.
-        if [ "${BACK_SNAP:-}" != "${ORIG_SNAP:-}" ]; then
-            qm move-disk "$CLONE" scsi0 "$ALT" --delete 1 >/dev/null 2>&1
-            if qm move-disk "$CLONE" scsi0 "$STORAGE" --format qcow2 --delete 1 >/tmp/i32-move3.log 2>&1; then
+        # Only worth running when the plain hop actually degraded something and
+        # both readings were trustworthy - after an unreadable answer there is
+        # nothing to demonstrate.
+        if [ "${ORIG_SNAP:-?}" != "?" ] && [ "${BACK_SNAP:-?}" != "?" ] && \
+           [ "${BACK_SNAP:-}" != "${ORIG_SNAP:-}" ]; then
+            if ! qm move-disk "$CLONE" scsi0 "$ALT" --delete 1 >/tmp/i32-move3a.log 2>&1; then
+                fail "L4: no se pudo sacar el disco otra vez para repetir el salto con --format"
+                tail -3 /tmp/i32-move3a.log | sed 's/^/      /'
+            elif qm move-disk "$CLONE" scsi0 "$STORAGE" --format qcow2 --delete 1 >/tmp/i32-move3.log 2>&1; then
                 MV3="$(volid_of "$CLONE")"
-                FIX_SNAP=no; can_snapshot "$MV3" && FIX_SNAP=si
+                FIX_SNAP="$(snap_state "$MV3")"
                 note "con --format qcow2: $MV3 (snapshot: $FIX_SNAP)"
                 if [ "$FIX_SNAP" = "$ORIG_SNAP" ]; then
                     pass "L4: con --format qcow2 explicito el volumen vuelve intacto en capacidades"
                 else
-                    fail "L4: ni con --format qcow2 se recupera la capacidad de snapshot"
+                    fail "L4: con --format qcow2 la capacidad queda en '$FIX_SNAP' y salio como '$ORIG_SNAP'"
                 fi
                 check_pattern "L4: y los datos siguen ahi tras la tercera ida y vuelta" "$MV3" "$PAT_MIB" "$SEED_A"
             else
@@ -417,8 +493,20 @@ if has_phase L5; then
             # clone's own layer; if it reached the base, every other clone of
             # that template would be silently corrupted too.
             note "escribiendo la semilla $SEED_B en el clon enlazado..."
-            write_pattern "$LNKVOL" 512 "$SEED_B"
-            check_pattern "L5: escribir en el clon no toca la plantilla de debajo" "$TPLVOL" "$PAT_MIB" "$SEED_A"
+            # If that write never landed, the template obviously still reads
+            # SEED_A, and the isolation assertion would pass without anything
+            # having been isolated. So the write is confirmed, and the clone is
+            # confirmed to be showing the new data, before the base is asked.
+            if write_pattern "$LNKVOL" 512 "$SEED_B"; then
+                pass "L5: escritura sobre el clon enlazado completada"
+                if check_pattern "L5: el clon enlazado devuelve el patron nuevo" "$LNKVOL" 512 "$SEED_B"; then
+                    check_pattern "L5: escribir en el clon no toca la plantilla de debajo" "$TPLVOL" "$PAT_MIB" "$SEED_A"
+                else
+                    skip "L5: el clon no refleja la escritura, la prueba de aislamiento no se puede evaluar"
+                fi
+            else
+                fail "L5: no se pudo escribir en el clon enlazado - el aislamiento queda sin probar"
+            fi
         else
             reason="$(tail -2 /tmp/i32-linked.log | tr '\n' ' ')"
             skip "L5: el almacenamiento no admite clones enlazados: $reason"
@@ -453,14 +541,24 @@ if [ -n "$BACKUP_VOLID" ]; then
 fi
 BACKUP_VOLID=""
 leftover=0
+unlistable=0
 for v in "$VMID" "$CLONE" "$LINKED" "$RESTORE"; do
     for s in "$STORAGE" "$ALT"; do
-        n="$(pvesm list "$s" 2>/dev/null | awk -v x="$v" '$1 ~ ("(vm|base)-" x "-")' | wc -l)"
-        leftover=$(( leftover + n ))
-        [ "$n" -gt 0 ] && pvesm list "$s" | awk -v x="$v" '$1 ~ ("(vm|base)-" x "-")' | sed 's/^/      /'
+        VOLS_OUT=""
+        if ! vols_for "$s" "$v"; then
+            unlistable=$(( unlistable + 1 ))
+            note "no se pudo listar $s al buscar restos de $v"
+            continue
+        fi
+        if [ -n "$VOLS_OUT" ]; then
+            leftover=$(( leftover + $(echo "$VOLS_OUT" | wc -l) ))
+            echo "$VOLS_OUT" | sed 's/^/      /'
+        fi
     done
 done
-if [ "$leftover" = 0 ]; then
+if [ "$unlistable" != 0 ]; then
+    fail "limpieza: $unlistable listado(s) fallaron - NO se puede afirmar que no queden restos"
+elif [ "$leftover" = 0 ]; then
     pass "limpieza: no queda ningun volumen de las VMs de prueba"
 else
     fail "limpieza: quedan $leftover volumen(es) sueltos"
@@ -494,4 +592,13 @@ if [ "$SKIPPED" != 0 ]; then
     echo "  Ademas, $SKIPPED comprobacion(es) NO llegaron a ejecutarse. Lo que"
     echo "  prometian NO esta probado - busca las lineas que empiezan por --."
 fi
-exit "$FAILURES"
+
+# Anything reading only the exit code has to see the difference between "every
+# check ran and passed" and "the checks that ran passed". 77 is the usual
+# convention for skipped, and it is not zero, which is the point.
+if [ "$FAILURES" != 0 ]; then
+    exit "$FAILURES"
+elif [ "$SKIPPED" != 0 ]; then
+    exit 77
+fi
+exit 0

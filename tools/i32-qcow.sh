@@ -100,6 +100,20 @@ cur_volid() {
     qm config "$VMID" 2>/dev/null | sed -n 's/^scsi0: \([^,]*\).*/\1/p'
 }
 
+# "No matching lines" and "the listing failed" are indistinguishable once they
+# have been piped into wc -l, and they mean opposite things: one is a storage
+# with nothing on it, the other is a storage nobody could read. Reading a failed
+# listing as "nothing there" makes the preflight proceed where it should refuse,
+# and makes the teardown report a clean exit while orphaned volumes sit on a
+# storage whose broker happens to be down. Sets VOLS_OUT; returns 1 if the
+# storage could not be listed at all.
+vols_for() {
+    local s="$1" v="$2" out
+    out="$(pvesm list "$s" 2>/dev/null)" || return 1
+    VOLS_OUT="$(echo "$out" | awk -v x="$v" '$1 ~ ("(vm|base)-" x "-")')"
+    return 0
+}
+
 cur_path() {
     local v
     v="$(cur_volid)"
@@ -114,14 +128,21 @@ nbd_attach() {
         if [ ! -e "/sys/block/nbd$i/pid" ]; then
             if qemu-nbd --connect="/dev/nbd$i" --format=qcow2 --cache=none "$path" 2>/dev/null; then
                 NBD="/dev/nbd$i"
-                # The connect returns before the kernel has sized the device.
+                # The connect returns before the kernel has sized the device, so
+                # a size of zero means "not ready yet" for a moment and "never
+                # going to work" after that. Returning success on a zero-sized
+                # device hands every later step a device that fails every I/O,
+                # and a test that reads those failures as damage would call that
+                # a detection. It has to be an attach failure instead.
                 for w in 1 2 3 4 5 6 7 8 9 10; do
                     if [ "$(blockdev --getsize64 "$NBD" 2>/dev/null || echo 0)" -gt 0 ]; then
                         return 0
                     fi
                     sleep 0.3
                 done
-                return 0
+                qemu-nbd --disconnect "$NBD" >/dev/null 2>&1 || true
+                NBD=""
+                return 1
             fi
         fi
     done
@@ -193,10 +214,14 @@ if pvesh get /cluster/resources --type vm --output-format json 2>/dev/null | gre
 fi
 
 # Anything already carrying this VMID's name is a leftover we must not adopt.
-stale="$(pvesm list "$STORAGE" 2>/dev/null | awk -v v="$VMID" '$1 ~ ("(vm|base)-" v "-")' | wc -l)"
-if [ "$stale" -gt 0 ]; then
-    echo "refusing: $stale leftover volume(s) for VMID $VMID on $STORAGE" >&2
-    pvesm list "$STORAGE" | awk -v v="$VMID" '$1 ~ ("(vm|base)-" v "-")' >&2
+VOLS_OUT=""
+if ! vols_for "$STORAGE" "$VMID"; then
+    echo "refusing: cannot list $STORAGE - unable to tell whether leftovers exist" >&2
+    exit 2
+fi
+if [ -n "$VOLS_OUT" ]; then
+    echo "refusing: leftover volume(s) for VMID $VMID on $STORAGE" >&2
+    echo "$VOLS_OUT" >&2
     exit 2
 fi
 note "sin restos previos de $VMID"
@@ -418,23 +443,42 @@ if has_phase Q3; then
         PATH5="$(cur_path)"
         if nbd_attach "$PATH5"; then
             OFF_MIB=100
+            OFF_BYTES=$(( OFF_MIB * 1024 * 1024 ))
             note "corrompiendo 8 KiB a proposito en el offset ${OFF_MIB} MiB..."
-            dd if=/dev/urandom of="$NBD" bs=4096 seek=$(( OFF_MIB * 256 )) count=2 \
-               conv=notrunc oflag=direct status=none 2>/dev/null
+            # If the corruption never lands, the disk stays clean and the verify
+            # says so - and blaming the verifier for that would be accusing the
+            # innocent. The write has to be confirmed before its detection means
+            # anything.
+            if dd if=/dev/urandom of="$NBD" bs=4096 seek=$(( OFF_MIB * 256 )) count=2 \
+                  conv=notrunc oflag=direct status=none 2>/dev/null; then
+                pass "Q3: la corrupcion deliberada se escribio"
+            else
+                fail "Q3: no se pudo escribir la corrupcion deliberada - la fase no prueba nada"
+            fi
             sync
             blockdev --flushbufs "$NBD" 2>/dev/null || true
 
             out="$("$BV" verify "$NBD" "$(( PAT_MIB * 1024 * 1024 ))" "$SEED_A" 2>&1)"
             rc=$?
             echo "$out" | sed 's/^/      /' | head -14
-            if [ "$rc" != 0 ]; then
-                if echo "$out" | grep -q "104857600"; then
-                    pass "Q3: el daño se detecta Y se localiza en el offset correcto"
-                else
-                    pass "Q3: el daño se detecta"
-                fi
+            # "Anything but zero" is not detection. The verifier exits 1 for a
+            # mismatch and dies with something else on an I/O error, and an I/O
+            # error is the failure mode this whole phase exists to rule out - a
+            # broken device would otherwise be read as a successful detection.
+            # So: exit code 1, and a MISMATCH line, and the right offset.
+            if [ "$rc" != 1 ]; then
+                fail "Q3: el verificador salio con $rc, que no es 'diferencias encontradas' sino un error - no se ha probado nada"
+            elif ! echo "$out" | grep -q '^MISMATCH:'; then
+                fail "Q3: salida sin linea MISMATCH pese al codigo 1"
+            elif ! echo "$out" | grep -q "$OFF_BYTES"; then
+                fail "Q3: se detecta daño pero NO en el offset $OFF_BYTES donde se provoco"
             else
-                fail "Q3: 8 KiB corrompidos y el verificador dice intacto - EL VERIFICADOR NO SIRVE"
+                ndiff="$(echo "$out" | sed -n 's/^MISMATCH: \([0-9][0-9]*\) of .*/\1/p' | head -1)"
+                if [ "${ndiff:-0}" = 2 ]; then
+                    pass "Q3: se corrompieron 2 bloques y se detectan exactamente 2, en el offset correcto"
+                else
+                    fail "Q3: se corrompieron 2 bloques y se reportan ${ndiff:-?} - el verificador no localiza bien"
+                fi
             fi
             nbd_detach
         else
@@ -443,19 +487,27 @@ if has_phase Q3; then
 
         # Metadata corruption, on a volume of its own so nothing else is at risk.
         say "Q3b - corrupcion de metadatos qcow2"
-        if pvesm alloc "$STORAGE" "$VMID" "vm-$VMID-disk-9" 1G --format qcow2 >/dev/null 2>&1; then
-            pass "Q3b: pvesm alloc de un volumen de 1 GiB"
-            MVOL="$STORAGE:vm-$VMID-disk-9"
+        # Let PVE name the volume. This storage appends .qcow2 to qcow2 volumes,
+        # and a hand-built name that happens to work today is one release away
+        # from being rejected for a reason that has nothing to do with the test.
+        alloc_out="$(pvesm alloc "$STORAGE" "$VMID" '' 1G --format qcow2 2>&1)"
+        MVOL="$(echo "$alloc_out" | sed -n "s/.*'\($STORAGE:[^']*\)'.*/\1/p" | head -1)"
+        if [ -n "$MVOL" ]; then
+            pass "Q3b: pvesm alloc de un volumen de 1 GiB ($MVOL)"
             activate_vol "$MVOL"
             MPATH="$(pvesm path "$MVOL" 2>/dev/null)"
             note "ruta      : $MPATH"
 
             qemu-img check -f qcow2 "$MPATH" >/dev/null 2>&1
             rc=$?
-            if [ "$rc" -le 1 ]; then
+            # Same mapping as img_check: only 0 and 3 mean the image is good.
+            # Accepting 1 here would let a check that could not run stand in for
+            # a clean baseline, and then the corruption step would have nothing
+            # to be compared against.
+            if [ "$rc" = 0 ] || [ "$rc" = 3 ]; then
                 pass "Q3b: recien creado, los metadatos estan limpios"
             else
-                fail "Q3b: un volumen recien creado ya da error $rc"
+                fail "Q3b: un volumen recien creado da rc=$rc (1 = la comprobacion no pudo completarse)"
             fi
 
             # The L1 table sits just past the header cluster. Filling it with
@@ -481,18 +533,31 @@ if has_phase Q3; then
                 fail "Q3b: metadatos destrozados y qemu-img check devuelve $rc con $nerr errores"
             fi
 
-            # And the block layer must not hand a guest silently wrong clusters.
+            # What the block layer does with a corrupt image is worth recording
+            # but is not a promise qcow2 makes, so it is reported and not
+            # asserted - three branches that all end in pass() is a check that
+            # cannot fail, which is the same as no check at all. The claim that
+            # IS enforced is the one above: qemu-img check flags it.
             if nbd_attach "$MPATH"; then
                 bad="$(dd if="$NBD" bs=4096 count=16 2>/dev/null | wc -c)"
-                note "lectura tras la corrupcion: $bad bytes devueltos"
                 nbd_detach
                 if [ "$bad" -lt 65536 ]; then
-                    pass "Q3b: la capa de bloque corta la lectura de la imagen dañada"
+                    note "observado: la capa de bloque corta la lectura ($bad de 65536 bytes)"
                 else
-                    pass "Q3b: la imagen dañada se abre pero qemu-img check ya la marca"
+                    note "observado: la imagen dañada se abre y devuelve $bad bytes; quien la detecta es qemu-img check"
                 fi
             else
-                pass "Q3b: la capa de bloque se NIEGA a abrir la imagen dañada"
+                # Could be a refusal to open, or simply no free nbd slot. Saying
+                # "it refuses" without knowing which would be inventing a result.
+                free_slots=0
+                for i in 0 1 2 3 4 5 6 7; do
+                    [ -e "/sys/block/nbd$i/pid" ] || free_slots=$(( free_slots + 1 ))
+                done
+                if [ "$free_slots" -gt 0 ]; then
+                    note "observado: qemu-nbd se NIEGA a abrir la imagen dañada (habia $free_slots slots libres)"
+                else
+                    fail "Q3b: no quedan slots nbd libres, no se pudo observar el comportamiento de lectura"
+                fi
             fi
 
             if pvesm free "$MVOL" >/dev/null 2>&1; then
@@ -513,14 +578,35 @@ fi
 if has_phase Q4; then
     say "Q4 - coste del formato: qcow2 frente al LV en crudo"
 
+    PATH6="$(cur_path 2>/dev/null || true)"
+    # Q4 is the only phase that writes to a resolved path rather than to a
+    # device this script created, and it does so twice: qemu-img bench -f raw
+    # and the dd benchmark. So the path is re-checked against the VMID once,
+    # here, before either of them runs - a guard placed between the two would
+    # be protecting the second write from a mistake the first already made.
+    Q4_OK=1
+    if [ -z "$PATH6" ] || [ ! -b "$PATH6" ]; then
+        Q4_OK=0
+        note "Q4: '$PATH6' no es un dispositivo de bloque"
+    else
+        case "$(basename "$PATH6")" in
+            *-"$VMID"-*) ;;
+            *) Q4_OK=0; note "Q4: $PATH6 no lleva el vmid $VMID en el nombre" ;;
+        esac
+    fi
+
     if ! qm status "$VMID" >/dev/null 2>&1; then
         skip "Q4: no hay VM $VMID"
+    elif [ "$Q4_OK" != 1 ]; then
+        skip "Q4: la ruta del disco no se pudo confirmar como del vmid $VMID, no se escribe nada"
     else
-        PATH6="$(cur_path)"
-        SRC=/dev/shm/i32-qcow-src
+        SRC="/dev/shm/i32-qcow-src-$VMID"
         dd if=/dev/urandom of="$SRC" bs=1M count=256 status=none
         MIB=1024
 
+        # A dd that fails instantly is not a fast transfer, but divided by an
+        # elapsed time near zero it looks like one. Failures have to end the
+        # measurement rather than flatter it.
         bench() {
             local dev="$1" bs="$2" bsb="$3" mode="$4" t0 t1 i loops
             loops=$(( MIB / 256 ))
@@ -529,10 +615,12 @@ if has_phase Q4; then
             for ((i = 0; i < loops; i++)); do
                 if [ "$mode" = w ]; then
                     dd if="$SRC" of="$dev" bs="$bs" seek=$(( i * 256 * 1048576 / bsb )) \
-                       count=$(( 256 * 1048576 / bsb )) oflag=direct status=none 2>/dev/null
+                       count=$(( 256 * 1048576 / bsb )) oflag=direct status=none 2>/dev/null || {
+                        echo "err"; return 1; }
                 else
                     dd if="$dev" of=/dev/null bs="$bs" skip=$(( i * 256 * 1048576 / bsb )) \
-                       count=$(( 256 * 1048576 / bsb )) iflag=direct status=none 2>/dev/null
+                       count=$(( 256 * 1048576 / bsb )) iflag=direct status=none 2>/dev/null || {
+                        echo "err"; return 1; }
                 fi
             done
             t1=$(date +%s.%N)
@@ -566,32 +654,33 @@ if has_phase Q4; then
             awk -v s="$secs" -v b="$bsz" -v c="$cnt" \
                 'BEGIN { if (s <= 0) s = 0.001; printf "%.0f", (b * c) / 1048576 / s }'
         }
-        DQ1_R=""; DQ1_W=""; DR1_R=""; DR1_W=""
         DQ1_R="$(qbench "$PATH6" qcow2 1048576 1024 r)"
         DQ1_W="$(qbench "$PATH6" qcow2 1048576 1024 w)"
         DR1_R="$(qbench "$PATH6" raw   1048576 1024 r)"
         DR1_W="$(qbench "$PATH6" raw   1048576 1024 w)"
-        pass "Q4: medido tambien sin nbd, con qemu-img bench"
+        # qbench prints n/a when it cannot parse a duration out of qemu-img.
+        # Announcing a measurement that is four n/a values is worse than
+        # announcing nothing, because the summary line is what gets quoted.
+        if [ "$DQ1_R" = "n/a" ] || [ "$DQ1_W" = "n/a" ] || \
+           [ "$DR1_R" = "n/a" ] || [ "$DR1_W" = "n/a" ]; then
+            fail "Q4: qemu-img bench no devolvio tiempos utilizables"
+        else
+            pass "Q4: medido tambien sin nbd, con qemu-img bench"
+        fi
 
         # The same LV, opened raw. The difference between the two rows is what
         # the format costs - anything else would be comparing two devices.
-        R1M_W=""; R1M_R=""; R4M_W=""; R4M_R=""
-        # This is the one place that writes raw to a resolved path rather than
-        # through a device this script created, so the path is checked against
-        # the VMID again here instead of trusting that cur_path was right.
-        case "$(basename "$PATH6")" in
-            *-"$VMID"-*) ;;
-            *) fail "Q4: $PATH6 no lleva el vmid $VMID en el nombre, no se escribe en crudo"
-               PATH6="" ;;
-        esac
-        if [ -n "$PATH6" ] && [ -b "$PATH6" ]; then
-            R1M_W="$(bench "$PATH6" 1M 1048576 w)"
-            R1M_R="$(bench "$PATH6" 1M 1048576 r)"
-            R4M_W="$(bench "$PATH6" 4M 4194304 w)"
-            R4M_R="$(bench "$PATH6" 4M 4194304 r)"
-            pass "Q4: medido en crudo sobre el mismo LV (la imagen queda inservible, se destruye despues)"
+        # The VMID and block-device checks already ran above, before anything
+        # wrote to this path.
+        R1M_W="$(bench "$PATH6" 1M 1048576 w)"
+        R1M_R="$(bench "$PATH6" 1M 1048576 r)"
+        R4M_W="$(bench "$PATH6" 4M 4194304 w)"
+        R4M_R="$(bench "$PATH6" 4M 4194304 r)"
+        if [ "$Q1M_W" = err ] || [ "$Q1M_R" = err ] || [ "$Q4M_W" = err ] || [ "$Q4M_R" = err ] || \
+           [ "$R1M_W" = err ] || [ "$R1M_R" = err ] || [ "$R4M_W" = err ] || [ "$R4M_R" = err ]; then
+            fail "Q4: alguna transferencia fallo, las cifras de esa fila no valen"
         else
-            fail "Q4: $PATH6 no es un dispositivo de bloque"
+            pass "Q4: medido en crudo sobre el mismo LV (la imagen queda inservible, se destruye despues)"
         fi
 
         echo ""
@@ -626,12 +715,14 @@ if qm status "$VMID" >/dev/null 2>&1; then
         fail "limpieza: qm destroy fallo - QUEDA BASURA para VMID $VMID"
     fi
 fi
-left="$(pvesm list "$STORAGE" 2>/dev/null | awk -v v="$VMID" '$1 ~ ("(vm|base)-" v "-")' | wc -l)"
-if [ "$left" = 0 ]; then
+VOLS_OUT=""
+if ! vols_for "$STORAGE" "$VMID"; then
+    fail "limpieza: no se pudo listar $STORAGE - NO se puede afirmar que no queden restos"
+elif [ -z "$VOLS_OUT" ]; then
     pass "limpieza: no queda ningun volumen de $VMID en $STORAGE"
 else
-    fail "limpieza: quedan $left volumen(es) de $VMID"
-    pvesm list "$STORAGE" | awk -v v="$VMID" '$1 ~ ("(vm|base)-" v "-")' | sed 's/^/      /'
+    fail "limpieza: quedan volumenes de $VMID"
+    echo "$VOLS_OUT" | sed 's/^/      /'
 fi
 
 say "resumen"
@@ -663,4 +754,13 @@ if [ "$SKIPPED" != 0 ]; then
     echo ""
     echo "  Ademas, $SKIPPED comprobacion(es) NO llegaron a ejecutarse - lineas con --."
 fi
-exit "$FAILURES"
+
+# Anything reading only the exit code has to see the difference between "all
+# checks ran and passed" and "the checks that ran passed". 77 is the usual
+# convention for skipped, and it is not zero, which is the whole point.
+if [ "$FAILURES" != 0 ]; then
+    exit "$FAILURES"
+elif [ "$SKIPPED" != 0 ]; then
+    exit 77
+fi
+exit 0

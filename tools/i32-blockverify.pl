@@ -27,6 +27,20 @@ use strict;
 use warnings;
 use IO::Handle;
 
+# The header above promises exit 2 for an I/O error, and a bare die does not
+# keep that promise: it exits with errno, or 255, or whatever happens to be in
+# $!. A caller that distinguishes "blocks differ" (1) from "this did not work"
+# (anything else) - which is the only way a positive-control test can tell a
+# real detection from a broken device - has to be able to trust the number.
+#
+# $^S is true while an eval is running, and the sync check below relies on eval
+# to tolerate a failure, so this handler must stand aside for those.
+$SIG{__DIE__} = sub {
+    die $_[0] if $^S;
+    print STDERR $_[0];
+    exit 2;
+};
+
 use constant BLK   => 4096;
 use constant CHUNK => 256;            # blocks built per syswrite/sysread
 use constant MAGIC => 'IDK32BLK';     # exactly 8 bytes
