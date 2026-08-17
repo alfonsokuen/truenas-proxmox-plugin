@@ -1985,7 +1985,12 @@ sub _tn_pool_health($scfg) {
     # call was left on the default. Pool health is advisory and cached for a
     # minute, so a missed sample costs nothing.
     my $pools = eval {
-        _api_call($scfg, 'pool.query', [[ ["name", "=", $pool_name] ]], { retry_max => 0 });
+        # retry_opts, not retry_max at the top level: _api_call reads
+        # $opts->{retry_opts} and silently ignores anything else, so the flat
+        # form left the default of three retries in place while looking like it
+        # had disabled them.
+        _api_call($scfg, 'pool.query', [[ ["name", "=", $pool_name] ]],
+            { retry_opts => { retry_max => 0 } });
     };
     return undef if $@ || !$pools || !@$pools;
 

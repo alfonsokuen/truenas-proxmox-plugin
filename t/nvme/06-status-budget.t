@@ -47,13 +47,16 @@ my $throw   = undef;  # error to throw from every API call
     *{"${PKG}::_nvme_connect"} = sub { 1 };
     *{"${PKG}::_api_call"} = sub {
         my ($scfg, $method, $params, $opts) = @_;
-        # Two shapes reach here. Direct callers pass { retry_max => N };
-        # _tn_dataset_get nests it as { retry_opts => { retry_max => N } }.
-        # An earlier draft of this test read only the flat one and reported a
-        # call as retrying when it was not - the assertion has to understand
-        # both or it measures the wrapper rather than the policy.
-        my $rmax = $opts->{retry_opts} ? $opts->{retry_opts}{retry_max}
-                 :                       $opts->{retry_max};
+        # Read the option exactly as the real _api_call does - only
+        # $opts->{retry_opts} - and deliberately not the flat
+        # $opts->{retry_max}. An earlier draft of this stub accepted both, and
+        # that is precisely how it came to approve a fix that did nothing: the
+        # call site had been given { retry_max => 0 }, _api_call ignored it and
+        # kept its default of three retries, and this test reported the policy
+        # as disabled because the stub was more forgiving than the code. A stub
+        # that accepts more shapes than the thing it stands in for measures its
+        # own tolerance.
+        my $rmax = $opts->{retry_opts} ? $opts->{retry_opts}{retry_max} : undef;
         push @calls, { method => $method, retry_max => $rmax };
         sleep($latency) if $latency;
         die $throw if defined $throw;
