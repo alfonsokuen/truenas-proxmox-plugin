@@ -825,6 +825,23 @@ sub check_config {
         );
     }
 
+    # A hostnqn can be changed on an existing storage, so its format is checked
+    # on every path, not only at creation.
+    if (defined($opts->{tn_hostnqn}) && $opts->{tn_hostnqn} ne ''
+        && $opts->{tn_hostnqn} !~ /^nqn\./) {
+        die "tn_hostnqn must follow NVMe NQN format\n";
+    }
+
+    # Everything below describes what a COMPLETE configuration must look like,
+    # so it can only be asked of one. On update, PVE hands the plugin just the
+    # options that changed - `pvesm set <id> --nodes pve3` arrives here as a
+    # config containing nothing but `nodes` - and demanding tn_api_host of that
+    # made every edit of an existing storage fail, from the CLI, the API and the
+    # web interface alike. The connection and placement options are all
+    # `fixed => 1`, so PVE::SectionConfig already refuses to change them; there
+    # is nothing left for this block to protect on the update path.
+    return $opts if !$create;
+
     # Validate required fields are present
     if (!$opts->{tn_api_host}) {
         die "tn_api_host is required\n";
