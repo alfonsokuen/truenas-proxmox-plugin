@@ -1675,7 +1675,22 @@ sub _wait_for_job_completion {
 
         my $job_status;
         eval {
-            $job_status = _api_call($scfg, 'core.call', ['core.get_jobs', [{ id => int($job_id) }]]);
+            # core.get_jobs directly, with a query filter. The previous form -
+            # core.call wrapping core.get_jobs, passing { id => N } as the
+            # filter - could not work on 25.10 for two independent reasons, both
+            # measured against a live target:
+            #
+            #   core.call([...])                  -> -32601 Method does not exist
+            #   core.get_jobs([{id => 1}])        -> EINVAL filters: Input should be a valid list
+            #   core.get_jobs([[['id','=',1]]])   -> ok
+            #
+            # core.call is simply gone from the JSON-RPC API. So every call into
+            # here failed, five times in a row, and the wait returned "API
+            # unavailable" - which meant no operation that returns a job id
+            # could ever be waited on. The failure is silent at level 1, and
+            # tn_debug defaults to 0.
+            $job_status = _api_call($scfg, 'core.get_jobs',
+                [ [ [ 'id', '=', int($job_id) ] ] ]);
         };
 
         if ($@) {

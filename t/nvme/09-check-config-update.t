@@ -32,6 +32,22 @@ unless (eval { require $PLUGIN; 1 }) {
 
 my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 
+# Unlike every other test here, this one goes through PVE::SectionConfig - and
+# a custom storage plugin is unknown to it until it has been registered. PVE
+# does that at runtime for everything under PVE/Storage/Custom/; the plugin file
+# does not register itself. A test that just loads the file gets "unknown
+# section type 'truenasplugin'" from the SUPER call, before reaching a single
+# line of the plugin's own validation, and every assertion below fails for a
+# reason that has nothing to do with what it is testing.
+unless (eval {
+    require PVE::Storage::Plugin;
+    $PKG->register();
+    PVE::Storage::Plugin->init();
+    1;
+}) {
+    plan skip_all => "cannot register the plugin with PVE::SectionConfig: $@";
+}
+
 # A complete, valid nvme-tcp configuration, as it would arrive on create.
 my %full = (
     type              => 'truenasplugin',
@@ -90,12 +106,19 @@ for my $opt (
 
 # The three fields whose absence must still be fatal at creation. If the fix
 # had simply deleted these checks, this is what would notice.
+#
+# The message comes from PVE::SectionConfig, not from the plugin: options
+# without `optional => 1` are enforced by the SUPER call before the plugin's own
+# "is required" lines are ever reached, so those lines are unreachable on the
+# create path too. They are left in place as documentation of intent, but this
+# asserts on the behaviour - creation is refused and the error names the field -
+# rather than on which layer produced the wording.
 for my $missing (qw(tn_api_host tn_api_key tn_dataset)) {
     my %cfg = %full;
     delete $cfg{$missing};
     my (undef, $err) = try_check(\%cfg, 1);
-    like($err // '', qr/\Q$missing\E is required/,
-        "creating without $missing is still refused");
+    like($err // '', qr/\Q$missing\E/,
+        "creating without $missing is refused, and the error names it");
 }
 
 # Transport-specific requirements likewise.
