@@ -161,7 +161,9 @@ note "el invitado responde"
 # filtering it, and leaves the log readable.
 gexec "bind 'set enable-bracketed-paste off' 2>/dev/null; true" 10
 
-gexec 'cat /run/i32-datadisk' 10
+# The guest resolves its disks by serial, so ask it rather than guessing a name
+# that changes with boot order.
+gexec '. /usr/local/bin/i32-paths.sh; basename "$I32BLK"' 10
 DATA="$(echo "$GOUT" | tr -d ' \t' | grep -E '^[a-z]+[0-9]*$' | tail -1)"
 # A device name that came back with anything else glued to it would fail every
 # open, and every one of those failures would read as a storage fault. Better to
