@@ -5320,7 +5320,12 @@ sub _nvme_device_for_uuid {
         $namespace_detail,
     );
 
-    die $err_msg;
+    # The hint belongs here, not further up. Attached to activate_volume it
+    # reached a direct activate_volumes() call and neither `pvesm free` nor
+    # `qm destroy` - which is to say nobody, since those are the two commands
+    # an operator actually runs into this with. Both reach the failure through
+    # this function.
+    die $err_msg . _activation_hint_already_freed();
 }
 
 # Sync NVMe portals: ensure all configured portals have port bindings on TrueNAS.
@@ -7824,6 +7829,7 @@ sub activate_volume {
             my $err = $@;
             $err = 'Unknown error while locating iSCSI device' if !defined($err) || $err eq '';
             _log($scfg, 0, 'err', "[TrueNAS] activate_volume: failed to locate device: $err");
+            $err .= _activation_hint_already_freed();
             $err .= "\n" if $err !~ /\n\z/;
             die $err;
         }
@@ -7842,6 +7848,8 @@ sub activate_volume {
             my $err = $@;
             $err = 'Unknown error while locating NVMe device' if !defined($err) || $err eq '';
             _log($scfg, 0, 'err', "[TrueNAS] activate_volume: failed to locate device: $err");
+            # No hint appended here: _nvme_device_for_uuid already carries it,
+            # and it raises for every caller, not just this one.
             $err .= "\n" if $err !~ /\n\z/;
             die $err;
         }
@@ -7849,6 +7857,38 @@ sub activate_volume {
 
     return 1;
 }
+
+# PVE activates a volume before freeing it and before destroying the VM that
+# holds it, so an already-deleted disk arrives here rather than at free_image -
+# which is idempotent and would have been perfectly happy. The device
+# troubleshooting above is then advice about a fabric that was never going to
+# produce a device, and the operator goes looking for a fault that is not there.
+#
+# This deliberately asserts nothing about whether the volume exists. Asking
+# TrueNAS would seem obvious, and was tried: a pool that failed to import
+# answers "no such dataset" for every volume it holds, with the data intact, so
+# a confident "this volume is gone - remove it from the VM" is an instruction
+# that destroys data at exactly the moment the operator is most likely to
+# follow it. And the check costs an API round trip - up to the whole broker
+# timeout - on a path that has already failed, in the middle of VM start,
+# migration and backup. A conditional hint is worth neither.
+#
+# The escape it names was measured, not reasoned about. The reasoned-about
+# version said `qm set --delete` merely moves the disk to unusedN and that only
+# editing the config file breaks the loop; running it says otherwise. With the
+# volume already gone, `qm set <vmid> --delete <disk>` returns 0 and leaves no
+# unusedN entry behind, and the `qm destroy` after it succeeds. The config-file
+# edit is the fallback for when it does not.
+sub _activation_hint_already_freed {
+    return "\n"
+         . "If this volume was already deleted, this is the expected failure: "
+         . "PVE activates a volume before freeing it, and there is no device "
+         . "to activate. Drop the stale reference with "
+         . "`qm set <vmid> --delete <disk>` and then destroy the VM. If that "
+         . "still fails, delete the disk's line from "
+         . "/etc/pve/qemu-server/<vmid>.conf and retry.\n";
+}
+
 sub deactivate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
     # Snapshot mode (issue #42): tear down the ephemeral clone device that
