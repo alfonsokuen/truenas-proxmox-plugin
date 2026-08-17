@@ -85,9 +85,29 @@ run_read() {
         'BEGIN { d = t1 - t0; if (d <= 0) d = 0.001; printf "%.0f", mb / d }'
 }
 
-printf "%-8s  %-28s  %s\n" "bloque" "escritura MB/s (3 pasadas)" "lectura MB/s (3 pasadas)"
-printf "%-8s  %-28s  %s\n" "------" "----------------------------" "------------------------"
+# Speed on its own would not have caught issue #45. That fault is about the
+# target failing to map buffers for LARGE transfers, and a disk move never
+# issues one - qemu-img convert works in a couple of megabytes at a time, so a
+# clean move says nothing about what happens at max_sectors_kb. Reading each
+# pass back and comparing it byte for byte turns the 32M row into the only test
+# here that actually exercises the size the bug is about.
+run_verify() {
+    local bs="$1" total="$2" loops i bad=0
+    loops=$(( total / CHUNK_MIB ))
+    [ "$loops" -ge 1 ] || loops=1
+    blockdev --flushbufs "$DEV" 2>/dev/null || true
+    for ((i = 0; i < loops; i++)); do
+        dd if="$DEV" bs="$bs" skip=$(( i * CHUNK_MIB * 1024 * 1024 / bs_bytes )) \
+           count=$(( CHUNK_MIB * 1024 * 1024 / bs_bytes )) iflag=direct status=none 2>/dev/null \
+           | cmp -s - "$SRC" || bad=$(( bad + 1 ))
+    done
+    [ "$bad" = 0 ] && echo "intacto" || echo "DAÑADO en $bad de $loops trozo(s)"
+}
 
+printf "%-6s  %-26s  %-26s  %s\n" "bloque" "escritura MB/s (x3)" "lectura MB/s (x3)" "integridad"
+printf "%-6s  %-26s  %-26s  %s\n" "------" "--------------------------" "--------------------------" "----------"
+
+worst=0
 for bs in 64k 1M 4M 32M; do
     case "$bs" in
         64k) bs_bytes=65536 ;;
@@ -98,9 +118,23 @@ for bs in 64k 1M 4M 32M; do
     w=""; r=""
     for _ in 1 2 3; do w="$w $(run_write "$bs" "$SIZE_MIB")"; done
     for _ in 1 2 3; do r="$r $(run_read  "$bs" "$SIZE_MIB")"; done
-    printf "%-8s %-29s %s\n" "$bs" "$w" "$r"
+    # The last write pass is still on the device, so verify against that.
+    v="$(run_verify "$bs" "$SIZE_MIB")"
+    case "$v" in DAÑADO*) worst=1 ;; esac
+    printf "%-6s  %-26s  %-26s  %s\n" "$bs" "$w" "$r" "$v"
 done
 
 echo ""
 echo "Un solo valor bajo entre tres altos importa mas que la media: en un fabric"
 echo "sano las tres pasadas se parecen. Si no, mira el log del kernel de la ventana."
+echo ""
+if [ "$worst" = 0 ]; then
+    echo "Integridad intacta en los cuatro tamanos, incluido 32M - que es el unico"
+    echo "que llega al limite de max_sectors_kb y por tanto el unico que pone a"
+    echo "prueba el mecanismo descrito en el issue #45."
+else
+    echo "HAY DAÑO. Anota en que tamano de bloque aparece: si solo ocurre en los"
+    echo "grandes, es exactamente la firma del issue #45 y el remedio es limitar"
+    echo "max_sectors_kb en el iniciador."
+fi
+exit "$worst"
