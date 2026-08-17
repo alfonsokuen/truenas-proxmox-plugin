@@ -21,7 +21,9 @@
 #   i32-qcow.sh --storage <sid> --vmid <9990-9999> [--size GiB] [--phases Q1,Q2,Q3,Q4] --yes
 #
 # It creates and destroys a VM and its disk. VMIDs are restricted to the
-# scratch range and every volume it touches must belong to that VMID.
+# scratch range and every volume it touches must belong to that VMID. The one
+# thing here that is NOT scoped that way is unloading the nbd module on exit,
+# and that only happens if this script was the one that loaded it.
 
 set -uo pipefail
 
@@ -44,7 +46,10 @@ fi
 [ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 2; }
 
 # The whole safety story is this range plus the ownership checks below. Every
-# destructive command in here names $VMID, and nothing else can be reached.
+# destructive command either names $VMID directly or writes to a path that is
+# re-checked against $VMID at the point of use - see Q4, the only place that
+# writes raw to a path resolved earlier rather than to a device this script
+# created itself.
 case "$VMID" in
     999[0-9]) ;;
     *) echo "refusing: VMID $VMID is outside the scratch range 9990-9999" >&2; exit 2 ;;
@@ -55,10 +60,10 @@ BV="$(dirname "$0")/i32-blockverify.pl"
 
 SEED_A=$(( VMID * 100 + 11 ))
 SEED_B=$(( VMID * 100 + 22 ))
-PAT_MIB=$(( SIZE * 1024 / 2 ))          # half the disk, so a rollback has
-if [ "$PAT_MIB" -gt 4096 ]; then        # untouched territory beyond it too
-    PAT_MIB=4096
-fi
+PAT_MIB=$(( SIZE * 1024 / 2 ))          # only half the disk carries a pattern,
+if [ "$PAT_MIB" -gt 4096 ]; then        # to keep the runs short. Nothing ever
+    PAT_MIB=4096                        # checks the tail beyond it, so it is
+fi                                      # unwritten space and not a test.
 SUB_MIB=1024                            # region rewritten after the snapshot
 if [ "$SUB_MIB" -gt "$PAT_MIB" ]; then
     SUB_MIB=$(( PAT_MIB / 2 ))
@@ -131,8 +136,19 @@ nbd_detach() {
     NBD=""
 }
 
-# qemu-img check is the only thing here that reads the metadata as metadata.
-# Its exit codes matter: 0 clean, 1 leaked clusters only, 2 corruption, 3 fixed.
+# qemu-img check is the only thing here that reads the metadata as metadata,
+# so its exit codes have to be read the way qemu defines them and not the way
+# they look:
+#
+#   0  the image is good
+#   1  the check could NOT be completed because of an internal error
+#   2  the check completed and the image is corrupt
+#   3  the check completed, there are leaked clusters, the image is good
+#
+# 1 and 3 are the pair that invites the mistake. A check that never finished is
+# not a clean bill of health, and leaked clusters are wasted space rather than
+# damage - treating 1 as a pass would let a metadata failure be reported as
+# "sin errores", which is the one answer this function must never give wrongly.
 img_check() {
     local path="$1" label="$2" out rc
     out="$(qemu-img check -f qcow2 "$path" 2>&1)"
@@ -140,8 +156,10 @@ img_check() {
     echo "$out" | sed 's/^/      /' | head -10
     case "$rc" in
         0) pass "$label: metadatos qcow2 sin errores" ;;
-        1) pass "$label: clusters filtrados pero sin corrupcion" ;;
-        *) fail "$label: qemu-img check devuelve $rc" ;;
+        3) pass "$label: hay clusters filtrados pero la imagen esta sana" ;;
+        2) fail "$label: qemu-img check declara la imagen CORRUPTA" ;;
+        1) fail "$label: qemu-img check no pudo completar la comprobacion" ;;
+        *) fail "$label: qemu-img check devuelve un codigo inesperado ($rc)" ;;
     esac
     return 0
 }
@@ -558,7 +576,15 @@ if has_phase Q4; then
         # The same LV, opened raw. The difference between the two rows is what
         # the format costs - anything else would be comparing two devices.
         R1M_W=""; R1M_R=""; R4M_W=""; R4M_R=""
-        if [ -b "$PATH6" ]; then
+        # This is the one place that writes raw to a resolved path rather than
+        # through a device this script created, so the path is checked against
+        # the VMID again here instead of trusting that cur_path was right.
+        case "$(basename "$PATH6")" in
+            *-"$VMID"-*) ;;
+            *) fail "Q4: $PATH6 no lleva el vmid $VMID en el nombre, no se escribe en crudo"
+               PATH6="" ;;
+        esac
+        if [ -n "$PATH6" ] && [ -b "$PATH6" ]; then
             R1M_W="$(bench "$PATH6" 1M 1048576 w)"
             R1M_R="$(bench "$PATH6" 1M 1048576 r)"
             R4M_W="$(bench "$PATH6" 4M 4194304 w)"
@@ -614,11 +640,27 @@ while [ "$i" -lt "${#SUMMARY[@]}" ]; do
     echo "  ${SUMMARY[$i]}"
     i=$(( i + 1 ))
 done
+SKIPPED=0
+i=0
+while [ "$i" -lt "${#SUMMARY[@]}" ]; do
+    case "${SUMMARY[$i]}" in "--"*) SKIPPED=$(( SKIPPED + 1 )) ;; esac
+    i=$(( i + 1 ))
+done
+
 echo ""
-if [ "$FAILURES" = 0 ]; then
+if [ "$FAILURES" != 0 ]; then
+    echo "  $FAILURES comprobacion(es) fallidas - arriba esta cual."
+else
     echo "  Todo limpio: la capa qcow2, la cadena de snapshots y el rollback"
     echo "  conservan los datos, y el daño provocado a proposito SI se detecta."
-else
-    echo "  $FAILURES comprobacion(es) fallidas - arriba esta cual."
+    echo ""
+    echo "  Alcance: esto mide $STORAGE. Un storage que use otro formato u otro"
+    echo "  mecanismo de snapshot no queda validado por nada de lo de arriba."
+fi
+# Said on every path, not only on the happy one: a run with a failure that also
+# skipped three checks must still say that those three never ran.
+if [ "$SKIPPED" != 0 ]; then
+    echo ""
+    echo "  Ademas, $SKIPPED comprobacion(es) NO llegaron a ejecutarse - lineas con --."
 fi
 exit "$FAILURES"

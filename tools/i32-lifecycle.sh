@@ -10,9 +10,14 @@
 #   L1  resize      grow the disk and confirm what was already there is untouched
 #   L2  full clone  the copy carries the data, and the original still does too
 #   L3  backup      vzdump then restore into a new VM, compared block by block
-#   L4  move disk   to another storage and back, compared after each hop
-#   L5  template    convert, linked clone, and confirm writing to the clone
-#                   cannot reach the base image underneath it
+#   L4  move disk   to another storage and back - the data is compared after
+#                   each hop AND the volume is checked for coming back with the
+#                   capabilities it left with, which is a separate question and
+#                   the one qm move-disk answers badly without --format
+#   L5  template    convert, then linked clone, and confirm writing to the clone
+#                   cannot reach the base image underneath it. Storages that
+#                   decline linked clones skip that last part - it is recorded
+#                   as a skip, and a skip is not a pass
 #
 #   i32-lifecycle.sh --storage <sid> --vmid <9990-9996> [--size GiB] \
 #                    [--alt <sid>] [--backup <sid>] [--phases L1,...] --yes
@@ -118,7 +123,20 @@ open_vol() {
         *)     OPENED="$p"; OPENED_NBD=0 ;;
     esac
     OPENED_FMT="${fmt:-raw}"
+    # The verifier reads through the page cache. On the qcow2 path the nbd
+    # device is created fresh each time, so the cache is cold anyway; on a raw
+    # zvol opened directly it is not, and a read could be answered by whatever
+    # the write left in memory instead of by the storage.
+    blockdev --flushbufs "$OPENED" 2>/dev/null || true
     return 0
+}
+
+# PVE's own answer, not an inference from the volume name.
+can_snapshot() {
+    perl -e 'use PVE::Storage;
+             my $cfg = PVE::Storage::config();
+             my $r = eval { PVE::Storage::volume_has_feature($cfg, "snapshot", $ARGV[0], undef, 0) };
+             exit($r ? 0 : 1);' "$1" 2>/dev/null
 }
 close_vol() { [ "${OPENED_NBD:-0}" = 1 ] && nbd_detach; OPENED=""; OPENED_NBD=0; }
 
@@ -316,6 +334,14 @@ if has_phase L4; then
     if ! qm status "$CLONE" >/dev/null 2>&1; then
         skip "L4: no hay clon $CLONE que mover"
     else
+        # What the disk was before it left. Comparing data alone would call a
+        # round trip successful even when the volume comes back in a different
+        # format having quietly lost the ability to snapshot - which is exactly
+        # what qm move-disk does without an explicit --format.
+        ORIG_VOLID="$(volid_of "$CLONE")"
+        ORIG_SNAP=no; can_snapshot "$ORIG_VOLID" && ORIG_SNAP=si
+        note "antes de moverlo: $ORIG_VOLID (snapshot: $ORIG_SNAP)"
+
         if qm move-disk "$CLONE" scsi0 "$ALT" --delete 1 >/tmp/i32-move1.log 2>&1; then
             pass "L4: disco movido a $ALT"
             MV1="$(volid_of "$CLONE")"
@@ -330,9 +356,37 @@ if has_phase L4; then
             MV2="$(volid_of "$CLONE")"
             note "ahora en : $MV2"
             check_pattern "L4: y sobreviven tambien a la vuelta" "$MV2" "$PAT_MIB" "$SEED_A"
+
+            BACK_SNAP=no; can_snapshot "$MV2" && BACK_SNAP=si
+            note "volvio como  : $MV2 (snapshot: $BACK_SNAP)"
+            if [ "$BACK_SNAP" = "$ORIG_SNAP" ]; then
+                pass "L4: el volumen vuelve con las mismas capacidades que tenia"
+            else
+                fail "L4: salio con snapshot=$ORIG_SNAP y vuelve con snapshot=$BACK_SNAP - los datos estan, la capacidad no"
+                note "      remedio: qm move-disk ... --format qcow2"
+            fi
         else
             fail "L4: qm move-disk de vuelta a $STORAGE fallo"
             tail -5 /tmp/i32-move2.log | sed 's/^/      /'
+        fi
+
+        # And the same hop done right, to show the flag is the whole difference.
+        if [ "${BACK_SNAP:-}" != "${ORIG_SNAP:-}" ]; then
+            qm move-disk "$CLONE" scsi0 "$ALT" --delete 1 >/dev/null 2>&1
+            if qm move-disk "$CLONE" scsi0 "$STORAGE" --format qcow2 --delete 1 >/tmp/i32-move3.log 2>&1; then
+                MV3="$(volid_of "$CLONE")"
+                FIX_SNAP=no; can_snapshot "$MV3" && FIX_SNAP=si
+                note "con --format qcow2: $MV3 (snapshot: $FIX_SNAP)"
+                if [ "$FIX_SNAP" = "$ORIG_SNAP" ]; then
+                    pass "L4: con --format qcow2 explicito el volumen vuelve intacto en capacidades"
+                else
+                    fail "L4: ni con --format qcow2 se recupera la capacidad de snapshot"
+                fi
+                check_pattern "L4: y los datos siguen ahi tras la tercera ida y vuelta" "$MV3" "$PAT_MIB" "$SEED_A"
+            else
+                fail "L4: qm move-disk --format qcow2 fallo"
+                tail -5 /tmp/i32-move3.log | sed 's/^/      /'
+            fi
         fi
     fi
 fi
@@ -418,11 +472,26 @@ while [ "$i" -lt "${#SUMMARY[@]}" ]; do
     echo "  ${SUMMARY[$i]}"
     i=$(( i + 1 ))
 done
+SKIPPED=0
+i=0
+while [ "$i" -lt "${#SUMMARY[@]}" ]; do
+    case "${SUMMARY[$i]}" in "--"*) SKIPPED=$(( SKIPPED + 1 )) ;; esac
+    i=$(( i + 1 ))
+done
+
 echo ""
-if [ "$FAILURES" = 0 ]; then
+if [ "$FAILURES" != 0 ]; then
+    echo "  $FAILURES comprobacion(es) fallidas - arriba esta cual."
+else
     echo "  Los datos sobreviven a crecer, clonar, respaldar, restaurar, mover"
     echo "  de almacenamiento y convertir en plantilla, verificados bloque a bloque."
-else
-    echo "  $FAILURES comprobacion(es) fallidas - arriba esta cual."
+fi
+# A skip is not a pass, and it has to be said whether or not anything failed -
+# tucking it inside the success branch means a run with one failure never
+# mentions the three checks that did not run at all.
+if [ "$SKIPPED" != 0 ]; then
+    echo ""
+    echo "  Ademas, $SKIPPED comprobacion(es) NO llegaron a ejecutarse. Lo que"
+    echo "  prometian NO esta probado - busca las lineas que empiezan por --."
 fi
 exit "$FAILURES"
