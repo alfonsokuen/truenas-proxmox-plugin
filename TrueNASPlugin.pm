@@ -1772,6 +1772,18 @@ sub _parse_dataset_error {
         retryable => 0,
     } if $error_string =~ /does not exist|ENOENT|InstanceNotFound/i;
 
+    # These two phrases are produced by _wait_for_job_completion when it
+    # abandons a wait: the deletion job was accepted and may well still be
+    # running server-side, we simply stopped watching. That is not a failure
+    # report and must not be classified as one - the caller has to go and look
+    # at the dataset. Checked before 'busy' because the "API unavailable" form
+    # carries an arbitrary transport error in its tail, which can contain
+    # anything, including the word 'busy'.
+    return {
+        type => 'indeterminate',
+        retryable => 0,
+    } if $error_string =~ /Job timed out after \d+ seconds|API unavailable:/;
+
     return {
         type => 'busy',
         retryable => 1,
@@ -1821,8 +1833,43 @@ sub _delete_dataset_with_retry {
         if ($error_info->{type} eq 'busy' && $attempt < $max_retries) {
             my $delay = 2 ** ($attempt - 1);  # Exponential backoff: 1s, 2s, 4s
             _log($scfg, 1, 'info', "[TrueNAS] Dataset busy, retrying in ${delay}s... ($err)");
-            sleep($delay);
+            select(undef, undef, undef, $delay);
             next;
+        }
+
+        # An abandoned wait says nothing about whether the delete worked: the
+        # job was accepted, and a destroy of a large or heavily-snapshotted
+        # zvol routinely outlives the wait window and completes on its own.
+        # Dying with the raw timeout here reported "the delete failed" for
+        # deletes that had in fact succeeded, inviting exactly the wrong manual
+        # intervention. Look at the dataset before deciding what to report, and
+        # do not re-issue the delete - the first job may still be running, and
+        # a second recursive force destroy racing it is not a state anyone can
+        # reason about.
+        if ($error_info->{type} eq 'indeterminate') {
+            chomp(my $why = $err);
+            my $ds_check = eval { _tn_dataset_get($scfg, $full_ds) };
+            my $check_err = $@;
+            if (!$ds_check && $check_err
+                && _parse_dataset_error($check_err)->{type} eq 'not_found') {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] Deletion of dataset $full_ds outlived its wait "
+                  . "window but the dataset is gone - treating as success ($why)");
+                _invalidate_status_capacity_cache(undef, $scfg);
+                return;
+            }
+            if ($ds_check) {
+                die "stopped waiting for the deletion of $full_ds: $why\n"
+                  . "The dataset was still present when checked, but the TrueNAS "
+                  . "deletion job may still be running and may yet complete on its "
+                  . "own. This is 'we gave up waiting', not 'the delete failed': "
+                  . "check the job in the TrueNAS UI before intervening manually, "
+                  . "then re-run the free.\n";
+            }
+            die "stopped waiting for the deletion of $full_ds ($why), and could "
+              . "not verify whether the dataset is gone. Outcome unknown; re-run "
+              . "the free once the TrueNAS API answers.\n"
+              . "  verification failure: $check_err";
         }
 
         # Otherwise, this is a real error
@@ -2554,10 +2601,26 @@ sub _find_free_disk_name {
             [["pool", "=", (split('/', $dataset))[0]], ["name", "~", "^${dataset_escaped}/${prefix}"]]
         ]);
     };
-    my %existing;
-    if ($children && ref($children) eq 'ARRAY') {
-        %existing = map { $_->{id} => 1 } @$children;
+    # Fail closed, for the same reason the linked-clone guard does. A query
+    # that died leaves %existing empty, and an empty %existing means every
+    # candidate looks free - so the first name handed out is vm-<vmid>-disk-0,
+    # which for any VM that already has a disk is a name that is very much
+    # taken. The create that follows is guarded against collisions and would
+    # retry, so this is a wasted round trip rather than an overwrite, but the
+    # guess is made on no evidence at all and the answer it gives is exactly
+    # the one most likely to collide.
+    if (my $query_err = $@) {
+        die "Cannot pick a free disk name for VM $vmid: listing the existing "
+          . "disks under $dataset failed, so every name would be a guess.\n"
+          . "  cause: $query_err";
     }
+    if (ref($children) ne 'ARRAY') {
+        die "Cannot pick a free disk name for VM $vmid: listing the existing "
+          . "disks under $dataset returned "
+          . (ref($children) || (defined($children) ? 'a scalar' : 'nothing'))
+          . " instead of a dataset list.\n";
+    }
+    my %existing = map { $_->{id} => 1 } grep { defined $_->{id} } @$children;
 
     for (my $n = 0; $n < 1000; $n++) {
         my $candidate = "${prefix}$n";
@@ -6142,10 +6205,32 @@ sub free_image {
                 [ [ [ 'origin.parsed', '=', $snap_id ] ],
                   { select => [ 'id' ] } ]);
         };
-        my @clones;
-        if ($children && ref($children) eq 'ARRAY') {
-            @clones = map { $_->{id} } grep { defined $_->{id} } @$children;
+        # The guard is only as strong as this lookup. If the query died, or
+        # came back as anything but the array pool.dataset.query returns on
+        # success - an origin.parsed filter a middleware release no longer
+        # accepts answers with an error, not with an empty list - then nothing
+        # has been established about clones. Treating that as "no clones"
+        # waved the recursive force destroy below through on the strength of a
+        # transport blip, leaving libzfs's EBUSY as the only thing between a
+        # template and its live clones. Refuse instead: a base image that
+        # survives one failed free can be freed again once the API answers;
+        # clones whose origin snapshot is gone cannot be put back.
+        if (my $query_err = $@) {
+            die "Cannot delete base image '$volname': the linked-clone check "
+              . "on $snap_id failed, so whether clones still depend on it is "
+              . "unknown. Refusing to destroy $full_ds; retry once the "
+              . "TrueNAS API answers.\n  cause: $query_err";
         }
+        if (ref($children) ne 'ARRAY') {
+            my $got = ref($children) || (defined($children) ? 'a scalar' : 'nothing');
+            die "Cannot delete base image '$volname': the linked-clone check "
+              . "on $snap_id returned $got instead of a dataset list, so "
+              . "whether clones still depend on it is unknown. Refusing to "
+              . "destroy $full_ds.\n";
+        }
+        # Any row is a live clone even when its id did not come through; count
+        # rows, and use the ids only for the message.
+        my @clones = map { $_->{id} // '(id not reported)' } @$children;
         if (@clones) {
             die sprintf(
                 "Cannot delete base image '%s': %d linked clone(s) still " .
@@ -6508,9 +6593,36 @@ sub _free_image_nvme {
             }
         };
 
-        # Only disconnect if this is the last namespace, or if we can't determine count
-        # This prevents breaking multi-disk operations
-        if ($active_ns_count <= 1 || $@) {
+        my $count_err = $@;
+
+        # _nvme_disconnect operates on the whole subsystem NQN, so it tears
+        # down every namespace this node imports - every NVMe disk of every VM
+        # on it - not just the volume being freed. That is only tolerable when
+        # this really is the last namespace. A failed count query used to fall
+        # into the same branch as "last namespace", turning one flaky API
+        # answer during a routine disk removal into a node-wide storage
+        # outage; and because $active_ns_count starts at 0, a died eval landed
+        # in the <= 1 arm even without the || $@, so removing that alone would
+        # not have fixed it. An unknown count has to mean the opposite: assume
+        # the subsystem is shared and leave it alone. The namespace being
+        # freed is then still exported - its delete has just failed with "in
+        # use" - so carrying on into the force destroy below would pull the
+        # zvol out from under it. The free stops here instead, the same way
+        # step 1 refuses.
+        if ($count_err) {
+            chomp(my $count_msg = $count_err);
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] _free_image_nvme: skipping subsystem disconnect for $zname: "
+              . "active namespace count unknown, assuming subsystem is shared: $count_msg");
+            die "[TrueNAS] refusing to destroy $full_ds: its namespace is still in use, "
+              . "and the disconnect-and-retry step was skipped because the active "
+              . "namespace count could not be determined. Retry once the TrueNAS API "
+              . "answers.\n  cause: $count_err";
+        }
+
+        # Only disconnect if this is the known last namespace.
+        # This prevents breaking multi-disk operations.
+        if ($active_ns_count <= 1) {
             _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: disconnecting NVMe subsystem to retry namespace deletion (active namespaces: $active_ns_count)");
             _nvme_disconnect($scfg);
             # Wait for NVMe disconnect to complete
