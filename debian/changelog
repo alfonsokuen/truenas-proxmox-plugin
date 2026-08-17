@@ -1,3 +1,51 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk3) unstable; urgency=medium
+
+  * broker: bound every upstream read, so a TrueNAS that stops answering
+    cannot take the daemon down with it. The socket constructors set
+    Timeout => 15, which covers connect() and nothing else; every read was a
+    bare blocking sysread. An upstream that accepted the TCP connection and
+    then went silent WITHOUT closing it - a reboot, a fabric blip, or a
+    firewall forgetting the flow all look like this from the initiator - left
+    ws_read_exact waiting with no deadline. Because the daemon serves clients
+    inline on one thread, that was not a single stalled request: the broker
+    stopped answering anyone, permanently, and systemd's Restart=on-failure
+    never fired because the process was still alive. Reproduced before fixing:
+    first call 0.00 s, upstream goes mute, every call after it times out
+    including calls from processes started afterwards, still wedged minutes
+    later, nothing in the log.
+
+  * broker: one budget for the whole request. Probe, reconnect, authenticate
+    and call now draw from a single deadline set when the request arrives.
+    Threading a relative timeout instead let each step start its own clock: a
+    5 s liveness probe followed by a 30 s reconnect produced a 35 s request
+    against a client that waits 30 s, so the client always gave up first and
+    the work was thrown away.
+
+  * broker: answer inside the client's own deadline. The client now states its
+    budget in the request envelope and the broker replies a margin before it
+    expires. With both sides on 30 s the client won the race by hundredths of
+    a second, so the operator saw a generic "read timeout" instead of the
+    broker's account of what actually failed. Clients that send no timeout
+    keep the previous behaviour.
+
+  * broker: distinguish an upstream that never answered from one that rejected
+    the API key. Both used to die with "TrueNAS authentication failed", which
+    sends the reader to check credentials when the fault is the network.
+
+  * broker: TCP keepalive on the upstream socket, so a peer that vanished
+    without a FIN is eventually torn down by the kernel rather than handed
+    back out of the connection pool as though it were live.
+
+  * broker: the run directory and log path may be overridden by environment,
+    which lets the daemon be exercised by an unprivileged test. The systemd
+    unit sets neither, so an installed system is unaffected.
+
+  * t/broker/01-upstream-deadline.t: regression coverage for the above, with a
+    local upstream that can be told to go quiet while holding the socket open.
+    Requires no privileges and no TrueNAS.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Sun, 16 Aug 2026 21:20:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk2) unstable; urgency=medium
 
   * NVMe-oF: identify a namespace by its UUID, not by a recyclable NSID. The

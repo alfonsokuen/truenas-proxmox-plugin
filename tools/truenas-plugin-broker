@@ -36,12 +36,31 @@ use Digest::SHA qw(sha1 sha1_hex);
 use MIME::Base64 qw(encode_base64);
 use JSON::PP;
 use Socket;
+# IPPROTO_TCP is not in Socket's default export list; the keepalive tuning
+# below needs it by name.
+use Socket qw(IPPROTO_TCP);
 use Time::HiRes qw(time);
 
-my $SOCKET_PATH    = '/run/truenas-plugin/broker.sock';
-my $PIDFILE        = '/run/truenas-plugin/broker.pid';
-my $LOG_FILE       = '/var/log/truenas-plugin-broker.log';
+# Paths are overridable so the daemon can be exercised by a test as an
+# unprivileged user against a scratch directory. The systemd unit sets none of
+# these, so a real install is unaffected.
+my $RUN_DIR        = $ENV{TRUENAS_BROKER_RUNDIR} || '/run/truenas-plugin';
+my $SOCKET_PATH    = "$RUN_DIR/broker.sock";
+my $PIDFILE        = "$RUN_DIR/broker.pid";
+my $LOG_FILE       = $ENV{TRUENAS_BROKER_LOG} || '/var/log/truenas-plugin-broker.log';
 my $IDLE_REAP_SECS = 600;   # close WS conns idle longer than this
+# Ceiling on any single upstream read. A TrueNAS that reboots, a fabric that
+# blips, or a firewall that forgets the flow leaves this end of the TCP
+# connection believing it is established: writes land in the kernel buffer and
+# reads never return. Since requests are served inline, one such connection
+# silently takes the whole daemon - and every TrueNAS storage on this node -
+# out of service until someone restarts it by hand. Overridable for slow
+# arrays via TRUENAS_BROKER_TIMEOUT.
+my $UPSTREAM_TIMEOUT = $ENV{TRUENAS_BROKER_TIMEOUT} || 30;
+# The liveness probe on a pooled connection gets a much shorter budget: its
+# whole purpose is to find out quickly whether the socket is still real, and a
+# probe that waits the full timeout defeats the point of probing.
+my $PING_TIMEOUT = 5;
 my $WS_PATH = '/api/current';
 
 my $foreground = grep { $_ eq '--foreground' || $_ eq '-f' } @ARGV;
@@ -68,7 +87,7 @@ sub ldebug { _log_line('DEBUG', $_[0]) if $debug; }
 
 # ---------------- setup ----------------
 sub ensure_rundir {
-    my $dir = '/run/truenas-plugin';
+    my $dir = $RUN_DIR;
     mkdir($dir, 0700) unless -d $dir;
     chmod 0700, $dir;
 }
@@ -108,7 +127,8 @@ sub _host_ipv4 {
 }
 
 sub ws_open {
-    my ($scfg) = @_;
+    my ($scfg, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
     # Normalize scheme the same way TrueNASPlugin.pm::_ws_defaults does.
     # Without this, an operator who set tn_api_scheme=https (rejected by the
     # plugin's own validator only against the direct-WS path) would slip
@@ -138,6 +158,19 @@ sub ws_open {
         ) or die "TCP connect to $host:$port failed: $!";
     }
 
+    # Keepalive so the kernel eventually tears down a peer that went away
+    # without a FIN. The read deadline above already stops us waiting on such a
+    # socket; this stops us handing a corpse back out of the pool as if it were
+    # live. Best-effort: the constants are Linux-specific and the daemon must
+    # still work if they are missing.
+    eval {
+        setsockopt($sock, SOL_SOCKET, SO_KEEPALIVE, pack('l', 1));
+        setsockopt($sock, IPPROTO_TCP, 4, pack('l', 30));   # TCP_KEEPIDLE
+        setsockopt($sock, IPPROTO_TCP, 5, pack('l', 10));   # TCP_KEEPINTVL
+        setsockopt($sock, IPPROTO_TCP, 6, pack('l', 3));    # TCP_KEEPCNT
+        1;
+    } or ldebug("could not set TCP keepalive on upstream socket: $@");
+
     my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
     my $key_b64 = encode_base64($key_raw, '');
     my $req =
@@ -149,8 +182,15 @@ sub ws_open {
       "Sec-WebSocket-Version: 13\r\n".
       "\r\n";
     print $sock $req;
+    # Bounded like every other read here: a peer that completes the TCP
+    # handshake and then never sends the 101 would otherwise hold the daemon
+    # for good, and this path runs with no pooled connection to fall back on.
     my $resp = '';
-    while ($sock->sysread(my $buf, 1024)) {
+    while (1) {
+        die "WS handshake timed out waiting for the HTTP response"
+            unless ws_wait_readable($sock, $deadline);
+        my $got = $sock->sysread(my $buf, 1024);
+        last unless defined $got && $got > 0;
         $resp .= $buf;
         last if $resp =~ /\r\n\r\n/s;
     }
@@ -164,8 +204,17 @@ sub ws_open {
         jsonrpc => "2.0", id => $conn->{next_id}++,
         method  => "auth.login_with_api_key",
         params  => [ $scfg->{api_key} ],
-    });
-    die "TrueNAS authentication failed" unless $auth;
+    }, $deadline);
+    # Silence and rejection are different faults and want different responses:
+    # one is the network, the other is the API key. Reporting a timed-out read
+    # as "authentication failed" sent the reader to check credentials while the
+    # real problem was a TrueNAS that had stopped answering.
+    die "no response from TrueNAS during authentication (timed out or connection lost)"
+        unless defined $auth;
+    if (ref($auth) eq 'HASH' && exists $auth->{error}) {
+        my $e = ref($auth->{error}) ? encode_json($auth->{error}) : $auth->{error};
+        die "TrueNAS rejected the API key: $e";
+    }
     return $conn;
 }
 
@@ -179,10 +228,42 @@ sub xor_mask {
     return $out;
 }
 
+# Wait until $sock has something to read, or the deadline passes. Returns 1 if
+# readable, 0 on timeout. IO::Socket::SSL decodes a whole TLS record at a time,
+# so bytes can already be sitting in its buffer with nothing left on the wire -
+# select() would then block on a socket whose data has in fact arrived. Ask the
+# SSL layer first and only fall through to select() when it holds nothing.
+sub ws_wait_readable {
+    my ($sock, $deadline) = @_;
+    return 1 if $sock->can('pending') && $sock->pending();
+    my $remaining = $deadline - time();
+    return 0 if $remaining <= 0;
+    my $sel = IO::Select->new($sock);
+    return $sel->can_read($remaining) ? 1 : 0;
+}
+
+# Read exactly $len bytes, bounded by an absolute deadline.
+#
+# The deadline covers the whole read rather than each sysread, so a slow but
+# advancing transfer is not cut off - the same envelope the plugin applies to
+# its own end of the Unix socket. Without it, a peer that accepts the connection
+# and then says nothing blocks here forever: the constructor's Timeout only ever
+# covered connect(). And because this daemon serves clients inline, one such
+# block is not a single stalled request, it is every request that follows.
 sub ws_read_exact {
-    my ($sock, $bufref, $len) = @_;
+    my ($sock, $bufref, $len, $deadline) = @_;
     $$bufref = '';
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
     while (length($$bufref) < $len) {
+        unless (ws_wait_readable($sock, $deadline)) {
+            # Deliberately does not name a number of seconds. The probe and a
+            # full call run on different budgets, and an earlier draft of this
+            # line printed the global default for both - which would have sent
+            # the reader hunting for a 30 s stall that was really a 5 s one.
+            lwarn("upstream read timed out waiting for "
+                . ($len - length($$bufref)) . " more byte(s)");
+            return 0;
+        }
         my $got = $sock->sysread(my $tmp, $len - length($$bufref));
         return 0 unless defined $got && $got > 0;
         $$bufref .= $tmp;
@@ -203,30 +284,31 @@ sub ws_send_text {
 }
 
 sub ws_recv_text {
-    my ($sock) = @_;
+    my ($sock, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
     my $message = '';
     while (1) {
         my $hdr;
-        return undef unless ws_read_exact($sock, \$hdr, 2);
+        return undef unless ws_read_exact($sock, \$hdr, 2, $deadline);
         my ($b1, $b2) = unpack('CC', $hdr);
         my $fin    = $b1 & 0x80;
         my $opcode = $b1 & 0x0F;
         my $masked = $b2 & 0x80;
         my $len    = $b2 & 0x7F;
         if ($len == 126) {
-            my $ext; return undef unless ws_read_exact($sock, \$ext, 2);
+            my $ext; return undef unless ws_read_exact($sock, \$ext, 2, $deadline);
             $len = unpack('n', $ext);
         } elsif ($len == 127) {
-            my $ext; return undef unless ws_read_exact($sock, \$ext, 8);
+            my $ext; return undef unless ws_read_exact($sock, \$ext, 8, $deadline);
             $len = unpack('Q>', $ext);
         }
         my $mask_key = '';
         if ($masked) {
-            return undef unless ws_read_exact($sock, \$mask_key, 4);
+            return undef unless ws_read_exact($sock, \$mask_key, 4, $deadline);
         }
         my $payload = '';
         if ($len > 0) {
-            return undef unless ws_read_exact($sock, \$payload, $len);
+            return undef unless ws_read_exact($sock, \$payload, $len, $deadline);
             $payload = xor_mask($payload, $mask_key) if $masked;
         }
         if    ($opcode == 0x01) { $message  = $payload; return $message if $fin; }
@@ -245,13 +327,19 @@ sub ws_recv_text {
 }
 
 sub ws_rpc {
-    my ($conn, $obj) = @_;
+    # $deadline is absolute, and is the caller's to set. Taking a relative
+    # timeout here instead let each step start its own clock: a probe that
+    # spent 5 s followed by a reconnect that spent 30 s produced a 35 s
+    # request - longer than the deadline the plugin gives the whole round
+    # trip, so the client gave up first and the work was wasted.
+    my ($conn, $obj, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
     my $req_id = $obj->{id};
     my $text = encode_json($obj);
     ws_send_text($conn->{sock}, $text);
     my $max_skip = 10;
     for (my $skipped = 0; $skipped <= $max_skip; $skipped++) {
-        my $resp = ws_recv_text($conn->{sock});
+        my $resp = ws_recv_text($conn->{sock}, $deadline);
         return undef unless defined $resp;
         my $decoded = eval { decode_json($resp) };
         next if $@ || !$decoded;
@@ -276,15 +364,22 @@ sub scfg_key {
 }
 
 sub get_or_open_ws {
-    my ($scfg) = @_;
+    my ($scfg, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
     my $sk = scfg_key($scfg);
     my $entry = $POOL{$sk};
     if ($entry && $entry->{conn} && $entry->{conn}->{sock}) {
-        # Quick liveness check: ping
+        # Quick liveness check: ping. Given a tight budget of its own - this is
+        # the read most likely to meet a half-open socket, because a pooled
+        # connection is by definition one nobody has touched recently - but
+        # never more than the request as a whole has left, so that a failed
+        # probe still leaves room to reconnect inside the same deadline.
+        my $ping_deadline = time() + $PING_TIMEOUT;
+        $ping_deadline = $deadline if $ping_deadline > $deadline;
         my $ok = eval {
             ws_rpc($entry->{conn}, {
                 jsonrpc => "2.0", id => 999999, method => "core.ping", params => [],
-            });
+            }, $ping_deadline);
         };
         if ($ok) {
             $entry->{last_used} = time();
@@ -294,7 +389,7 @@ sub get_or_open_ws {
         eval { $entry->{conn}->{sock}->close(); };
         delete $POOL{$sk};
     }
-    my $conn = ws_open($scfg);
+    my $conn = ws_open($scfg, $deadline);
     $POOL{$sk} = { conn => $conn, last_used => time() };
     linfo("opened WS for $sk (pool size " . scalar(keys %POOL) . ")");
     return $conn;
@@ -394,13 +489,29 @@ sub handle_request {
 
     my $sk = scfg_key($scfg);
     my $result_obj;
+    # One budget for the whole request - probe, reconnect, authenticate and
+    # call all draw from it.
+    #
+    # The client applies a deadline of its own, and when the two are equal it
+    # wins the race by a hair: measured at 30.03 s against a client deadline of
+    # 30 s, so the operator always saw the client's generic "read timeout" and
+    # never the broker's account of what actually failed. Clients that send
+    # their budget get answered a margin before it expires; clients that do not
+    # (older plugin builds) keep the previous behaviour.
+    my $budget = $UPSTREAM_TIMEOUT;
+    my $client_timeout = $req->{timeout};
+    if (defined($client_timeout) && $client_timeout =~ /^\d+(?:\.\d+)?$/ && $client_timeout > 2) {
+        my $margin = $client_timeout - 2;
+        $budget = $margin if $margin < $budget;
+    }
+    my $deadline = time() + $budget;
     eval {
-        my $conn = get_or_open_ws($scfg);
+        my $conn = get_or_open_ws($scfg, $deadline);
         my $rpc = {
             jsonrpc => "2.0", id => $conn->{next_id}++,
             method => $method, params => $params,
         };
-        $result_obj = ws_rpc($conn, $rpc);
+        $result_obj = ws_rpc($conn, $rpc, $deadline);
     };
     if (my $err = $@) {
         # Drop the cached conn — likely dead — and surface the failure in

@@ -1182,6 +1182,12 @@ sub _broker_rpc {
         },
         method => $obj->{method},
         params => $obj->{params} // [],
+        # Tell the broker how long we intend to wait so it can answer just
+        # inside that window. Without it the two deadlines are the same size
+        # and ours expires first by milliseconds, replacing the broker's
+        # account of the failure with a bare "read timeout". Brokers that
+        # predate this field ignore it.
+        timeout => ($scfg->{tn_broker_timeout} // 30),
     };
     my $payload = encode_json($req) . "\n";
 
