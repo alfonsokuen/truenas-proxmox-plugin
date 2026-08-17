@@ -1,3 +1,55 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk4) unstable; urgency=medium
+
+  * Do not destroy a zvol whose export could not be removed.
+    _nvme_delete_namespace turned every nvmet.namespace.delete failure into a
+    log line and returned normally, so the caller's success check was true
+    whenever the query had worked, however many deletes had failed - and the
+    dataset was then destroyed with force => true while a namespace still
+    pointed at it. A denied permission, a timeout or a transport blip was
+    enough, and the log line was level 1, which tn_debug's default of 0
+    discards. Silent as well as destructive.
+
+  * Make the guards on the deletion path fail closed. The linked-clone check
+    on a base image, the active-namespace count that decides whether to
+    disconnect the whole subsystem, and the free-disk-name listing all
+    decided "it is safe to proceed" from lookups that had not succeeded.
+
+  * Report an abandoned deletion wait as what it is. A job that outlived its
+    window was classified as a hard failure though the destroy routinely
+    completes afterwards; the dataset is re-queried before anything is
+    reported, and the delete is never blindly re-issued.
+
+  * create_base: the rewire rollback restores device_path, as the snapshot
+    rollback beside it always did; pool.dataset.rename and pool.snapshot.create
+    no longer retry, since neither survives being replayed; and a rename or
+    snapshot whose response was lost is reconciled by asking the pool rather
+    than by reading the error text.
+
+  * Bound the connect to the broker socket. AF_UNIX does not refuse on a full
+    backlog, it sleeps - and with a blocking socket, forever. Measured against
+    the daemon with Listen => 32, stopped: connections 1 to 33 returned in
+    0.00 s and the 34th never returned. The plugin's own deadline is
+    established after the socket exists, so it did not cover this.
+
+  * Keep status() off pvestatd's critical path. The pool-health lookup ran
+    with the default three retries inside a function pvestatd calls every 10
+    seconds for every storage, serially - around two minutes during which
+    every storage on the node goes stale. The capacity cache could never hit:
+    a 10 second TTL against a 10 second poll, tested as a strict age < ttl.
+
+  * _wait_for_job_completion counted only the time it spent sleeping, so a
+    "30 second" wait could run for a quarter of an hour while a task worker
+    held the cluster storage lock. The deadline is wall clock now.
+
+  * The retry backoff called sleep() with a fractional delay, which the
+    builtin truncates to whole seconds - so tn_api_retry_delay below 1 gave a
+    retry loop with no delay at all. Measured: sleep(0.5) returns in 0.000s.
+
+  * Fix the bulk helpers, which passed four arguments to a three-argument
+    signature and so died before reaching TrueNAS (#77).
+
+ -- IDKmanager <gerencia@idkmanager.com>  Sun, 16 Aug 2026 23:05:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk3) unstable; urgency=medium
 
   * broker: bound every upstream read, so a TrueNAS that stops answering
