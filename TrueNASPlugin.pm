@@ -41,7 +41,14 @@ package PVE::Storage::Custom::TrueNASPlugin;
 # Simple cache for API results
 my %API_CACHE = ();
 my $CACHE_TTL = 60; # seconds
-my $STATUS_CAPACITY_TTL_S = 10;
+# Longer than pvestatd's 10 second poll, deliberately. At 10 the cache could
+# never hit: an entry stored at t=0 is read at t=10, and the freshness test is
+# a strict "age < ttl", so 10 < 10 is false and every single poll paid for a
+# full round trip. The cache that exists to absorb pvestatd was tuned to
+# exactly the period it was meant to absorb. The cost of raising it is that
+# capacity in the GUI can lag by up to this long, which is what every other
+# storage plugin does.
+my $STATUS_CAPACITY_TTL_S = 30;
 my $TARGET_VISIBLE_SKIP_TTL_S = 60;
 
 # Per-host cache for preflight check results
@@ -354,7 +361,12 @@ sub _retry_with_backoff {
         $delay += $jitter;
 
         _log($scfg, 1, 'info', "[TrueNAS] Retry attempt $attempt/$max_retries for $operation_name after ${delay}s delay (error: $last_error)");
-        sleep($delay);
+        # Not sleep(): the builtin truncates its argument to a whole number of
+        # seconds, and tn_api_retry_delay accepts values as low as 0.1. Anyone
+        # who tuned it below 1 got sleep(0) - a retry loop with no delay at
+        # all, hammering a TrueNAS that was already struggling. Measured:
+        # sleep(0.5) returns in 0.000s.
+        select(undef, undef, undef, $delay);
     }
 
     # Should never reach here, but just in case
@@ -1622,12 +1634,21 @@ sub _wait_for_job_completion {
 
     _log($scfg, 1, 'info', "[TrueNAS] Waiting for job $job_id to complete (timeout: ${timeout_seconds}s)");
 
-    # Fast polling for first 5 seconds (100ms intervals), then 1s intervals
+    # Fast polling for first 5 seconds (100ms intervals), then 1s intervals.
+    #
+    # $elapsed counts only the time this loop spends sleeping, which is not the
+    # same as the time it spends waiting. Each iteration also makes a
+    # core.get_jobs call, and that call can cost a full broker deadline plus
+    # retries - so against a slow-but-alive TrueNAS a "30 second" wait ran for
+    # a quarter of an hour, while a PVE task worker held the cluster storage
+    # lock for the whole of it. The deadline below is wall clock; $elapsed
+    # stays only to pick the poll interval.
+    my $deadline = time() + $timeout_seconds;
     my $elapsed = 0;
     my $attempt = 0;
     my $consecutive_failures = 0;
 
-    while ($elapsed < $timeout_seconds) {
+    while (time() < $deadline) {
         $attempt++;
 
         # Use faster polling for first 5 seconds to catch quick completions
@@ -1907,8 +1928,17 @@ sub _tn_pool_health($scfg) {
     my $cached = _get_cached($host_key, "pool_health:$pool_name");
     return $cached if defined $cached;
 
+    # No retries. This runs inside status(), which pvestatd calls every 10
+    # seconds for every storage on the node, one after another in a single
+    # process - so time spent here is time no other storage gets to report. At
+    # the default of 3 retries a slow-but-alive TrueNAS costs four broker
+    # deadlines plus backoff, around two minutes, and for that whole time every
+    # storage on the node goes stale, not just this one. The capacity lookup
+    # beside it already runs with retry_max => 0 for exactly this reason; this
+    # call was left on the default. Pool health is advisory and cached for a
+    # minute, so a missed sample costs nothing.
     my $pools = eval {
-        _api_call($scfg, 'pool.query', [[ ["name", "=", $pool_name] ]]);
+        _api_call($scfg, 'pool.query', [[ ["name", "=", $pool_name] ]], { retry_max => 0 });
     };
     return undef if $@ || !$pools || !@$pools;
 
