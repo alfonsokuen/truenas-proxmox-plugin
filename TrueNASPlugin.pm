@@ -1382,9 +1382,16 @@ sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
         die "Bulk operations are disabled in storage configuration";
     }
 
-    # Bulk operations are always write operations, use ephemeral connection
-    return _api_call_mutate($scfg, 'core.bulk', [$method_name, $params_array, $description],
-        sub { die "Bulk operations require WebSocket transport (TrueNAS 25.10+ only)\n"; });
+    # Bulk operations are always write operations, use ephemeral connection.
+    #
+    # The fourth argument this used to carry - a callback for the old REST
+    # transport - could never run: _api_call_mutate takes three parameters and
+    # a Perl signature makes a surplus argument fatal, so every call through
+    # here died with "Too many arguments for subroutine" before reaching
+    # TrueNAS. It went unnoticed because nothing in the plugin calls the bulk
+    # helpers yet. The callback is vestigial anyway: TrueNAS 25.10 dropped the
+    # REST API, so WebSocket is the only transport there is.
+    return _api_call_mutate($scfg, 'core.bulk', [$method_name, $params_array, $description]);
 }
 
 # Bulk snapshot deletion helper
