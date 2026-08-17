@@ -276,6 +276,17 @@ vm_is_ours() {
 disk_volid() { qm config "$VMID" 2>/dev/null | sed -n "s/^$1: \([^,]*\).*/\1/p" | head -1; }
 vol_path()   { pvesm path "$1" 2>/dev/null; }
 
+# On shared LVM the logical volume is only activated when something needs it, so
+# `pvesm path` names a device node that does not exist yet and the block-device
+# check below rejects a perfectly good destination. Asking PVE to activate it is
+# the same thing qm does before starting a VM, and it is a no-op on storages
+# that keep their devices present.
+activate_vol() {
+    perl -e 'use PVE::Storage;
+             my $cfg = PVE::Storage::config();
+             eval { PVE::Storage::activate_volumes($cfg, [ $ARGV[0] ]) };' "$1" 2>/dev/null || true
+}
+
 # Reads must come off the device, not out of the page cache, or a corrupted
 # destination can verify clean against the bytes we just wrote through it.
 # BLKFLSBUF both syncs and invalidates, which is exactly what we need - and if
@@ -371,6 +382,7 @@ phase_body() {
     local src_volid src_path
     src_volid="$(disk_volid scsi0)"
     [ -n "$src_volid" ] || die "could not read the source disk back out of the VM config"
+    activate_vol "$src_volid"
     src_path="$(vol_path "$src_volid")"
     [ -n "$src_path" ] || die "pvesm path gave nothing for $src_volid"
 
@@ -440,6 +452,7 @@ phase_body() {
         *) die "after the move scsi0 is $dst_volid, which is not on $DST.
        Comparing against it would measure the wrong volume." ;;
     esac
+    activate_vol "$dst_volid"
     dst_path="$(vol_path "$dst_volid")"
     [ -n "$dst_path" ] || die "pvesm path gave nothing for $dst_volid"
     [ -b "$dst_path" ] || die "destination $dst_volid resolves to $dst_path, which is not a
@@ -471,6 +484,15 @@ phase_body() {
 
     journal_since "$since" "$OUT/$tag.kernel.txt"
     collect_nvme "$tag"
+
+    # Stopping the VM deactivates a shared LVM volume again, so the device node
+    # that existed a moment ago is gone by the time we want to read it. Activate
+    # once more here rather than earlier: this is the point where the comparison
+    # actually needs the device.
+    activate_vol "$dst_volid"
+    [ -b "$dst_path" ] || die "destination $dst_path is not present after stopping the VM.
+       The volume could not be activated for reading, and comparing against a
+       missing device would say nothing about the storage."
     flush_dev "$dst_path"
 
     say "verifying the destination"
