@@ -1,3 +1,28 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk5) unstable; urgency=medium
+
+  * path() resolves the name and stops looking for the device. The nvme-tcp
+    branch used to connect to the subsystem and run discovery, and it could
+    die - so `qm destroy` failed, because PVE resolves path() on the destroy
+    path and never calls activate_volume there. path() is name resolution and
+    must not fail; ZFSPoolPlugin builds /dev/zvol/<pool>/<name> unchecked and
+    LVM-thin hands back an inactive LV. Discovery now lives only in
+    activate_volume, which is the authoritative activation point.
+    Consequence, deliberate: destroy no longer aborts when the array is
+    unreachable, so a zvol can be left behind. That is the same trade the
+    in-tree plugins make.
+
+  * The udev link is waited for where activation happens, not where the name
+    is built, and it is required to be a block device. `-e` is true for a
+    regular file, and qemu-img dd/convert creates its output - so a lost udev
+    race could leave a regular file squatting the by-id name with the data in
+    page cache. A squatter is now named and refused.
+
+  * activate: say what the failure is when the volume was already freed. The
+    hint is attached to _nvme_device_for_uuid, not to activate_volume, because
+    measured against a live `qm destroy` the latter was never reached.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Mon, 17 Aug 2026 19:00:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk4) unstable; urgency=medium
 
   * Do not destroy a zvol whose export could not be removed.
