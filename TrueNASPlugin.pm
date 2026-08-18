@@ -316,6 +316,29 @@ sub _is_retryable_error {
     return 0; # Default: don't retry unknown errors
 }
 
+# Absolute wall-clock deadline for the API call currently in flight, set by
+# _retry_with_backoff and read by the transport so a later attempt asks for
+# the time that is actually left rather than a fresh full window. undef means
+# no call is in flight and the transport should use its own configured
+# timeout, which is what every caller outside the retry loop wants.
+our $_api_deadline;
+
+# Seconds left in the current call's budget, or undef when unbounded. Never
+# returns 0 or less: a caller that asked for the remaining time and got 0
+# would treat it as "no timeout" and block forever.
+sub _min_timeout {
+    my ($configured) = @_;
+    my $left = _api_budget_remaining();
+    return $configured if !defined $left;
+    return $left < $configured ? $left : $configured;
+}
+
+sub _api_budget_remaining {
+    return undef if !defined $_api_deadline;
+    my $left = $_api_deadline - time();
+    return $left > 0 ? $left : 0.1;
+}
+
 sub _retry_with_backoff {
     my ($scfg, $operation_name, $code_ref, $retry_opts) = @_;
 
@@ -325,6 +348,28 @@ sub _retry_with_backoff {
     my $initial_delay = defined($retry_opts) && exists($retry_opts->{retry_delay})
         ? $retry_opts->{retry_delay}
         : ($scfg->{tn_api_retry_delay} // 1);
+
+    # This loop used to count attempts and never look at the clock, so the
+    # worst case was the product of two numbers nobody multiplied: with
+    # tn_api_retry_max 5 and a dead array, six attempts of ~30s each plus
+    # 2+4+8+16+32s of backoff is about 150s for ONE call, and against a
+    # direct connection where an attempt costs a full TCP connect timeout
+    # (~127s) it is closer to fourteen minutes. Measured with
+    # tools/i32-apiloss.sh: pvesm alloc had not returned after 180s, holding
+    # the storage lock, and pvestatd stopped writing metrics for the
+    # duration. One unreachable array must not cost the node its management
+    # plane for a quarter of an hour.
+    #
+    # The budget is wall-clock across the whole retry sequence. It bounds
+    # when a new attempt may START; it cannot interrupt an attempt already
+    # blocked in a syscall, so the true ceiling is the budget plus one
+    # attempt. $_api_deadline lets the transport below shrink its own
+    # timeout to what is left instead of always asking for the full window.
+    my $budget = $scfg->{tn_api_budget_s} // 120;
+    $budget = 120 if $budget !~ /^\d+(?:\.\d+)?$/ || $budget < 1;
+    my $started  = time();
+    my $deadline = $started + $budget;
+    local $_api_deadline = $deadline;
 
     my $attempt = 0;
     my $last_error;
@@ -354,11 +399,27 @@ sub _retry_with_backoff {
             die "Operation failed after $max_retries retries: $last_error";
         }
 
+        # Out of time. Say so in those words: "we stopped waiting" is a
+        # different fact from "it did not work", and the caller decides
+        # differently on each.
+        my $left = $deadline - time();
+        if ($left <= 0) {
+            my $spent = time() - $started;
+            _log($scfg, 0, 'err', "[TrueNAS] Budget of ${budget}s spent after $attempt "
+                . "attempt(s) for $operation_name: $last_error");
+            die "Gave up on $operation_name after ${spent}s (budget ${budget}s, "
+              . "$attempt attempt(s)); the array did not answer in time, so the "
+              . "outcome is unknown: $last_error";
+        }
+
         # Calculate delay with exponential backoff
         my $delay = $initial_delay * (2 ** ($attempt - 1));
         # Add jitter (0-20% random variation) to prevent thundering herd
         my $jitter = $delay * 0.2 * rand();
         $delay += $jitter;
+        # Never sleep past the deadline: burning the remaining budget on a
+        # backoff buys a retry that is guaranteed to be refused.
+        $delay = $left if $delay > $left;
 
         _log($scfg, 1, 'info', "[TrueNAS] Retry attempt $attempt/$max_retries for $operation_name after ${delay}s delay (error: $last_error)");
         # Not sleep(): the builtin truncates its argument to a whole number of
@@ -578,6 +639,16 @@ sub properties {
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
+        tn_api_budget_s => {
+            description => "Wall-clock ceiling, in seconds, for one API call including " .
+                          "every retry. Counting retries without counting time lets " .
+                          "tn_api_retry_max multiply by the per-attempt timeout: with " .
+                          "5 retries against an unreachable array that is minutes per " .
+                          "call, during which the storage lock is held and pvestatd " .
+                          "stops reporting. This bounds when a new attempt may start, " .
+                          "so the real ceiling is this plus one attempt. Default: 120.",
+            type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 900,
+        },
         tn_broker_timeout => {
             description => "How long to wait for the session broker to answer one " .
                           "call, in seconds. The broker is told this value and aims " .
@@ -690,6 +761,7 @@ sub options {
         # Retry configuration
         tn_api_retry_max => { optional => 1 },
         tn_api_retry_delay => { optional => 1 },
+        tn_api_budget_s => { optional => 1 },
         tn_broker_timeout => { optional => 1 },
 
         # Concurrency
@@ -1264,7 +1336,10 @@ sub _broker_rpc {
         # and ours expires first by milliseconds, replacing the broker's
         # account of the failure with a bare "read timeout". Brokers that
         # predate this field ignore it.
-        timeout => ($scfg->{tn_broker_timeout} // 30),
+        # Never ask for more than the retry budget has left. Asking for the
+        # full window on the last attempt is how one call overshoots its
+        # budget by a whole broker timeout.
+        timeout => _min_timeout($scfg->{tn_broker_timeout} // 30),
     };
     my $payload = encode_json($req) . "\n";
 
@@ -1275,7 +1350,10 @@ sub _broker_rpc {
     # trip, not per-call to sysread, so a slow-but-progressing TN won't
     # falsely trip it. Tunable via tn_broker_timeout (seconds); default
     # 30 s, the same envelope the rest of the plugin uses for WS I/O.
-    my $timeout = $scfg->{tn_broker_timeout} // 30;
+    # Capped the same way as the timeout we declare to the broker: on the
+    # last attempt of a retry sequence there may be only seconds of budget
+    # left, and waiting the full window would blow past it.
+    my $timeout = _min_timeout($scfg->{tn_broker_timeout} // 30);
     my $deadline = time() + $timeout;
     my $sel = IO::Select->new($sock);
 
