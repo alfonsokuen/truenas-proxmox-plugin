@@ -1,3 +1,67 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk6) unstable; urgency=medium
+
+  Everything here came out of one fault injection: tools/i32-apiloss.sh, which
+  blacks out the array's management API at the packet level while leaving the
+  fabric and guest I/O alone. Four assertions, all four failing when it was
+  first run.
+
+  * list_images_nvme no longer answers "this storage is empty" when what
+    happened is "I could not ask". Measured: a storage holding two volumes
+    listed as zero with exit code 0, three times, in 155s, 90s and 35s - not a
+    timeout decaying into a partial answer, a confident wrong answer that is
+    sometimes fast. Reconciliation is built on this call, and an empty list
+    tells it every dataset on the array is an orphan. Three doors led there -
+    the subsystem query dying, the subsystem not being found, and the
+    namespace query dying inside `eval {...} // []`, silently. All three now
+    die naming the question that could not be asked. The pool.dataset.query
+    batch fetch stays non-fatal on purpose: it has a per-volume fallback, and
+    11-list-fail-closed.t pins that so a later tightening does not turn a
+    working degraded mode into an outage.
+
+  * _retry_with_backoff counts time, not just attempts. It counted attempts
+    and never looked at the clock, so the worst case was a product nobody
+    multiplied: with tn_api_retry_max 5, six attempts of ~30s through the
+    broker plus 2+4+8+16+32s of backoff is ~150s for ONE call, and against a
+    direct connection where an attempt costs a full TCP connect timeout,
+    closer to fourteen minutes. tn_api_budget_s (default 120) bounds the
+    sequence, and the transport now asks for the time that is left rather than
+    a fresh full window every attempt - without that second half the last
+    attempt overshoots by a whole broker timeout.
+
+  * cluster_lock_storage bounds how long the work holds the lock, not just how
+    long we wait to get it. tn_storage_lock_timeout is the acquire timeout;
+    once acquired the callback ran with no ceiling, so an operation making
+    several calls held the lock for the sum of them. tn_op_budget_s (default:
+    tn_storage_lock_timeout) starts its clock when the operation gets the
+    lock, not while it queues behind another node. Measured effect: pvesm
+    alloc went from still running at 180s to failing cleanly at 151s with the
+    reason named.
+
+  * status() stops asking an array that just said no. Both its lookups already
+    ran with retry_max => 0, but one probe against a dead API still costs a
+    broker deadline, times every truenasplugin storage, inside the single
+    process that reports metrics for all of them. tn_status_budget_s (default
+    8) bounds the probe - nobody waits on a capacity figure, and a stale
+    metric costs less than a blocked pvestatd - and tn_status_probe_backoff_s
+    (default 30) answers from memory after a connectivity failure. The marker
+    is narrow on purpose: armed only by connectivity errors, never by a
+    missing dataset or a rejected key, and dropped the moment the array
+    answers.
+
+  KNOWN, and not fixed here: the first call issued after the API disappears is
+  blocked in a read on a socket that was already established, and no budget
+  can interrupt a syscall already in flight - measured at over 180s where
+  later calls settle at ~36s. pvestatd still stalls during that first window.
+  And pvesm status computes every storage before filtering, so one slow
+  storage darkens the node's management plane no matter what this plugin
+  does. Guests keep running, quorum holds, and everything recovers unattended.
+
+  Tests: 15 files, 291 assertions. Each new file was run against the unfixed
+  plugin first; the tagged assertions fail there, which is the only thing that
+  makes them worth having.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Tue, 18 Aug 2026 11:20:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk5) unstable; urgency=medium
 
   * path() resolves the name and stops looking for the device. The nvme-tcp
