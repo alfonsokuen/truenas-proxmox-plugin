@@ -850,6 +850,31 @@ recover() {
 # ============================================================
 # Phase 5: Reconnect
 # ============================================================
+# Disconnect only the subsystems this plugin configures, never every session on
+# the node. `nvme disconnect-all` is not a safer-looking variant of this: on a
+# node that also consumes NVMe-oF outside the plugin - a raw namespace carrying
+# an LVM VG, say - it tears that down too, with the guests still running on it.
+# The blast radius of the old call was every NVMe fabric the host had, and it
+# was printed as an instruction to repeat on every other node in the cluster.
+_disconnect_configured_subsystems() {
+    local nqns nqn found=0
+    nqns="$(awk '/^[[:space:]]*tn_subsystem_nqn[[:space:]]/ { print $2 }' \
+        /etc/pve/storage.cfg 2>/dev/null | sort -u)"
+    if [[ -z "$nqns" ]]; then
+        warning "No tn_subsystem_nqn found in /etc/pve/storage.cfg; disconnecting nothing."
+        warning "If you meant to disconnect a specific subsystem, run:"
+        info "  nvme disconnect -n <subsystem-nqn>"
+        return 0
+    fi
+    while IFS= read -r nqn; do
+        [[ -n "$nqn" ]] || continue
+        info "  disconnecting ${nqn}"
+        nvme disconnect -n "$nqn" 2>/dev/null || true
+        found=$((found + 1))
+    done <<< "$nqns"
+    success "Disconnected ${found} configured subsystem(s); other fabrics left alone"
+}
+
 reconnect() {
     local moved="$1"
 
@@ -880,14 +905,13 @@ reconnect() {
     read -rp "  Disconnect NVMe sessions and restart PVE services? [y/N]: " confirm
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
         warning "Skipped. You will need to manually run on EACH cluster node:"
-        info "  nvme disconnect-all"
+        info "  nvme disconnect -n <subsystem-nqn>   # NEVER disconnect-all"
         info "  systemctl restart pvedaemon pveproxy pvestatd"
         return
     fi
 
-    info "Disconnecting NVMe sessions on this node..."
-    nvme disconnect-all 2>/dev/null || true
-    success "NVMe sessions disconnected"
+    info "Disconnecting this storage.s NVMe subsystems on this node..."
+    _disconnect_configured_subsystems
 
     info "Restarting pvedaemon, pveproxy, pvestatd on this node..."
     systemctl restart pvedaemon pveproxy pvestatd
@@ -904,7 +928,7 @@ reconnect() {
     if [[ ${#cluster_nodes[@]} -gt 1 ]]; then
         echo ""
         warning "IMPORTANT: Run the following on each OTHER cluster node:"
-        info "  nvme disconnect-all && systemctl restart pvedaemon pveproxy pvestatd"
+        info "  nvme disconnect -n <subsystem-nqn> && systemctl restart pvedaemon pveproxy pvestatd"
     fi
     info "Start your VMs one at a time to verify each one works."
     info "VM config backups are at: ${BACKUP_DIR}/"
