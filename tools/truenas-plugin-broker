@@ -65,8 +65,18 @@ if ($UPSTREAM_TIMEOUT !~ /^\d+(?:\.\d+)?$/ || $UPSTREAM_TIMEOUT < 1) {
     $UPSTREAM_TIMEOUT = 30;
 }
 # Ceiling on a client-declared budget, so one caller cannot hold the single
-# accept thread for an arbitrary time.
-my $MAX_BUDGET = 600;
+# accept thread for an arbitrary time. Requests are served inline, so this
+# number is the worst case for every OTHER storage on the node as well: at 600,
+# one caller that asked for a ten-minute timeout left every TrueNAS storage here
+# unserved for ten minutes, and pvestatd - which polls on a far shorter timer -
+# stacked up behind it instead of failing cleanly. 90 is above any operation
+# this plugin issues in practice and below the point where waiting is worse than
+# reporting a failure. Raising it raises the blast radius, not just the patience.
+my $MAX_BUDGET = $ENV{TRUENAS_BROKER_MAX_BUDGET} || 90;
+if ($MAX_BUDGET !~ /^\d+(?:\.\d+)?$/ || $MAX_BUDGET < 5) {
+    warn "TRUENAS_BROKER_MAX_BUDGET is not a number >= 5; using 90\n";
+    $MAX_BUDGET = 90;
+}
 # The liveness probe on a pooled connection gets a much shorter budget: its
 # whole purpose is to find out quickly whether the socket is still real, and a
 # probe that waits the full timeout defeats the point of probing.
@@ -523,7 +533,11 @@ sub make_listener {
     unlink $SOCKET_PATH if -e $SOCKET_PATH;
     my $srv = IO::Socket::UNIX->new(
         Local  => $SOCKET_PATH,
-        Listen => 32,
+        # Clients wait here while the single thread serves the one in flight,
+        # and a client sitting in the backlog has not been accepted yet, so its
+        # own read timeout has not started counting. A short queue turns one
+        # slow request into refused connections for everybody else.
+        Listen => 128,
         Type   => SOCK_STREAM,
     ) or die "cannot bind $SOCKET_PATH: $!";
     chmod 0600, $SOCKET_PATH;
