@@ -48,9 +48,11 @@ microseconds, which is a different failure and would have proved nothing.
 Three defects, each reproduced in isolation with a positive control:
 
 **`pvesm list` invents an empty storage.** With the API up, 2 volumes in 570 ms.
-With the API blacked out: **0 volumes, exit code 0**, after 155 s. It recovers
-to 2 as soon as the API returns, so the storage was never the problem — the
-plugin simply could not ask, and reported "nothing there" instead of saying so.
+With the API blacked out: **0 volumes, exit code 0**. Reproduced three times, in
+155 s, 90 s and 35 s — so it is not a timeout decaying into a partial answer, it
+is a confident wrong answer that is sometimes fast. It recovers to 2 as soon as
+the API returns, so the storage was never the problem — the plugin simply could
+not ask, and reported "nothing there" instead of saying so.
 
 This is the most dangerous thing found in the whole campaign, and it is not a
 hang. Reconciliation is exactly the job that compares PVE's list against the
