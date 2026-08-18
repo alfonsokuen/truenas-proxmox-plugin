@@ -1,0 +1,53 @@
+Subject: nvmet: strip the model string before comparing and writing attr_model
+
+On a chassis where dmidecode reports an empty system-product-name, the
+middleware's subsys.model() falls through to
+
+    return f'TrueNAS {system_product}'[:MAX_MODEL_LEN]
+
+and builds 'TrueNAS ' -- with a trailing space. update_attrs() reads the
+current value back with
+
+    curval = p.read_text().strip()          # kernel.py, ~line 102
+
+so the value it compares against is 'TrueNAS', while the value it wants to
+write is 'TrueNAS '. They never match, so every render attempts to rewrite
+attr_model. The kernel refuses that write once any host has discovered the
+subsystem:
+
+    nvmet: Can't set model number. TrueNAS  is already assigned
+
+which surfaces as EIO. The exception aborts the remainder of the render, so
+the namespaces and allowed_hosts symlinks queued behind it never reach the
+kernel: the subsystem stays visible but exports nothing, and newly created
+namespaces are recorded in the middleware database yet never published.
+
+Stripping the desired value makes it equal the stripped value that is read
+back, so the comparison matches and no write is attempted. The stale
+'TrueNAS ' already in configfs is left alone -- it is cosmetic, and the
+kernel would refuse to change it anyway.
+
+Upstream: NAS-140266 (fixed in TrueNAS 26 BETA).
+Applies to: TrueNAS 25.10.x, file
+  /usr/lib/python3/dist-packages/middlewared/plugins/nvmet/kernel.py
+
+--- a/usr/lib/python3/dist-packages/middlewared/plugins/nvmet/kernel.py
++++ b/usr/lib/python3/dist-packages/middlewared/plugins/nvmet/kernel.py
+@@ -403,7 +403,16 @@
+             case 'B':
+                 result['attr_cntlid_min'] = 32000
+ 
+-        result['attr_model'] = render_ctx['nvmet.subsys.model']
++        # IDK, 2026-08-17: strip before comparing and writing. dmidecode reports
++        # an empty system-product-name on this chassis, so model() builds
++        # 'TrueNAS ' with a trailing space. configfs reads attr_model back
++        # stripped, so values_match() never matches and update_attrs() rewrites
++        # attr_model on every render. The kernel refuses that write once a host
++        # has discovered the subsystem - 'Can't set model number. TrueNAS  is
++        # already assigned', EIO - and the exception aborts the remainder of the
++        # render, so namespaces and allowed_hosts never reach the kernel.
++        # Upstream fix: NAS-140266.
++        result['attr_model'] = render_ctx['nvmet.subsys.model'].strip()
+         result['attr_firmware'] = render_ctx['nvmet.subsys.firmware']
+         return result
+ 
