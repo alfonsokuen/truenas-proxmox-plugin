@@ -6846,7 +6846,31 @@ sub _free_image_nvme {
     if ($@) {
         my $err = $@ // '';
         if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
-            # Dataset already gone — treat as success (idempotent)
+            # The message says the dataset is gone. Confirm that it is, rather
+            # than believing the string: this pattern matches anywhere in free
+            # text, and a transport-level failure can carry those words for
+            # reasons that have nothing to do with the dataset. A JSON-RPC
+            # "-32601 Method does not exist" is enough, and so is whatever the
+            # broker reports when it dies mid-call. Measured: kill the broker
+            # 150 ms into `pvesm free` and this branch swallowed the failure -
+            # exit status 0, zvol still on the array, namespace still exported
+            # and still published in the kernel. A delete that reports success
+            # while the volume is still there is worse than one that fails,
+            # because nothing will ever come back to it.
+            my $still_there = eval { _tn_dataset_get($scfg, $full_ds) };
+            my $probe_err = $@;
+            if ($still_there) {
+                die "Refusing to report success for $full_ds: the delete failed "
+                  . "with '$err', but the dataset is still on the array.\n";
+            }
+            if ($probe_err && $probe_err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # We could not find out. That is not the same as "it is gone",
+                # and guessing here is how volumes get forgotten.
+                die "Cannot confirm $full_ds was deleted: the delete failed with "
+                  . "'$err' and the follow-up query failed with '$probe_err'. "
+                  . "Retry once the TrueNAS API answers.\n";
+            }
+            # Confirmed absent - genuinely idempotent.
         } else {
             # Re-raise so Proxmox reports the failure; zvol is still present on TrueNAS
             die "Failed to delete dataset $full_ds: $err\n";
