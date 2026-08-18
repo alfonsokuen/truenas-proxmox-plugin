@@ -45,7 +45,7 @@ untouched; only the management API stops answering. Reproduced by dropping the
 array's *replies* on the input hook — dropping outbound instead returns EPERM in
 microseconds, which is a different failure and would have proved nothing.
 
-Two defects, both reproduced in isolation with a positive control:
+Three defects, each reproduced in isolation with a positive control:
 
 **`pvesm list` invents an empty storage.** With the API up, 2 volumes in 570 ms.
 With the API blacked out: **0 volumes, exit code 0**, after 155 s. It recovers
