@@ -369,6 +369,14 @@ sub _retry_with_backoff {
     $budget = 120 if $budget !~ /^\d+(?:\.\d+)?$/ || $budget < 1;
     my $started  = time();
     my $deadline = $started + $budget;
+    # An outer deadline wins when it is nearer. cluster_lock_storage sets one
+    # for the whole locked operation, and a per-call budget that ignored it
+    # would let a sequence of calls hold the lock for N times the budget -
+    # which is exactly how alloc stayed past 180s with each individual call
+    # behaving itself.
+    if (defined($_api_deadline) && $_api_deadline < $deadline) {
+        $deadline = $_api_deadline;
+    }
     local $_api_deadline = $deadline;
 
     my $attempt = 0;
@@ -639,6 +647,16 @@ sub properties {
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
+        tn_op_budget_s => {
+            description => "Wall-clock ceiling, in seconds, for the API calls of one " .
+                          "locked storage operation. tn_api_budget_s bounds a single " .
+                          "call; an operation that makes several was still unbounded " .
+                          "and held the cluster lock for the sum of them. The clock " .
+                          "starts when the operation acquires the lock, not while it " .
+                          "queues for it. Bounds API calls, not local I/O. Set to 0 " .
+                          "to disable. Default: the value of tn_storage_lock_timeout.",
+            type => 'integer', optional => 1, minimum => 0, maximum => 3600,
+        },
         tn_api_budget_s => {
             description => "Wall-clock ceiling, in seconds, for one API call including " .
                           "every retry. Counting retries without counting time lets " .
@@ -761,6 +779,7 @@ sub options {
         # Retry configuration
         tn_api_retry_max => { optional => 1 },
         tn_api_retry_delay => { optional => 1 },
+        tn_op_budget_s => { optional => 1 },
         tn_api_budget_s => { optional => 1 },
         tn_broker_timeout => { optional => 1 },
 
@@ -8933,8 +8952,40 @@ sub cluster_lock_storage {
     # Localize @_deferred_work for re-entrancy safety (nested lock calls get their own queue)
     local @_deferred_work = ();
 
+    # Bound how long the work may hold the lock, not just how long we wait to
+    # get it. $lock_timeout above is the acquire timeout; once acquired the
+    # callback used to run unbounded, so an operation that makes several API
+    # calls held the lock for the sum of them. Measured with
+    # tools/i32-apiloss.sh against an unreachable array: alloc had still not
+    # returned after 180s even with every individual call inside its own
+    # budget, because the budget was per call and alloc makes several.
+    #
+    # The deadline starts when the callback starts, not when we begin waiting
+    # for the lock - time spent queueing behind another node is not this
+    # operation's to spend. Nested locks inherit whichever deadline is nearer,
+    # via the same rule _retry_with_backoff applies.
+    #
+    # This bounds API calls. Local I/O (nvme connect, udev settle) has its own
+    # timeouts and is mostly deferred outside the lock anyway. Set
+    # tn_op_budget_s to 0 to switch it off.
+    my $op_budget = $scfg->{tn_op_budget_s};
+    $op_budget = $lock_timeout if !defined($op_budget);
+    $op_budget = $lock_timeout if $op_budget !~ /^\d+(?:\.\d+)?$/;
+
+    my $wrapped = $func;
+    if ($op_budget > 0) {
+        $wrapped = sub {
+            my $inner = time() + $op_budget;
+            if (defined($_api_deadline) && $_api_deadline < $inner) {
+                $inner = $_api_deadline;
+            }
+            local $_api_deadline = $inner;
+            return $func->(@_);
+        };
+    }
+
     # Run the locked callback via parent implementation
-    my $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $func, @param);
+    my $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $wrapped, @param);
 
     # Execute deferred work outside the lock (best-effort, never die)
     if (@_deferred_work) {
