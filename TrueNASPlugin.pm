@@ -55,6 +55,12 @@ my $TARGET_VISIBLE_SKIP_TTL_S = 60;
 my %_preflight_last_ok;
 my %_target_visible_last_ok;
 
+# host_key => epoch until which status() answers "inactive" without probing the
+# API again. Armed only by connectivity failures, and cleared the moment the
+# array answers, so a recovered array is picked up on the next poll after the
+# window rather than being remembered as down.
+my %_status_api_down;
+
 # Lightweight status-cache counters for tuning/verification
 my %_status_capacity_cache_stats = (
     hit => 0,
@@ -647,6 +653,25 @@ sub properties {
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
+        tn_status_budget_s => {
+            description => "Wall-clock ceiling, in seconds, for the API probe inside " .
+                          "status(). Deliberately much shorter than an operation " .
+                          "budget: pvestatd calls status() for every storage on the " .
+                          "node from a single process, so time spent here is time no " .
+                          "other storage gets to report. Nobody is waiting on a " .
+                          "capacity figure; a stale metric costs less than a blocked " .
+                          "pvestatd. Default: 8.",
+            type => 'integer', optional => 1, default => 8, minimum => 1, maximum => 120,
+        },
+        tn_status_probe_backoff_s => {
+            description => "After status() fails to reach the array, answer 'inactive' " .
+                          "for this many seconds without probing again. An array that " .
+                          "just refused will refuse again, and finding that out costs " .
+                          "one deadline per poll per storage. Cleared as soon as the " .
+                          "array answers, so recovery is seen within one window. Set " .
+                          "to 0 to probe on every poll. Default: 30.",
+            type => 'integer', optional => 1, default => 30, minimum => 0, maximum => 600,
+        },
         tn_op_budget_s => {
             description => "Wall-clock ceiling, in seconds, for the API calls of one " .
                           "locked storage operation. tn_api_budget_s bounds a single " .
@@ -779,6 +804,8 @@ sub options {
         # Retry configuration
         tn_api_retry_max => { optional => 1 },
         tn_api_retry_delay => { optional => 1 },
+        tn_status_budget_s => { optional => 1 },
+        tn_status_probe_backoff_s => { optional => 1 },
         tn_op_budget_s => { optional => 1 },
         tn_api_budget_s => { optional => 1 },
         tn_broker_timeout => { optional => 1 },
@@ -7371,6 +7398,37 @@ sub status {
         _log($scfg, 2, 'debug', "[TrueNAS] status: path reconcile failed: $@") if $@;
     }
 
+    # An array that just refused to answer will refuse again a second later,
+    # and pvestatd cannot afford to find that out one broker deadline at a
+    # time. Both lookups below already run with retry_max => 0, so a single
+    # probe against a dead API still costs a full tn_broker_timeout - times
+    # every truenasplugin storage on the node, inside the one process that
+    # reports metrics for all of them. Measured with tools/i32-apiloss.sh:
+    # pvestatd stopped writing metrics entirely for the length of the outage.
+    #
+    # So: remember the refusal briefly and answer from memory while it stands.
+    # The cost is that recovery is noticed up to tn_status_probe_backoff_s
+    # late, which is a poll or two - against pvestatd going silent for the
+    # whole outage, that is a trade worth making.
+    my $backoff = $scfg->{tn_status_probe_backoff_s};
+    $backoff = 30 if !defined($backoff) || $backoff !~ /^\d+(?:\.\d+)?$/;
+    if ($backoff > 0) {
+        my $down_until = $_status_api_down{$host_key};
+        if (defined($down_until) && time() < $down_until) {
+            _log($scfg, 1, 'info', "[TrueNAS] status: '$storeid' reported inactive from "
+                . "the recent-failure marker; not probing the API again for "
+                . int($down_until - time()) . "s");
+            return (0, 0, 0, 0);
+        }
+    }
+
+    # Bound the probe itself. This is deliberately far shorter than the budget
+    # a user-initiated operation gets: nobody is waiting on status(), and a
+    # stale metric costs less than a blocked pvestatd.
+    my $status_budget = $scfg->{tn_status_budget_s};
+    $status_budget = 8 if !defined($status_budget) || $status_budget !~ /^\d+(?:\.\d+)?$/ || $status_budget < 1;
+    local $_api_deadline = time() + $status_budget;
+
     eval {
         my $ds = _get_cached($host_key, $status_method, $STATUS_CAPACITY_TTL_S);
         if ($ds) {
@@ -7414,6 +7472,13 @@ sub status {
             # Network/connectivity issue - mark as inactive (temporary)
             _log($scfg, 0, 'info', "[TrueNAS] status: storage '$storeid' marked inactive (connectivity issue): $err");
             $active = 0;
+            # Arm the marker read at the top, so the next poll answers from
+            # memory instead of spending another deadline finding out the same
+            # thing. Only for connectivity: a bad dataset name or a rejected
+            # API key answers fast and needs no suppression.
+            if ($backoff > 0) {
+                $_status_api_down{$host_key} = time() + $backoff;
+            }
         } elsif (_is_not_found_error($err)) {
             # Dataset doesn't exist - this is a configuration error
             _log($scfg, 0, 'err', "[TrueNAS] status: storage '$storeid' configuration error (dataset not found): $err");
@@ -7432,6 +7497,11 @@ sub status {
         $total = 0;
         $avail = 0;
         $used  = 0;
+    } else {
+        # It answered. Drop any suppression immediately rather than waiting
+        # out the window: the marker exists to stop pointless probing, not to
+        # keep insisting a working array is down.
+        delete $_status_api_down{$host_key};
     }
     return ($total, $avail, $used, $active);
 }
