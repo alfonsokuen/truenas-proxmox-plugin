@@ -7081,13 +7081,23 @@ sub _list_images_nvme {
             [["subnqn", "=", $nqn]]
         ]);
     };
+    # An empty list is a claim: "there is nothing on this storage". We may only
+    # make it when we actually know. Every early return below used to hand back
+    # $res, still empty, on an error - so an unreachable API was indistinguishable
+    # from an empty array. Measured with tools/i32-apiloss.sh: a storage holding
+    # two volumes listed as zero, exit code 0. Reconciliation is built on this
+    # call, and an empty answer tells it every dataset on the array is an orphan.
     if ($@) {
-        _log($scfg, 0, 'err', "[TrueNAS] list_images_nvme: failed to query subsystem: $@");
-        return $res;
+        my $err = $@;
+        _log($scfg, 0, 'err', "[TrueNAS] list_images_nvme: failed to query subsystem: $err");
+        die "Cannot list $storeid: the subsystem query failed and the contents of "
+          . "this storage are unknown: $err";
     }
     if (!$subsystems || !@$subsystems) {
         _log($scfg, 0, 'err', "[TrueNAS] list_images_nvme: subsystem $nqn not found");
-        return $res;
+        die "Cannot list $storeid: subsystem $nqn was not found on the array. "
+          . "Either tn_subsystem_nqn is wrong or the subsystem is gone; this is "
+          . "not the same as the storage being empty.\n";
     }
     my $subsys_id = $subsystems->[0]{id};
 
@@ -7095,7 +7105,21 @@ sub _list_images_nvme {
     # Note: Query without filter because TrueNAS API filter syntax is inconsistent
     my $namespaces = eval {
         _api_call($scfg, 'nvmet.namespace.query', [[]]);
-    } // [];
+    };
+    if ($@) {
+        my $err = $@;
+        _log($scfg, 0, 'err', "[TrueNAS] list_images_nvme: failed to query namespaces: $err");
+        die "Cannot list $storeid: the namespace query failed, so the contents of "
+          . "this storage are unknown: $err";
+    }
+    if (!defined $namespaces) {
+        die "Cannot list $storeid: the namespace query returned nothing at all, "
+          . "which is not the same as returning no namespaces.\n";
+    }
+    if (ref($namespaces) ne 'ARRAY') {
+        die "Cannot list $storeid: the namespace query answered with "
+          . ref($namespaces) . " instead of a namespace list.\n";
+    }
 
     # Filter to only our subsystem ('subsys' may be a scalar id or nested object)
     $namespaces = [ grep {
