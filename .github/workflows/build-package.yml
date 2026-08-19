@@ -13,7 +13,62 @@ permissions:
   contents: write
 
 jobs:
+  # Runs before anything is built. The suite existed but no workflow ran it, so
+  # every fix was validated only when someone remembered to do it by hand.
+  #
+  # The unit files need PVE's perl modules to load the plugin at all. Without
+  # them each one skips itself and a naive runner reports success having
+  # exercised nothing -- measured 2026-08-19: 0 of 28 files asserted anything on
+  # a bare container. tools/run-tests.sh therefore enforces a floor on files
+  # that actually emitted assertions, so a broken environment fails loudly
+  # instead of passing quietly.
+  unit:
+    name: Unit suite
+    runs-on: ubuntu-latest
+    # PVE 9 is built on Debian trixie; the perl modules must match that base.
+    container:
+      image: debian:trixie
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TEST_TIMEOUT: "120"
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git gnupg perl
+
+      - name: Add Proxmox repository
+        run: |
+          install -d /etc/apt/keyrings
+          curl -fsSL https://enterprise.proxmox.com/debian/proxmox-release-trixie.gpg \
+            -o /etc/apt/keyrings/proxmox-release-trixie.gpg
+          # signed-by scopes this key to the Proxmox repository only. Dropping it
+          # into trusted.gpg.d would make it valid for every source in the image.
+          echo "deb [signed-by=/etc/apt/keyrings/proxmox-release-trixie.gpg] http://download.proxmox.com/debian/pve trixie pve-no-subscription" \
+            > /etc/apt/sources.list.d/pve.list
+          apt-get update
+
+      - name: Install PVE perl modules
+        run: |
+          apt-get install -y --no-install-recommends \
+            libpve-storage-perl libpve-common-perl
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Installed from the checkout so the suite exercises THIS commit, not
+      # whatever version the package manager happened to pull in.
+      - name: Install plugin under test
+        run: |
+          install -D -m 0644 TrueNASPlugin.pm \
+            /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+      - name: Run unit suite
+        run: bash tools/run-tests.sh unit
+
   build:
+    needs: unit
     runs-on: ubuntu-latest
     container:
       image: debian:bookworm

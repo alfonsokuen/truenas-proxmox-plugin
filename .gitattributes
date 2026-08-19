@@ -1,0 +1,13 @@
+# Shell scripts and CI definitions must keep LF endings regardless of the
+# platform they are edited on. A checkout with core.autocrlf=true (the Windows
+# default) would otherwise commit CRLF, and a bash script with CRLF fails on
+# Linux with "bad interpreter: No such file or directory" -- which reads as a
+# missing file rather than a line-ending problem.
+*.sh            text eol=lf
+*.pl            text eol=lf
+*.t             text eol=lf
+*.pm            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+tools/*         text eol=lf
+debian/*        text eol=lf
