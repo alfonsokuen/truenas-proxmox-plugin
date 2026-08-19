@@ -77,7 +77,13 @@ main() {
     local deb_version
     deb_version="$(dpkg-parsechangelog -S Version)"
     local plugin_version
-    plugin_version="${deb_version%%+*}"
+    # Must match what debian/rules injects. Upstream trims at the first '+' so a
+    # +debN build reports the bare version; this build deliberately keeps its
+    # +idkN suffix so an internal build is distinguishable from upstream's from
+    # inside PVE (see the comment in debian/rules). The injection was changed to
+    # keep it and this check was not, so every build failed here -- unnoticed,
+    # because CI never ran the packaging step to completion.
+    plugin_version="${deb_version}"
 
     [[ -n "${package_name}" ]] || die "Unable to read package name from debian/changelog"
     [[ -n "${deb_version}" ]] || die "Unable to read version from debian/changelog"
@@ -120,8 +126,20 @@ main() {
     local plugin_file="${TMP_DIR}/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
     [[ -f "${plugin_file}" ]] || die "Plugin file missing in extracted package: ${plugin_file}"
 
-    if ! grep -Eq "^our \\\$VERSION = '${plugin_version}';$" "${plugin_file}"; then
-        die "Version injection verification failed: expected \"our \\\$VERSION = '${plugin_version}';\""
+    # Compared as a literal string, not a regex. The version carries a '+', which
+    # ERE reads as "one or more of the previous character": `alpha1+idk6` matches
+    # alpha1idk6 and alpha11idk6, never the literal text. Upstream's
+    # `${deb_version%%+*}` hid this by removing the '+' before it was ever used
+    # as a pattern.
+    local expected_line actual_line
+    expected_line="our \$VERSION = '${plugin_version}';"
+    actual_line="$(grep -m1 '^our \$VERSION = ' "${plugin_file}" || true)"
+
+    if [[ "${actual_line}" != "${expected_line}" ]]; then
+        log_error "Version injection verification failed"
+        log_error "  expected: ${expected_line}"
+        log_error "  found:    ${actual_line:-<no \$VERSION line in the packaged module>}"
+        die "Packaged module does not carry the version from debian/changelog"
     fi
 
     local sums_file="${ARTIFACT_DIR}/SHA256SUMS"
