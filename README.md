@@ -2,6 +2,22 @@
 
 <p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI or NVMe/TCP, featuring live snapshots, LXC container storage, ZFS integration, and cluster compatibility.</p>
 
+---
+
+> **This is the IDKmanager fork (`idk-secure`), not upstream.**
+>
+> It carries fixes upstream does not have yet and a record of what was measured.
+> After evaluating it against a three-node PVE 9 cluster, **we decided not to adopt
+> it for our fleet** — see [`docs/decision-2026-08.md`](docs/decision-2026-08.md)
+> for the reasoning, which is about maintenance burden and blast radius, not about
+> whether the plugin works.
+>
+> - [`docs/decision-2026-08.md`](docs/decision-2026-08.md) — the adoption decision and what would reverse it
+> - [`docs/validation-2026-08.md`](docs/validation-2026-08.md) — what was exercised, what broke, and what is **not** proven
+> - [`docs/nvmeof-host-tuning.md`](docs/nvmeof-host-tuning.md) — host-side udev/LVM tuning, with the traps
+
+---
+
 ## Features
 
 - **Dual Transport Support** - iSCSI (traditional) or NVMe/TCP (lower latency) block storage
