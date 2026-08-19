@@ -256,15 +256,25 @@ for v in "$VMID" "$CLONE" "$LINKED" "$RESTORE"; do
     if pvesh get /cluster/resources --type vm --output-format json 2>/dev/null | grep -q "\"vmid\":$v,"; then
         echo "refusing: VMID $v is in use in the cluster" >&2; exit 2
     fi
-    VOLS_OUT=""
-    if ! vols_for "$STORAGE" "$v"; then
-        echo "refusing: cannot list $STORAGE - unable to tell whether leftovers exist" >&2; exit 2
-    fi
-    if [ -n "$VOLS_OUT" ]; then
-        echo "refusing: leftover volume(s) for $v on $STORAGE" >&2
-        echo "$VOLS_OUT" >&2
-        exit 2
-    fi
+    # Every storage this run will clean up, not just the primary one. The
+    # cleanup at the end destroys by VMID, so a volume that happens to carry
+    # one of these VMIDs is destroyed whether this run created it or not - and
+    # the alternate storage was omitted here until it swept away a 2 GiB
+    # leftover from an earlier session on the move-disk target. The VMIDs were
+    # checked as VMs and found free; nobody checked them as volumes over there.
+    for s in "$STORAGE" ${ALT:+"$ALT"}; do
+        VOLS_OUT=""
+        if ! vols_for "$s" "$v"; then
+            echo "refusing: cannot list $s - unable to tell whether leftovers exist" >&2; exit 2
+        fi
+        if [ -n "$VOLS_OUT" ]; then
+            echo "refusing: leftover volume(s) for $v on $s" >&2
+            echo "$VOLS_OUT" >&2
+            echo "this run would destroy them on cleanup. Move them, or pick a" >&2
+            echo "different --vmid base." >&2
+            exit 2
+        fi
+    done
     # A backup left by an earlier run with this same VMID would restore and
     # verify clean, because the seeds are derived from the VMID and would match.
     if pvesm list "$BKP" --content backup 2>/dev/null | awk -v x="$v" '$1 ~ ("qemu-" x "-")' | grep -q .; then
