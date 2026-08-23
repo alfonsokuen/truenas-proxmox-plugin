@@ -33,3 +33,19 @@ adds a shared recent-failure marker that CAPS (never skips) the periodic ensure 
 expected-vs-real ensure failures by the retry engine's own death sentences, and keeps whitelist
 reconciliation safe under short budgets. Measured: 15/15 polls at ~10s each -> 3 slow cycles per
 outage; pvestatd never starves. 332 tests, mutation-hardened.
+
+## Serie idk8 (2026-08-23, tarde) — iSCSI CHAP contra TrueNAS 25.10
+Dos hallazgos upstream, ambos verificados en vivo:
+1. **idk8**: 25.10 impone CHAP de discovery IMPLICITO en cuanto existe cualquier grupo
+   `iscsi/auth` (el knob `discovery_authmethod` ya no existe en la API). El plugin solo
+   configuraba `node.session.auth.*`, asi que su propio discovery moria con "initiator
+   failed authorization". Fix: helper `_iscsi_discover` que alimenta el discoverydb con
+   las mismas credenciales antes de descubrir.
+2. **idk8b**: el bucle principal de `_iscsi_login_all` era CODIGO MUERTO — `iscsiadm -m
+   node -T <iqn>` imprime el record completo, no la lista "portal,tpgt iqn" que el parser
+   esperaba, asi que @nodes siempre quedaba vacio y toda sesion entraba por el fallback
+   sin auth (que ademas resetea el discoverydb). En claro colaba; con CHAP no habia sesion
+   posible. Fix: listar todos los nodos y filtrar, tolerar el sufijo `,tpgt`, y fallback
+   CHAP-aware.
+Validado: login CHAP autonomo desde estado cliente limpio, VM+I/O end-to-end, negativo
+(login sin credenciales RECHAZADO por el target), suite 332/332 sin regresiones.
