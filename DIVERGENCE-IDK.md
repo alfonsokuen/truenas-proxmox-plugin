@@ -49,3 +49,15 @@ Dos hallazgos upstream, ambos verificados en vivo:
    CHAP-aware.
 Validado: login CHAP autonomo desde estado cliente limpio, VM+I/O end-to-end, negativo
 (login sin credenciales RECHAZADO por el target), suite 332/332 sin regresiones.
+
+## Empaquetado — `tools/build-deb.sh` (2026-08-23, al publicar el fork)
+La verificacion final del build derivaba la version esperada del plugin con
+`plugin_version="${deb_version%%+*}"`: upstream trata el sufijo tras `+` como revision de
+EMPAQUETADO, de modo que el `.pm` declara solo la parte anterior. Este fork usa `+idk6` como parte
+de la IDENTIDAD del plugin y el `.pm` la declara entera, asi que la comprobacion moria con
+"Version injection verification failed" y **el paquete no se podia construir desde este arbol**.
+Ahora se aceptan las DOS convenciones (`${deb_version}` o `${deb_version%%+*}`) y se compara de
+forma literal, no por ERE — la version lleva `~` y `+`, que en una expresion regular significan
+otra cosa y dejaban pasar cadenas que no eran la esperada. Lo destapo el workflow heredado de
+upstream al publicar el repo.
+

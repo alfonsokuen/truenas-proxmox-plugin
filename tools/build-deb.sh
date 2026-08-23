@@ -120,8 +120,17 @@ main() {
     local plugin_file="${TMP_DIR}/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
     [[ -f "${plugin_file}" ]] || die "Plugin file missing in extracted package: ${plugin_file}"
 
-    if ! grep -Eq "^our \\\$VERSION = '${plugin_version}';$" "${plugin_file}"; then
-        die "Version injection verification failed: expected \"our \\\$VERSION = '${plugin_version}';\""
+    # El $VERSION del .pm empaquetado tiene que corresponder con debian/changelog. Hay dos
+    # convenciones legitimas para el sufijo tras '+': upstream lo usa como revision de
+    # EMPAQUETADO (2.1.24~alpha1+deb12 -> el .pm declara 2.1.24~alpha1), y este fork lo usa
+    # como parte de la IDENTIDAD del plugin (2.1.24~alpha1+idk6 -> el .pm la declara entera,
+    # porque es lo que distingue esta build de la de upstream). Se aceptan ambas y se rechaza
+    # cualquier otra. Comparacion literal, no regex: la version lleva '~' y '+', que en una ERE
+    # significan otra cosa y dejarian pasar cadenas que no son la esperada.
+    local pm_version
+    pm_version="$(sed -n "s/^our [\$]VERSION = '\(.*\)';\$/\1/p" "${plugin_file}" | head -n 1)"
+    if [[ "${pm_version}" != "${deb_version}" && "${pm_version}" != "${plugin_version}" ]]; then
+        die "Version verification failed: debian/changelog says '${deb_version}', so the plugin must declare '${deb_version}' or '${plugin_version}', but it declares '${pm_version:-<none>}'"
     fi
 
     local sums_file="${ARTIFACT_DIR}/SHA256SUMS"
