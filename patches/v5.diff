@@ -1,0 +1,108 @@
+--- TrueNASPlugin.pm.bak-prev5	2026-08-23 14:43:53.409370303 -0500
++++ TrueNASPlugin.pm	2026-08-23 14:45:49.623331510 -0500
+@@ -419,9 +419,18 @@
+         my $left = $deadline - time();
+         if ($left <= 0) {
+             my $spent = time() - $started;
+-            _log($scfg, 0, 'err', "[TrueNAS] Budget of ${budget}s spent after $attempt "
++            # Name the budget that actually governed. $budget is the configured
++            # knob, but an outer deadline (the 2s marker cap, cluster_lock's
++            # window) may have shrunk the effective one - and "Budget of 120s
++            # spent" after two real seconds sends the diagnosis the wrong way,
++            # 18 lines for every 1 of the note that explains the cap.
++            my $granted = $deadline - $started;
++            my $bnote = ($granted + 0.5 < $budget)
++                ? sprintf('%ss, capped to %.0fs by an outer deadline', $budget, $granted)
++                : "${budget}s";
++            _log($scfg, 0, 'err', "[TrueNAS] Budget of $bnote spent after $attempt "
+                 . "attempt(s) for $operation_name: $last_error");
+-            die "Gave up on $operation_name after ${spent}s (budget ${budget}s, "
++            die "Gave up on $operation_name after ${spent}s (budget $bnote, "
+               . "$attempt attempt(s)); the array did not answer in time, so the "
+               . "outcome is unknown: $last_error";
+         }
+@@ -3783,11 +3792,25 @@
+     # empty one refuses every host trying to (re)connect.
+     # Paren-call form, not the bareword: this sub sits ABOVE the constants
+     # block in the file, so the bareword does not exist yet when this compiles.
++    # The reserve exists for the CLOSE step only: dying between closing and
++    # authorizing is what leaves the subsystem shut with an empty host list.
++    # When the subsystem is already closed ($cur_allow_any_host false - which
++    # is what both real call sites pass in whitelist mode), the only work left
++    # is the authorize, and deferring THAT is the opposite of protection: it
++    # leaves the closed-and-empty state standing, and kills the repair-mode
++    # self-heal in _nvme_connect() for as long as the marker keeps renewing.
++    # An authorize that dies of budget mutates nothing; the next ensure retries.
++    my $will_close = !defined($cur_allow_any_host) || $cur_allow_any_host;
+     my $left_budget = _api_budget_remaining();
+-    if (defined($left_budget) && $left_budget < WHITELIST_MIN_BUDGET_S()) {
+-        _log($scfg, 1, 'info', "[TrueNAS] nvme_reconcile_host_whitelist: deferring, "
+-            . "only ${left_budget}s left of the API budget (need "
+-            . WHITELIST_MIN_BUDGET_S() . "s)");
++    if ($will_close && defined($left_budget) && $left_budget < WHITELIST_MIN_BUDGET_S()) {
++        # Level 0 via the throttled note, not level 1: "I did not harden the
++        # subsystem" is exactly the class of fact this file already paid a
++        # debugging session (2026-08-23) to learn must not live at a level the
++        # default config discards.
++        _log_api_down_note($scfg, 'whitelist-defer', undef,
++            _api_recently_down($scfg) // $left_budget,
++            "deferring close-then-authorize on subsys $subsys_id, only "
++            . "${left_budget}s of API budget left (need " . WHITELIST_MIN_BUDGET_S() . 's)');
+         return;
+     }
+ 
+@@ -5500,6 +5523,12 @@
+     my $existing_bindings = eval {
+         _api_call($scfg, 'nvmet.port_subsys.query', []);
+     } // [];
++    # "Could not ask" must not impersonate "no bindings". The empty default is
++    # survivable (sync only creates, and duplicate creates are handled), but
++    # the assumption has to be on the record - under the 2s marker cap this
++    # query now fails routinely during outages instead of almost never.
++    _log($scfg, 1, 'warning', "[TrueNAS] sync_portals: port_subsys.query failed, "
++        . "assuming no existing bindings: $@") if $@;
+ 
+     # Build lookup of existing "addr:port" for this subsystem
+     my %existing_set;
+@@ -7489,12 +7518,11 @@
+         # _nvme_ensure_subsystem() when portals refused us. This runs BEFORE
+         # the marker gate below, so without its own cap it was the second
+         # uncapped API path on the poll - the very hole the gate closes.
+-        if (defined(_api_recently_down($scfg))) {
+-            local $_api_deadline = _capped_api_deadline();
+-            eval { _nvme_connect($scfg, repair => 1) };
+-        } else {
+-            eval { _nvme_connect($scfg, repair => 1) };
+-        }
++        # RHS evaluates before localization, so `local $x = $x` is a no-op
++        # rebind - verified against this exact call shape in review.
++        local $_api_deadline = defined(_api_recently_down($scfg))
++            ? _capped_api_deadline() : $_api_deadline;
++        eval { _nvme_connect($scfg, repair => 1) };
+         _log($scfg, 2, 'debug', "[TrueNAS] status: path reconcile failed: $@") if $@;
+     }
+ 
+@@ -7978,10 +8006,21 @@
+                 # minute for the whole outage. Anything else (401, DHCHAP
+                 # mismatch, EINVAL...) is a real fault and keeps the loud path:
+                 # mixing the two is how real faults hide inside expected noise.
++                my $excerpt = $ensure_err;
++                $excerpt =~ s/\s+/ /g;
++                $excerpt = substr($excerpt, 0, 160) . '...' if length($excerpt) > 160;
++                # Classify by the retry engine's own two death sentences - both
++                # self-generated, matched from the string START. Never by
++                # substrings of a foreign payload: a constraint error towing a
++                # Python traceback can contain the word "timeout", and that is
++                # the one error class the engine logs only at debug level, so
++                # misfiling it here erased its last visible trace. Wrapped or
++                # nested deaths ("failed to authorize host: Gave up on...")
++                # stay loud on purpose: they mean work beyond the probe died.
+                 if (defined($marker_left)
+-                    && $ensure_err =~ /Gave up on|timed?\s?out|timeout|did not answer/i) {
++                    && $ensure_err =~ /^Gave up on |^Operation failed after \d+ retries: /) {
+                     _log_api_down_note($scfg, 'ensure-budget', $storeid, $marker_left,
+-                        'subsystem ensure hit the probe budget; will retry next poll');
++                        "subsystem ensure hit the probe budget ($excerpt); will retry next poll");
+                 } else {
+                     _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: subsystem "
+                         . "ensure failed for $storeid, still attempting connect: $ensure_err");

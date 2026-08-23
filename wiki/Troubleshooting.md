@@ -1,0 +1,2083 @@
+# Troubleshooting Guide
+
+Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
+
+## Table of Contents
+
+- [Installer Issues](#installer-issues)
+  - [Installation Failed](#installation-failed)
+  - [Missing Dependencies](#missing-dependencies)
+  - [Permission Denied](#permission-denied)
+  - [GitHub API Rate Limiting](#github-api-rate-limiting)
+  - [Service Restart Failures](#service-restart-failures)
+  - [Configuration Wizard Issues](#configuration-wizard-issues)
+  - [Health Check Failures](#health-check-failures)
+- [About Plugin Error Messages](#about-plugin-error-messages)
+- [Storage Status Issues](#storage-status-issues)
+  - [Storage Shows as Inactive](#storage-shows-as-inactive)
+- [Connection and API Issues](#connection-and-api-issues)
+  - ["Could not connect to TrueNAS API"](#could-not-connect-to-truenas-api)
+  - [API Rate Limiting](#api-rate-limiting)
+- [iSCSI Discovery and Connection Issues](#iscsi-discovery-and-connection-issues)
+  - ["Could not discover iSCSI targets"](#could-not-discover-iscsi-targets)
+  - ["Could not resolve iSCSI target ID for configured IQN"](#could-not-resolve-iscsi-target-id-for-configured-iqn)
+  - [iSCSI Session Issues](#iscsi-session-issues)
+- [NVMe/TCP Connection Issues](#nvmetcp-connection-issues)
+  - ["nvme-cli is not installed"](#nvme-cli-is-not-installed)
+  - ["Could not determine host NQN"](#could-not-determine-host-nqn)
+  - ["Failed to connect to any NVMe/TCP portal"](#failed-to-connect-to-any-nvmetcp-portal)
+  - [NVMe Connect Fails After Offlining CPU Threads (EXDEV / errno -18)](#nvme-connect-fails-after-offlining-cpu-threads-exdev--errno--18)
+  - [DH-CHAP Authentication Failures](#dh-chap-authentication-failures)
+- [NVMe/TCP Namespace Issues](#nvmetcp-namespace-issues)
+  - ["Could not locate NVMe device for UUID"](#could-not-locate-nvme-device-for-uuid)
+  - [Namespace Creation Fails](#namespace-creation-fails)
+  - ["WebSocket transport required"](#websocket-transport-required)
+- [Volume Creation Issues](#volume-creation-issues)
+  - ["Failed to create iSCSI extent for disk"](#failed-to-create-iscsi-extent-for-disk)
+  - ["Insufficient space on dataset"](#insufficient-space-on-dataset)
+  - ["Unable to find free disk name after 1000 attempts"](#unable-to-find-free-disk-name-after-1000-attempts)
+  - ["Volume created but device not accessible after 10 seconds"](#volume-created-but-device-not-accessible-after-10-seconds)
+- [VM Deletion Issues](#vm-deletion-issues)
+  - [Orphaned Volumes After VM Deletion](#orphaned-volumes-after-vm-deletion)
+  - [Stale NVMe Namespaces](#stale-nvme-namespaces)
+  - [Warnings During VM Deletion](#warnings-during-vm-deletion)
+  - [Stale SCSI Devices After Disk Deletion](#stale-scsi-devices-after-disk-deletion)
+- [Snapshot Issues](#snapshot-issues)
+  - [Snapshot Creation Fails](#snapshot-creation-fails)
+  - [Snapshot Rollback Fails](#snapshot-rollback-fails)
+- [Performance Issues](#performance-issues)
+  - [Slow VM Disk Performance](#slow-vm-disk-performance)
+  - [Slow Multipath Read Performance](#slow-multipath-read-performance)
+  - [Slow VM Cloning](#slow-vm-cloning)
+- [Cluster-Specific Issues](#cluster-specific-issues)
+  - [Storage Not Shared Across Nodes](#storage-not-shared-across-nodes)
+  - [VM Migration Fails](#vm-migration-fails)
+- [Log Files and Debugging](#log-files-and-debugging)
+  - [Proxmox Logs](#proxmox-logs)
+  - [TrueNAS Logs](#truenas-logs)
+  - [Storage Diagnostics](#storage-diagnostics)
+  - [Enable Debug Logging](#enable-debug-logging)
+- [Getting Help](#getting-help)
+
+---
+
+## Installer Issues
+
+The automated installer ([install.sh](../install.sh)) handles most installation scenarios, but you may encounter issues. This section covers common installer problems and solutions.
+
+### Installation Failed
+
+**Symptom**: Installer exits with error during plugin installation
+
+**Common Errors**:
+
+**"Plugin syntax validation failed"**
+```bash
+ERROR: Plugin syntax validation failed
+Perl compilation check returned errors
+
+# This indicates the downloaded plugin file has syntax errors
+```
+
+**Solution**:
+```bash
+# Check if download was interrupted
+ls -lh /tmp/TrueNASPlugin.pm.download
+
+# Try downloading manually to verify file integrity
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/TrueNASPlugin.pm
+
+# Check syntax manually
+perl -c TrueNASPlugin.pm
+
+# If syntax is valid, try installer again
+./install.sh
+```
+
+**"Failed to restart Proxmox services"**
+```bash
+ERROR: Failed to restart pvedaemon
+Services could not be restarted properly
+
+# Plugin was installed but services didn't restart
+```
+
+**Solution**:
+```bash
+# Check service status
+systemctl status pvedaemon pveproxy
+
+# Check for conflicts or errors
+journalctl -u pvedaemon -n 50
+journalctl -u pveproxy -n 50
+
+# Try manual restart
+systemctl restart pvedaemon
+systemctl restart pveproxy
+
+# If services won't start, check plugin syntax
+perl -c /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# Rollback if needed
+./install.sh
+# Choose: "Rollback to previous version"
+```
+
+### Missing Dependencies
+
+**Symptom**: Installer exits with "Missing dependency" error
+
+**Common Messages**:
+```bash
+ERROR: Required dependency 'curl' or 'wget' not found
+Please install: apt-get install curl wget
+
+ERROR: Required dependency 'perl' not found
+Please install: apt-get install perl
+```
+
+**Solution**:
+```bash
+# Update package lists
+apt-get update
+
+# Install all common dependencies
+apt-get install curl wget perl
+
+# For minimal systems, install just what's needed
+# Either curl or wget (at least one required)
+apt-get install curl
+# OR
+apt-get install wget
+
+# Verify installations
+which curl wget perl
+
+# Run installer again
+./install.sh
+```
+
+### Permission Denied
+
+**Symptom**: "Permission denied" or "Must run as root"
+
+**Error Messages**:
+```bash
+ERROR: This script must be run as root
+Please run: sudo ./install.sh
+
+ERROR: Permission denied: /usr/share/perl5/PVE/Storage/Custom/
+Cannot write to plugin directory
+```
+
+**Solutions**:
+
+**Not running as root**:
+```bash
+# Check current user
+whoami
+
+# If not root, use sudo
+sudo ./install.sh
+
+# Or switch to root
+su -
+./install.sh
+```
+
+**Directory permissions issue**:
+```bash
+# Check plugin directory permissions
+ls -ld /usr/share/perl5/PVE/Storage/Custom/
+
+# Should be: drwxr-xr-x root root
+
+# Fix permissions if needed (as root)
+mkdir -p /usr/share/perl5/PVE/Storage/Custom/
+chown root:root /usr/share/perl5/PVE/Storage/Custom/
+chmod 755 /usr/share/perl5/PVE/Storage/Custom/
+```
+
+### GitHub API Rate Limiting
+
+**Symptom**: Cannot download plugin, GitHub API returns rate limit error
+
+**Error Message**:
+```bash
+ERROR: GitHub API rate limit exceeded
+API requests remaining: 0/60
+Rate limit resets at: 2025-10-25 15:30:00
+
+Please try again after the reset time, or use a GitHub token for higher limits
+```
+
+**Solutions**:
+
+**Option 1: Wait for rate limit reset**
+```bash
+# Wait until the reset time shown in error message
+# Default limit is 60 requests/hour for unauthenticated requests
+
+# Check current rate limit status
+curl -s https://api.github.com/rate_limit
+```
+
+**Option 2: Use GitHub token (higher limits)**
+```bash
+# Create GitHub personal access token:
+# 1. Go to https://github.com/settings/tokens
+# 2. Click "Generate new token (classic)"
+# 3. Give it a name: "Proxmox Installer"
+# 4. Select scopes: public_repo (read-only access)
+# 5. Click "Generate token"
+# 6. Copy the token
+
+# Set token environment variable
+export GITHUB_TOKEN="ghp_yourTokenHere"
+
+# Run installer (will use token for API requests)
+./install.sh
+
+# Or pass inline
+GITHUB_TOKEN="ghp_yourTokenHere" ./install.sh
+```
+
+**Option 3: Manual installation**
+```bash
+# Download plugin manually
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/TrueNASPlugin.pm
+
+# Install manually
+cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
+chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+systemctl restart pvedaemon pveproxy
+```
+
+### Service Restart Failures
+
+**Symptom**: Plugin installed but Proxmox services won't restart
+
+**Error Messages**:
+```bash
+ERROR: Service pvedaemon failed to start
+Service status: failed (Result: exit-code)
+
+WARNING: Service pveproxy is not running
+Please check service status manually
+```
+
+**Diagnosis**:
+```bash
+# Check service status
+systemctl status pvedaemon
+systemctl status pveproxy
+
+# View detailed errors
+journalctl -u pvedaemon -n 100
+journalctl -u pveproxy -n 100
+
+# Check plugin syntax
+perl -c /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# Look for Perl module dependencies
+grep -i "can't locate" /var/log/syslog
+```
+
+**Solutions**:
+
+**Plugin syntax error**:
+```bash
+# If perl -c shows errors, rollback
+./install.sh
+# Choose: "Rollback to previous version"
+
+# Report issue on GitHub if latest version has syntax errors
+```
+
+**Missing Perl modules**:
+```bash
+# Install common Perl modules
+apt-get install libwww-perl libjson-perl libhttp-message-perl
+
+# Restart services
+systemctl restart pvedaemon pveproxy
+```
+
+**Configuration conflict**:
+```bash
+# Check storage configuration
+cat /etc/pve/storage.cfg
+
+# Look for syntax errors or invalid parameters
+# Comment out problematic storage entries temporarily
+
+# Restart services
+systemctl restart pvedaemon pveproxy
+```
+
+### Configuration Wizard Issues
+
+**Symptom**: Configuration wizard fails to save or validate settings
+
+**Common Issues**:
+
+**"TrueNAS API connectivity test failed"**
+```bash
+# Wizard shows:
+✗ TrueNAS API connectivity test failed
+Could not connect to wss://192.168.1.100/api/current/websocket
+
+# Common causes:
+# 1. TrueNAS IP incorrect or unreachable
+# 2. API key invalid or expired
+# 3. Firewall blocking port 443/80
+# 4. TrueNAS API service not running
+```
+
+**Solutions**:
+```bash
+# Test connectivity manually
+ping 192.168.1.100
+
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+
+# Should return ok if the call succeeds
+
+# Check TrueNAS API service
+# In TrueNAS web UI: System Settings → Services → Middleware (should be running)
+
+# Verify API key is valid
+# In TrueNAS web UI: Credentials → Local Users → [user] → Edit
+# Check that API key section shows active key
+```
+
+**"Dataset does not exist on TrueNAS"**
+```bash
+# Wizard shows:
+✗ Dataset 'tank/proxmox' not found on TrueNAS
+
+# Dataset doesn't exist or API can't access it
+```
+
+**Solutions**:
+```bash
+# Check dataset exists on TrueNAS
+ssh root@truenas-ip
+zfs list tank/proxmox
+
+# If dataset doesn't exist, create it
+zfs create tank/proxmox
+zfs set compression=lz4 tank/proxmox
+
+# If dataset exists but wizard can't see it:
+# - Verify API key has permissions
+# - Check dataset name format (no trailing slashes)
+# - Ensure pool is mounted
+```
+
+**"Failed to write to storage.cfg"**
+```bash
+ERROR: Failed to write configuration to /etc/pve/storage.cfg
+Permission denied
+
+# Installer can't modify storage configuration
+```
+
+**Solutions**:
+```bash
+# Verify running as root
+whoami  # Should show "root"
+
+# Check /etc/pve is mounted (cluster filesystem)
+mount | grep /etc/pve
+
+# Should show: pve-cluster on /etc/pve
+
+# If not mounted (cluster issue):
+systemctl status pve-cluster
+systemctl restart pve-cluster
+
+# Check storage.cfg permissions
+ls -l /etc/pve/storage.cfg
+
+# Manual configuration (if wizard fails)
+nano /etc/pve/storage.cfg
+
+# Add configuration manually:
+truenasplugin: truenas-storage
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:3260
+    content images
+    shared 1
+```
+
+### WebSocket Connection Issues
+
+**Symptom**: Configuration wizard or operations fail with WebSocket connectivity errors
+
+**Common Errors**:
+```bash
+✗ TrueNAS WebSocket connection failed
+Could not connect to wss://192.168.1.100/api/current/websocket
+
+ERROR: WebSocket transport required for API operations
+Please ensure TrueNAS 25.10+ is installed and WebSocket port is accessible
+```
+
+**Solutions**:
+
+#### 1. Verify TrueNAS Version
+```bash
+# Check TrueNAS version via plugin API using STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+
+# If the call succeeds, confirm version in TrueNAS UI
+# Earlier versions than 25.10 do not support WebSocket transport
+```
+
+#### 2. Test WebSocket Connectivity
+```bash
+# Test WebSocket connection via plugin API using STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+
+# Should return ok with no errors
+```
+
+#### 3. Check Firewall and Network Access
+```bash
+# On Proxmox, check if WebSocket port is accessible
+# WebSocket typically uses the same port as API (443 for wss, 80 for ws)
+
+# Test HTTPS port (required for wss)
+curl -k -I https://YOUR_TRUENAS_IP
+
+# Test from all cluster nodes if using shared storage
+for node in node1 node2 node3; do
+    ssh $node "curl -k -I https://YOUR_TRUENAS_IP"
+done
+
+# Check Proxmox firewall rules
+iptables -L -n | grep 443
+
+# Check TrueNAS firewall (via TrueNAS web UI):
+# Network Settings → Firewall → Rules
+# Ensure port 443 (HTTPS) is allowed from Proxmox IP
+```
+
+#### 4. Verify TLS Certificate
+```bash
+# Test TLS certificate validity
+openssl s_client -connect YOUR_TRUENAS_IP:443 -showcerts </dev/null
+
+# Check for certificate errors (self-signed, expired, etc.)
+
+# If using self-signed certificate, set tn_api_insecure=1 for testing:
+nano /etc/pve/storage.cfg
+# Add to storage configuration:
+tn_api_insecure 1
+
+# For production, import TrueNAS certificate to Proxmox trust store
+# Copy TrueNAS CA cert to Proxmox:
+# mkdir -p /usr/local/share/ca-certificates/truenas
+# cp truenas-ca.crt /usr/local/share/ca-certificates/truenas/
+# update-ca-certificates
+```
+
+#### 5. Verify WebSocket URL Scheme
+```bash
+# Check storage configuration
+grep -E "api_scheme" /etc/pve/storage.cfg
+
+# Must be:
+tn_api_scheme wss  # for secure WebSocket (recommended)
+# OR
+tn_api_scheme ws   # for insecure WebSocket (testing only)
+
+# Common mistake: Using http/https scheme instead of ws/wss
+# WRONG:
+# tn_api_scheme https  # Not supported
+# CORRECT:
+# tn_api_scheme wss    # This is for WebSocket
+```
+
+#### 6. Check WebSocket Port Configuration
+```bash
+# TrueNAS WebSocket uses the same ports as the API:
+# - Port 443: Secure WebSocket (wss://) - recommended
+# - Port 80: Insecure WebSocket (ws://) - testing only
+
+# Verify port accessibility
+nc -zv YOUR_TRUENAS_IP 443
+nc -zv YOUR_TRUENAS_IP 80
+
+# Both should succeed (connection to port succeeded)
+```
+
+### Health Check Failures
+
+**Symptom**: Health check reports failures after installation
+
+**Common Failures**:
+
+**"Plugin file not found"**
+```bash
+✗ Plugin file exists
+File not found: /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# Plugin wasn't installed correctly
+```
+
+**Solution**:
+```bash
+# Verify installation
+ls -l /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# If missing, reinstall
+./install.sh
+# Choose: "Install latest version"
+```
+
+**"No storage configuration found"**
+```bash
+✗ Storage configuration found
+No 'truenasplugin' entries in /etc/pve/storage.cfg
+
+# Storage not configured yet
+```
+
+**Solution**:
+```bash
+# Run configuration wizard
+./install.sh
+# Choose: "Configure storage"
+
+# Or check if storage.cfg has entries
+grep truenasplugin /etc/pve/storage.cfg
+```
+
+**"iSCSI sessions not established"**
+```bash
+⚠ iSCSI sessions established
+Warning: No active iSCSI sessions found
+
+# No volumes created yet, or iSCSI login failed
+```
+
+**Solution**:
+```bash
+# This is normal if no VMs are using TrueNAS storage yet
+# Create a test volume to verify iSCSI:
+pvesm alloc truenas-storage 999 test-disk-0 1G
+
+# Check iSCSI sessions
+iscsiadm -m session
+
+# Should show session to TrueNAS IP
+
+# Clean up test volume
+pvesm free truenas-storage:vm-999-disk-0-lun1
+```
+
+**"Service not running"**
+```bash
+✗ Service pvedaemon running
+Status: inactive (dead)
+
+# Critical Proxmox service not running
+```
+
+**Solution**:
+```bash
+# Start service
+systemctl start pvedaemon
+
+# Check for errors
+systemctl status pvedaemon
+journalctl -u pvedaemon -n 50
+
+# If won't start, check plugin syntax
+perl -c /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+# Rollback if plugin is causing issues
+./install.sh
+# Choose: "Rollback to previous version"
+```
+
+### Installer Logs
+
+**Location**: `/var/log/truenas-installer.log`
+
+**Viewing logs**:
+```bash
+# View all logs
+cat /var/log/truenas-installer.log
+
+# View recent logs
+tail -n 100 /var/log/truenas-installer.log
+
+# Follow logs in real-time
+tail -f /var/log/truenas-installer.log
+
+# Search for errors
+grep ERROR /var/log/truenas-installer.log
+
+# Search for specific operation
+grep "Installing plugin" /var/log/truenas-installer.log
+```
+
+**Log format**:
+```
+[2025-10-25 14:32:15] INFO: Installer started (v1.0.0)
+[2025-10-25 14:32:16] INFO: Detected cluster: 3 nodes
+[2025-10-25 14:32:17] INFO: Downloading plugin v1.0.7...
+[2025-10-25 14:32:18] SUCCESS: Plugin installed successfully
+[2025-10-25 14:32:20] ERROR: Failed to restart pvedaemon
+```
+
+---
+
+## About Plugin Error Messages
+
+**The plugin provides enhanced error messages** with built-in troubleshooting guidance. When an error occurs, the plugin includes:
+- Specific cause of the failure
+- Step-by-step troubleshooting instructions
+- TrueNAS GUI navigation paths
+- Relevant commands for diagnosis
+
+**Example Enhanced Error**:
+```
+Failed to create iSCSI extent for disk 'vm-100-disk-0':
+
+Common causes:
+1. iSCSI service not running
+   → Check: TrueNAS → System Settings → Services → iSCSI (should be RUNNING)
+
+2. Zvol not accessible
+   → Verify: zfs list tank/proxmox/vm-100-disk-0
+
+3. API key lacks permissions
+   → Check: TrueNAS → Credentials → Local Users → [your user] → Edit
+   → Ensure user has full Sharing permissions
+
+4. Extent name conflict
+   → Check: TrueNAS → Shares → Block Shares (iSCSI) → Extents
+   → Look for existing extent named 'vm-100-disk-0'
+```
+
+**This guide supplements those built-in messages** with additional context and solutions for common scenarios.
+
+---
+
+## Storage Status Issues
+
+### Storage Shows as Inactive
+
+**Symptom**: Storage appears as inactive in `pvesm status`
+
+**Common Causes**:
+1. TrueNAS unreachable (network issue, TrueNAS offline)
+2. Dataset doesn't exist
+3. API authentication failed
+4. iSCSI service not running
+
+**Diagnosis**:
+```bash
+# Check Proxmox logs for specific error
+journalctl -u pvedaemon | grep "TrueNAS storage"
+
+# Look for error classification:
+# - INFO = connectivity issue (temporary)
+# - ERROR = configuration problem (needs admin action)
+# - WARNING = unknown issue (investigate)
+```
+
+**Solutions by Error Type**:
+
+#### Connectivity Issues (INFO level)
+```bash
+# Test network connectivity
+ping YOUR_TRUENAS_IP
+
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+
+# Check TrueNAS is online
+# Access TrueNAS web UI to verify system is running
+```
+
+#### Configuration Errors (ERROR level)
+
+**Dataset Not Found (ENOENT)**:
+```bash
+# Verify dataset exists on TrueNAS
+zfs list tank/proxmox
+
+# Create if missing
+zfs create tank/proxmox
+
+# Verify in /etc/pve/storage.cfg
+grep dataset /etc/pve/storage.cfg
+```
+
+**Authentication Failed (401/403)**:
+```bash
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+
+# If fails, regenerate API key in TrueNAS:
+# Credentials > Local Users > Edit > API Key > Add
+
+# Update /etc/pve/storage.cfg with new key
+# Restart services
+systemctl restart pvedaemon pveproxy
+```
+
+## Connection and API Issues
+
+### "Could not connect to TrueNAS API"
+
+**Symptom**: API connection failures in logs
+
+**Solutions**:
+
+#### 1. Test API Connectivity
+```bash
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+
+# Should return ok if the call succeeds
+```
+
+#### 2. Check Firewall Rules
+```bash
+# On Proxmox node
+iptables -L -n | grep 443
+
+# On TrueNAS, verify firewall allows API port (443 or 80)
+```
+
+#### 3. Verify TLS Configuration
+```bash
+# If using self-signed cert, use tn_api_insecure=1 (testing only)
+# In /etc/pve/storage.cfg:
+tn_api_insecure 1
+
+# Production: import TrueNAS cert or use valid CA cert
+```
+
+### API Rate Limiting
+
+**Symptom**: Errors mentioning rate limits or "too many requests"
+
+**Explanation**: TrueNAS limits API requests to 20 calls per 60 seconds with 10-minute cooldown
+
+**Solutions**:
+
+#### 1. Wait for Cooldown
+```bash
+# If rate limited, wait 10 minutes before retrying
+# Check TrueNAS logs
+tail -f /var/log/middlewared.log | grep rate
+```
+
+#### 2. Increase Retry Delay
+```ini
+# In /etc/pve/storage.cfg
+tn_api_retry_max 5
+tn_api_retry_delay 3
+```
+
+#### 3. Enable Bulk Operations
+```ini
+# Batch multiple operations to reduce API calls
+tn_enable_bulk_operations 1
+```
+
+## iSCSI Discovery and Connection Issues
+
+### "Could not discover iSCSI targets"
+
+**Symptom**: iSCSI target discovery fails
+
+**Diagnosis**:
+```bash
+# Manual discovery from Proxmox node
+iscsiadm -m discovery -t sendtargets -p YOUR_TRUENAS_IP:3260
+
+# Should list targets like:
+# 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:proxmox
+```
+
+**Solutions**:
+
+#### 1. Verify iSCSI Service Running
+```bash
+# On TrueNAS
+systemctl status iscsitarget
+
+# Via web UI: System Settings > Services > iSCSI (should show Running)
+
+# Start if not running
+systemctl start iscsitarget
+```
+
+#### 2. Check Network Connectivity
+```bash
+# Test iSCSI port
+telnet YOUR_TRUENAS_IP 3260
+
+# Should connect (Ctrl+C to exit)
+```
+
+#### 3. Verify Portal Configuration
+```bash
+# In TrueNAS web UI: Shares > Block Shares (iSCSI) > Portals
+# Ensure portal exists on 0.0.0.0:3260 or specific IP:3260
+```
+
+### "Could not resolve iSCSI target ID for configured IQN"
+
+**Symptom**: Plugin can't find the target IQN
+
+**Example Error**:
+```
+Configured IQN: iqn.2005-10.org.freenas.ctl:mytar get
+Available targets:
+  - iqn.2005-10.org.freenas.ctl:proxmox (ID: 2)
+```
+
+**Solutions**:
+
+#### 1. Verify Target Exists
+```bash
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"iscsi.target.query\", [[]]); print \"ok\\n\";'"
+
+# Via web UI: Shares > Block Shares (iSCSI) > Targets
+```
+
+#### 2. Check IQN Match
+```bash
+# In /etc/pve/storage.cfg, IQN must match exactly:
+tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+
+# Copy IQN from TrueNAS target configuration
+```
+
+#### 3. Create Target if Missing
+```bash
+# In TrueNAS web UI:
+# Shares > Block Shares (iSCSI) > Targets > Add
+# Set Target Name (e.g., "proxmox")
+# Save
+```
+
+### iSCSI Session Issues
+
+**Symptom**: Cannot connect to iSCSI target
+
+**Diagnosis**:
+```bash
+# Check active sessions
+iscsiadm -m session
+
+# Check session details
+iscsiadm -m session -P 3
+```
+
+**Solutions**:
+
+#### 1. Manual Login
+```bash
+# Login to target manually
+iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox \
+  -p YOUR_TRUENAS_IP:3260 --login
+
+# Verify session
+iscsiadm -m session
+```
+
+#### 2. Check Authentication
+```bash
+# If using CHAP, verify credentials match
+# In /etc/pve/storage.cfg:
+tn_chap_user your-username
+tn_chap_password your-password
+
+# Must match TrueNAS: Shares > iSCSI > Authorized Access
+```
+
+#### 3. Logout and Re-login
+```bash
+# Logout from all sessions for target
+iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox --logout
+
+# Re-login
+iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox \
+  -p YOUR_TRUENAS_IP:3260 --login
+```
+
+## NVMe/TCP Connection Issues
+
+These issues are specific to `transport_mode nvme-tcp` configurations. For iSCSI issues, see the previous section.
+
+### "nvme-cli is not installed"
+
+**Symptom**: Plugin reports nvme-cli package is missing
+
+**Error Message**:
+```
+ERROR: nvme-cli is not installed on this system
+NVMe/TCP transport requires nvme-cli package
+```
+
+**Solution**:
+```bash
+# Install nvme-cli package
+apt-get update
+apt-get install nvme-cli
+
+# Verify installation
+nvme version
+# Expected: nvme version 2.x or later
+```
+
+**Verify nvme-cli is working**:
+```bash
+# Check for NVMe devices (should work even without targets)
+nvme list
+
+# If command not found, reinstall
+apt-get install --reinstall nvme-cli
+```
+
+### "Could not determine host NQN"
+
+**Symptom**: Plugin cannot find the host NQN identifier
+
+**Error Message**:
+```
+ERROR: Could not determine host NQN
+No hostnqn configured and /etc/nvme/hostnqn does not exist
+```
+
+**Diagnosis**:
+```bash
+# Check if hostnqn file exists
+cat /etc/nvme/hostnqn
+
+# If missing or empty, generate one
+```
+
+**Solutions**:
+
+#### 1. Generate Host NQN
+```bash
+# Generate new host NQN
+nvme gen-hostnqn > /etc/nvme/hostnqn
+
+# Verify it was created
+cat /etc/nvme/hostnqn
+# Example output: nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400
+```
+
+#### 2. Configure Explicit Host NQN
+```bash
+# Alternative: Set hostnqn in storage.cfg
+nano /etc/pve/storage.cfg
+
+# Add to NVMe storage configuration:
+tn_hostnqn nqn.2014-08.org.nvmexpress:uuid:your-custom-uuid
+```
+
+### "Failed to connect to any NVMe/TCP portal"
+
+**Symptom**: Cannot establish NVMe/TCP connection to TrueNAS
+
+**Error Message**:
+```
+ERROR: Failed to connect to any NVMe/TCP portal
+Attempted portals:
+  - 192.168.1.100:4420 (failed: connection refused)
+```
+
+**Diagnosis**:
+```bash
+# Check if subsystem is already connected
+nvme list-subsys
+
+# Check for NVMe devices
+nvme list
+
+# Test network connectivity
+ping 192.168.1.100
+telnet 192.168.1.100 4420
+```
+
+**Solutions**:
+
+#### 1. Verify TrueNAS NVMe-oF Service
+```bash
+# Check service status via plugin API using STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"service.query\", [[[\"service\",\"=\",\"nvmet\"]]]); print \"ok\\n\";'"
+
+# Should return ok if the call succeeds
+
+# Start service if not running using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
+```
+
+In TrueNAS Web UI:
+- Navigate to **System Settings** → **Services**
+- Find **NVMe-oF Target**
+- Click toggle to start
+- (Optional) Enable **Start Automatically**
+
+#### 2. Check Network Connectivity
+```bash
+# Verify portal IP is reachable
+ping -c 3 192.168.1.100
+
+# Test NVMe/TCP port (4420)
+telnet 192.168.1.100 4420
+# Should connect successfully (Ctrl+C to exit)
+
+# If blocked, check firewalls:
+# - TrueNAS firewall rules
+# - Network firewall/ACLs
+# - Proxmox iptables
+```
+
+#### 3. Verify Portal Configuration
+```bash
+# Check TrueNAS NVMe ports using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.port.query\", [[]]); print \"ok\\n\";'"
+
+# Should return ok if the call succeeds
+# Example output:
+# {
+#   "addr_trtype": "TCP",
+#   "addr_trsvcid": 4420,
+#   "addr_traddr": "0.0.0.0"
+# }
+```
+
+#### 4. Check Storage Configuration
+```bash
+# Verify discovery_portal in storage.cfg
+grep discovery_portal /etc/pve/storage.cfg
+
+# For NVMe/TCP, should be IP:4420 (not 3260)
+tn_discovery_portal 192.168.1.100:4420
+
+# Verify subsystem_nqn is correctly formatted
+grep subsystem_nqn /etc/pve/storage.cfg
+# Should start with nqn.YYYY-MM.
+```
+
+#### 5. Manual Connection Test
+```bash
+# Try manual NVMe/TCP connection
+nvme connect -t tcp \
+  -n nqn.2005-10.org.freenas.ctl:proxmox-test \
+  -a 192.168.1.100 \
+  -s 4420
+
+# Check if connection succeeded
+nvme list-subsys | grep -A 5 "proxmox-test"
+
+# Disconnect after test
+nvme disconnect -n nqn.2005-10.org.freenas.ctl:proxmox-test
+```
+
+### NVMe Connect Fails After Offlining CPU Threads (EXDEV / errno -18)
+
+**Symptom**: NVMe/TCP connection fails after CPU threads are taken offline via `/sys/devices/system/cpu/cpuN/online` (e.g. for power saving or isolation via `isolcpus`/`cset`).
+
+**Error in dmesg**:
+```
+nvme nvmeX: Connect command failed, errno: -18
+nvme nvmeX: failed to connect queue: N ret=-18
+```
+
+**Root cause**: The kernel NVMe-TCP driver maps I/O queue N to CPU N by index. When a CPU in the middle of the possible range is offline, at least one queue gets assigned exclusively to an offline CPU, causing `EXDEV` (-18). This is a kernel driver limitation — the queue affinity is computed from the *possible* CPU bitmap, not the *online* bitmap.
+
+**Fix (v2.1.2+)**: The plugin automatically detects offline CPUs and passes `--nr-io-queues=floor(possible/2)` to `nvme connect`, which guarantees each queue maps to at least 2 possible CPUs. No manual action is required after upgrading.
+
+**Manual override** (if TrueNAS also reports queue limit errors):
+```
+# In storage.cfg — pin to a safe value for your hardware:
+tn_nr_io_queues 4
+```
+
+**Verify the fix is active**:
+```bash
+# After a connect, check how many queues were created:
+dmesg | grep -i "nvme.*creating.*I/O queues"
+# e.g.: nvme nvme3: creating 3 I/O queues.
+```
+
+**If running v2.1.1 or earlier**:
+```bash
+# Temporary workaround — reconnect with explicit queue cap:
+NQN=$(awk '/^truenasplugin: tn-nvme/{f=1} f && /tn_subsystem_nqn/{print $2; exit}' /etc/pve/storage.cfg)
+nvme disconnect -n "$NQN"
+nvme connect -t tcp -a <portal_ip> -s 4420 -n "$NQN" \
+  --nr-io-queues=$(( $(nproc --all) / 2 ))
+```
+
+---
+
+### DH-CHAP Authentication Failures
+
+**Symptom**: Connection fails with authentication errors when using DH-CHAP secrets
+
+**Error Message**:
+```
+ERROR: NVMe connect failed: authentication failed
+Controller rejected host authentication
+```
+
+**Diagnosis**:
+```bash
+# Check kernel logs for auth errors
+dmesg | grep -i nvme | grep -i auth
+
+# Verify secrets are configured
+grep nvme_dhchap /etc/pve/storage.cfg
+```
+
+**Solutions**:
+
+#### 1. Verify Secret Matching
+```bash
+# Check TrueNAS host configuration using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.host.query\", [[]]); print \"ok\\n\";'"
+
+# Compare hostnqn and dhchap_key with Proxmox configuration
+cat /etc/nvme/hostnqn
+grep nvme_dhchap_secret /etc/pve/storage.cfg
+```
+
+**The host NQN and secret must match exactly between Proxmox and TrueNAS.**
+
+#### 2. Regenerate Secrets
+```bash
+# Generate new host secret
+nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
+# Output: DHHC-1:01:base64data...
+
+# Update on both sides:
+# 1. Proxmox: Add to storage.cfg as nvme_dhchap_secret
+# 2. TrueNAS: Update via API or GUI for the host NQN
+```
+
+#### 3. Check Subsystem Access Control
+```bash
+# Verify subsystem allows host using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.subsys.query\", [[]]); print \"ok\\n\";'"
+
+# Check allow_any_host setting
+# If false, host must be explicitly linked to subsystem
+```
+
+#### 4. Test Without Authentication
+```bash
+# Temporarily remove DH-CHAP secrets to test connectivity
+nano /etc/pve/storage.cfg
+
+# Comment out secrets:
+# tn_nvme_dhchap_secret DHHC-1:01:...
+# tn_nvme_dhchap_ctrl_secret DHHC-1:01:...
+
+# Set subsystem allow_any_host = true in TrueNAS
+
+# Restart pvedaemon
+systemctl restart pvedaemon
+
+# Try creating a test volume
+# If this works, the issue is with authentication configuration
+```
+
+## NVMe/TCP Namespace Issues
+
+### "Could not locate NVMe device for UUID"
+
+**Symptom**: Namespace created but device path not found
+
+**Error Message**:
+```
+ERROR: Could not locate NVMe device for UUID after 5 seconds
+Expected device: /dev/disk/by-id/nvme-uuid.550e8400-e29b-41d4-a716-446655440000
+```
+
+**Background**: The plugin uses a three-tier device matching strategy:
+1. **NGUID matching** (primary) - Matches NVMe Namespace GUID from TrueNAS API against sysfs
+2. **NSID matching** (fallback) - Matches Namespace ID from sysfs if NGUID unavailable
+3. **Single device** (safe fallback) - Returns device when only one namespace exists
+
+This error indicates all three matching strategies failed to locate the device.
+
+**Diagnosis**:
+```bash
+# Check if subsystem is connected
+nvme list-subsys | grep -i <subsystem_nqn>
+
+# List NVMe devices
+nvme list
+
+# Check for UUID symlinks
+ls -la /dev/disk/by-id/nvme-uuid.*
+
+# Check NGUID in sysfs (for debugging)
+cat /sys/block/nvme*/nguid
+
+# Check NSID in sysfs
+cat /sys/block/nvme*/nsid
+```
+
+**Solutions**:
+
+#### 1. Verify Subsystem Connection
+```bash
+# Check if subsystem shows as connected
+nvme list-subsys
+
+# Look for your subsystem with "live" status:
+# nvme-subsysX - NQN=nqn.2005-10.org.freenas.ctl:proxmox-test
+# \
+#  +- nvmeX tcp traddr=192.168.1.100,trsvcid=4420 live
+
+# If not connected, connection failed
+# See "Failed to connect to any NVMe/TCP portal" section above
+```
+
+#### 2. Trigger udev Rescan
+```bash
+# Manually settle udev events
+udevadm settle
+
+# Wait a moment
+sleep 2
+
+# Check for device again
+ls -la /dev/disk/by-id/nvme-uuid.*
+
+# Reload udev rules if needed
+udevadm control --reload-rules
+udevadm trigger
+```
+
+#### 3. Verify Namespace Exists on TrueNAS
+```bash
+# Check TrueNAS namespaces using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.namespace.query\", [[]]); print \"ok\\n\";'"
+
+# Look for namespace with matching device_uuid
+# Verify it's enabled and associated with correct subsystem
+```
+
+#### 4. Check Kernel Logs
+```bash
+# Look for NVMe errors
+dmesg | grep -i nvme | tail -50
+
+# Look for device discovery messages
+dmesg | grep -i "nvme.*namespace"
+```
+
+#### 5. Verify NGUID/NSID Matching (Debug)
+```bash
+# Enable debug logging to see matching details
+# In /etc/pve/storage.cfg:
+tn_debug 2
+
+# Then check logs for device matching
+journalctl -f | grep '\[TrueNAS\].*nvme_find_device'
+
+# You should see:
+# - "attempting NGUID match for <guid>"
+# - "matched device /dev/nvmeXnY by NGUID" (success)
+# OR
+# - "NGUID matching failed - no device matched" (fallback to NSID)
+# - "attempting NSID match for NSID X"
+# - "matched device /dev/nvmeXnY by NSID" (success)
+```
+
+### Namespace Creation Fails
+
+**Symptom**: Cannot create NVMe namespace on TrueNAS
+
+**Error Messages**:
+```
+ERROR: Failed to create NVMe namespace
+TrueNAS API returned error: subsystem not found
+```
+
+**Solutions**:
+
+#### 1. Verify NVMe-oF Service Running
+```bash
+# Check service status using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"service.query\", [[[\"service\",\"=\",\"nvmet\"]]]); print \"ok\\n\";'"
+
+# Should return ok if the call succeeds
+```
+
+#### 2. Check Dataset Exists
+```bash
+# Verify ZFS dataset configured in storage.cfg exists via plugin API
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"pool.dataset.get_instance\", [\"tank/proxmox\"]); print \"ok\\n\";'"
+
+# Replace tank/proxmox with your dataset path
+```
+
+#### 3. Verify WebSocket API Transport
+```bash
+# WebSocket is the only supported transport for TrueNAS 25.10+
+# Verify your configuration uses ws/wss schemes:
+grep api_scheme /etc/pve/storage.cfg
+# REST API fallback has been removed
+```
+
+#### 4. Check Subsystem Exists
+```bash
+# List subsystems using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.subsys.query\", [[]]); print \"ok\\n\";'"
+
+# Verify subsystem with your configured subsystem_nqn exists
+# Plugin should auto-create it, but may fail if service issues
+```
+
+### "WebSocket transport required"
+
+**Symptom**: NVMe operations fail with API transport error
+
+**Error Message**:
+```
+ERROR: WebSocket transport required for NVMe-oF operations
+NVMe namespace management requires WebSocket transport (TrueNAS 25.10+)
+Ensure api_scheme is set to wss (or ws for non-TLS) in storage configuration
+```
+
+**Solution**:
+```bash
+# Edit storage configuration
+nano /etc/pve/storage.cfg
+
+# Find your NVMe storage configuration
+# Verify WebSocket scheme:
+truenasplugin: truenas-nvme
+    tn_api_scheme wss
+    # ... other parameters
+
+# Restart Proxmox services
+systemctl restart pvedaemon pveproxy
+```
+
+**Why WebSocket is Required**:
+- TrueNAS 25.10+ removed REST API support for all API operations
+- WebSocket is now the only supported transport
+- All API endpoints require WebSocket connection for TrueNAS 25.10+
+
+## Volume Creation Issues
+
+### "Failed to create iSCSI extent for disk"
+
+**Symptom**: Volume creation fails at extent creation step
+
+**Common Causes**:
+- iSCSI service not running
+- Zvol exists but not accessible
+- API key lacks permissions
+- Extent name conflict
+
+**Solutions**:
+
+#### 1. Check iSCSI Service
+```bash
+# Verify service running on TrueNAS
+# System Settings > Services > iSCSI (should be Running)
+
+# Or via CLI:
+systemctl status iscsitarget
+```
+
+#### 2. Verify Zvol Exists
+```bash
+# On TrueNAS
+zfs list -t volume | grep proxmox
+
+# Should show zvol like: tank/proxmox/vm-100-disk-0
+```
+
+#### 3. Check API Permissions
+```bash
+# API key user needs full Sharing permissions
+# In TrueNAS: Credentials > Local Users > Edit user
+# Verify permissions include iSCSI management
+```
+
+#### 4. Check for Extent Conflicts
+```bash
+# Via web UI: Shares > Block Shares (iSCSI) > Extents
+# Look for duplicate extent names
+
+# Delete conflicting extents or orphaned entries
+```
+
+### "Insufficient space on dataset"
+
+**Symptom**: Pre-flight validation fails due to insufficient space
+
+**Example Error**:
+```
+Insufficient space on dataset 'tank/proxmox':
+need 120.00 GB (with 20% overhead), have 80.00 GB available
+```
+
+**Solutions**:
+
+#### 1. Check Dataset Space
+```bash
+# On TrueNAS
+zfs list tank/proxmox
+
+# Shows available space
+```
+
+#### 2. Free Up Space
+```bash
+# Delete old snapshots
+zfs list -t snapshot | grep tank/proxmox
+zfs destroy tank/proxmox/vm-999-disk-0@snapshot1
+
+# Delete unused zvols
+zfs destroy tank/proxmox/vm-999-disk-0
+```
+
+#### 3. Expand Pool or Use Different Dataset
+```bash
+# Add more storage to pool or use larger pool
+# Or change dataset in /etc/pve/storage.cfg:
+tn_dataset tank/larger-pool/proxmox
+```
+
+### "Unable to find free disk name after 1000 attempts"
+
+**Symptom**: Cannot allocate disk name
+
+**Causes**:
+- VM has 1000+ disks (very unlikely)
+- TrueNAS dataset queries failing
+- Orphaned volumes preventing name assignment
+
+**Solutions**:
+
+#### 1. Check for Orphaned Volumes
+```bash
+# On TrueNAS, list all volumes
+zfs list -t volume | grep tank/proxmox
+
+# Look for orphaned vm-XXX-disk-* volumes
+# Delete if no longer needed:
+zfs destroy tank/proxmox/vm-999-disk-0
+```
+
+#### 2. Verify TrueNAS API Responding
+```bash
+# Test dataset query via plugin API using STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"pool.dataset.get_instance\", [\"tank/proxmox\"]); print \"ok\\n\";'"
+
+# Should return ok if the call succeeds
+```
+
+### "Volume created but device not accessible after 10 seconds"
+
+**Symptom**: Zvol created on TrueNAS but Linux can't see the device
+
+**Solutions**:
+
+#### 1. Check iSCSI Session
+```bash
+# Verify session active
+iscsiadm -m session
+
+# If no session, login
+iscsiadm -m node -T YOUR_TARGET_IQN -p YOUR_TRUENAS_IP:3260 --login
+```
+
+#### 2. Re-scan iSCSI Bus
+```bash
+# Force rescan
+iscsiadm -m node --rescan
+
+# Or rescan all sessions
+iscsiadm -m session --rescan
+```
+
+#### 3. Check by-path Devices
+```bash
+# List iSCSI devices
+ls -la /dev/disk/by-path/ | grep iscsi
+
+# Should show device corresponding to LUN
+```
+
+#### 4. Verify Multipath (if enabled)
+```bash
+# Check multipath status
+multipath -ll
+
+# Should show device with multiple paths
+
+# Reconfigure if needed
+multipath -r
+```
+
+## VM Deletion Issues
+
+### Orphaned Volumes After VM Deletion
+
+**Symptom**: Volumes remain on TrueNAS after VM deletion
+
+**Cause**: Using `qm destroy` command instead of GUI
+
+**Explanation**:
+- **GUI deletion** properly calls storage plugin cleanup (recommended)
+- **CLI `qm destroy`** does NOT call plugin cleanup methods
+- Proxmox removes internal references but TrueNAS storage remains
+
+**Solutions**:
+
+#### 1. Use Installer Cleanup Tool (Recommended)
+
+The installer includes an integrated orphan cleanup utility that supports both iSCSI and NVMe/TCP:
+
+```bash
+./install.sh
+# Choose: Diagnostics
+# Choose: Cleanup orphaned resources
+# Select the affected storage
+# Review detected orphans
+# Type 'DELETE' to confirm cleanup
+```
+
+This tool automatically:
+- Detects transport mode (iSCSI or NVMe/TCP)
+- Identifies orphaned resources (zvols, extents/namespaces, mappings)
+- Deletes them in the correct dependency order
+- Reports success/failure for each resource
+
+See [Advanced Features - Orphan Resource Cleanup](Advanced-Features.md#orphan-resource-cleanup) for detailed documentation.
+
+#### 2. Manual Cleanup via pvesm
+```bash
+# List remaining volumes for deleted VM
+pvesm list truenas-storage | grep vm-100
+
+# Free each volume manually
+pvesm free truenas-storage:vm-100-disk-0-lun1
+pvesm free truenas-storage:vm-100-disk-1-lun2
+```
+
+#### 3. Direct ZFS Cleanup (if plugin fails)
+```bash
+# On TrueNAS, list zvols
+zfs list -t volume | grep vm-100
+
+# Destroy zvols (WARNING: deletes data)
+zfs destroy tank/proxmox/vm-100-disk-0
+zfs destroy tank/proxmox/vm-100-disk-1
+
+# Clean up transport mappings via TrueNAS web UI:
+# For iSCSI: Shares > Block Shares (iSCSI) > Extents
+# For NVMe: Shares > Block Shares (NVMe-oF) > Namespaces
+# Delete entries for vm-100
+```
+
+#### 4. Prevention: Use GUI for Deletion
+```bash
+# Recommended: Always delete VMs via Proxmox web UI
+# This ensures proper cleanup of all resources
+```
+
+### Stale NVMe Namespaces
+
+**Symptom**: NVMe namespaces exist on TrueNAS but the corresponding zvol is missing
+
+**Cause**: Partial deletion where zvol was removed but namespace deletion failed
+
+**Diagnosis**:
+```bash
+# Check for stale namespaces via installer
+./install.sh
+# Choose: Diagnostics
+# Choose: Cleanup orphaned resources
+# Select NVMe/TCP storage
+```
+
+**Solution**: Use the installer cleanup tool as described above. The tool will detect namespaces with invalid `device_path` entries and offer to delete them.
+
+### Warnings During VM Deletion
+
+**Symptom**: Warnings about resources that don't exist
+
+**Example**:
+```
+warning: delete targetextent id=115 failed: InstanceNotFound
+warning: delete extent id=115 failed: does not exist
+```
+
+**Status**: This is normal and harmless if resources are already cleaned up
+
+**Explanation**:
+- Plugin attempts to delete resources in order (targetextent → extent → zvol)
+- If a resource is already gone (from previous cleanup or bulk delete), ENOENT errors are suppressed
+- Only actual failures (permissions, locks, etc.) generate warnings
+
+**Action**: No action needed if deletion completes successfully
+
+### Stale SCSI Devices After Disk Deletion
+
+**Symptom**: Kernel errors "Read Capacity failed" after deleting iSCSI disks
+
+**Example kernel logs**:
+```
+sd 1:0:0:11: [sdx] Read Capacity(16) failed: Result: hostbyte=DID_OK driverbyte=DRIVER_OK
+sd 0:0:0:11: [sdw] Read Capacity(10) failed: Result: hostbyte=DID_OK driverbyte=DRIVER_OK
+```
+
+**Status**: Automatically handled by plugin (v1.1.9+)
+
+**Explanation**:
+- When disks are deleted, the Linux SCSI layer may retain "ghost" device entries with size=0
+- These stale devices cause kernel errors on every iSCSI session rescan
+- Plugin v1.1.9+ automatically cleans up SCSI devices after successful disk deletion
+
+**Manual cleanup (for older plugin versions)**:
+```bash
+# Remove stale SCSI devices with size=0
+for dev in /sys/block/sd*; do
+    devname=$(basename "$dev")
+    size=$(cat "$dev/size" 2>/dev/null)
+    if [ "$size" = "0" ] && [ -e "$dev/device/delete" ]; then
+        echo "Removing stale device $devname (size=0)"
+        echo 1 > "$dev/device/delete"
+    fi
+done
+```
+
+**Note**: The automatic cleanup is transparent and requires no configuration. Debug logging at level 2 shows cleanup operations.
+
+## Snapshot Issues
+
+### Snapshot Creation Fails
+
+**Symptom**: Cannot create VM snapshot
+
+**Solutions**:
+
+#### 1. Check ZFS Space
+```bash
+# Snapshots require free space for metadata
+zfs list tank/proxmox
+
+# Ensure adequate free space
+```
+
+#### 2. Verify vmstate Storage
+```bash
+# If using live snapshots, check vmstate storage
+# In /etc/pve/storage.cfg:
+tn_vmstate_storage local
+
+# Ensure local storage has space for RAM dump
+df -h /var/lib/vz
+```
+
+#### 3. Check Snapshot Limits
+```bash
+# ZFS has no hard limit, but check dataset properties
+zfs get all tank/proxmox | grep snapshot
+```
+
+### Snapshot Rollback Fails
+
+**Symptom**: Cannot rollback to snapshot
+
+**Solutions**:
+
+#### 1. Stop VM First
+```bash
+# VM must be stopped for rollback
+qm stop 100
+
+# Then rollback
+qm rollback 100 snapshot-name
+```
+
+#### 2. Check Snapshot Exists
+```bash
+# List snapshots
+qm listsnapshot 100
+
+# Verify on TrueNAS
+zfs list -t snapshot | grep vm-100
+```
+
+## Performance Issues
+
+### Slow VM Disk Performance
+
+**Solutions**:
+
+#### 1. Optimize ZFS Block Size
+```ini
+# In /etc/pve/storage.cfg
+tn_zvol_blocksize 128K
+```
+
+#### 2. Enable Multipath
+```ini
+# Use multiple portals for load balancing
+tn_portals 192.168.1.101:3260,192.168.1.102:3260
+tn_use_multipath 1
+```
+
+#### 3. Network Optimization
+```bash
+# Enable jumbo frames
+ip link set eth1 mtu 9000
+
+# Verify MTU
+ip link show eth1
+```
+
+#### 4. Dedicated Storage Network
+```bash
+# Use dedicated 10GbE network for iSCSI
+# Configure VLANs to isolate storage traffic
+```
+
+### Slow Multipath Read Performance
+
+**Symptom**: Read performance with multipath is lower than expected, even though both paths are configured correctly
+
+**Observed Behavior**:
+- Write speeds: ~100-110 MB/s (both paths utilized) ✅
+- Sequential read speeds: ~50-100 MB/s (lower than expected) ⚠️
+- Network monitoring shows both interfaces active during reads
+- Multipath configuration appears correct
+
+**Root Cause**:
+This is a **known limitation** of TrueNAS SCALE's iSCSI implementation. The `MaxOutstandingR2T` parameter is hardcoded to `1`, which limits read parallelism across multiple paths.
+
+**Verification**:
+```bash
+# Check iSCSI session parameters
+iscsiadm -m session -P 3 | grep MaxOutstandingR2T
+
+# You'll see:
+# MaxOutstandingR2T: 1
+
+# Verify multipath is working (both paths should be active)
+multipath -ll
+
+# Check actual I/O distribution (both paths should show activity)
+grep -E '(sdX|sdY)' /proc/diskstats  # Before test
+# Run read test
+grep -E '(sdX|sdY)' /proc/diskstats  # After test
+# Both paths should show increased read sectors
+```
+
+**Important**:
+- This is **NOT a configuration error** - your multipath setup is working correctly
+- Both paths ARE being used, they just can't operate fully in parallel for reads
+- Write performance is not affected by this limitation
+
+**Solutions**:
+
+#### 1. Upgrade to 10GbE (Recommended)
+```bash
+# Single 10GbE path provides ~1000 MB/s
+# Eliminates the bottleneck entirely
+# Best long-term solution
+```
+
+#### 2. Accept Current Performance
+- ~100 MB/s read is reasonable for many workloads
+- Real-world applications with multiple VMs perform better than single-threaded benchmarks
+- Most production workloads issue parallel I/O naturally
+
+#### 3. Test with Parallel I/O
+```bash
+# Verify performance improves with parallel workloads
+fio --name=parallel-read --filename=/dev/mapper/mpathX \
+    --rw=read --bs=1M --size=2G --numjobs=4 --iodepth=16 \
+    --direct=1 --ioengine=libaio --runtime=30 --time_based --group_reporting
+
+# Should show better performance (~100-110 MB/s)
+```
+
+**For More Information**:
+See [Known Limitations - Multipath Read Performance](Known-Limitations.md#multipath-read-performance-limitation) for detailed explanation, technical details, and additional workarounds.
+
+### Slow VM Cloning
+
+**Symptom**: VM cloning takes a long time
+
+**Explanation**:
+- Proxmox uses network-based `qemu-img convert` for iSCSI storage
+- ZFS instant clones are not used (Proxmox limitation)
+- Clone speed limited by network bandwidth
+
+**Workarounds**:
+
+#### 1. Use Smaller Base Images
+```bash
+# Create minimal templates for cloning
+# Add data after clone completes
+```
+
+#### 2. Improve Network Bandwidth
+```bash
+# Use 10GbE or faster network
+# Ensure no bandwidth limitations
+```
+
+#### 3. Use Templates with Thin Provisioning
+```ini
+# Enable sparse volumes
+tn_sparse 1
+```
+
+## Cluster-Specific Issues
+
+### Storage Not Shared Across Nodes
+
+**Symptom**: Storage not accessible from all cluster nodes
+
+**Solutions**:
+
+#### 1. Verify shared=1
+```bash
+# In /etc/pve/storage.cfg
+shared 1
+```
+
+#### 2. Check iSCSI Sessions on All Nodes
+```bash
+# On each cluster node
+iscsiadm -m session
+
+# All nodes should show active session
+```
+
+#### 3. Verify Multipath on All Nodes
+```bash
+# On each node
+multipath -ll
+
+# Should show same devices
+```
+
+### VM Migration Fails
+
+**Symptom**: Cannot migrate VMs between nodes
+
+**Solutions**:
+
+#### 1. Ensure Shared Storage
+```ini
+# Must be shared storage
+shared 1
+```
+
+#### 2. Check Storage Active on All Nodes
+```bash
+# On each node
+pvesm status
+
+# Storage should be active on all nodes
+```
+
+#### 3. Verify Network Connectivity
+```bash
+# All nodes must reach TrueNAS
+# On each node:
+ping YOUR_TRUENAS_IP
+```
+
+#### 4. Check Block Device Discovery (if migration still fails)
+```bash
+# On destination node, verify devices appear after volume activation
+# For iSCSI:
+ls -la /dev/disk/by-path/ | grep iscsi
+
+# For NVMe-oF-TCP:
+nvme list
+ls -la /dev/disk/by-id/nvme-uuid.*
+
+# Enable debug logging to see device wait process
+# In /etc/pve/storage.cfg:
+tn_debug 2
+
+# Then check logs during migration
+journalctl -f | grep '\[TrueNAS\].*activate_volume'
+```
+
+## Log Files and Debugging
+
+### Proxmox Logs
+
+```bash
+# Daemon logs
+journalctl -u pvedaemon -f
+
+# Proxy logs
+journalctl -u pveproxy -f
+
+# Storage-specific logs
+journalctl -u pvedaemon | grep TrueNAS
+
+# System logs
+tail -f /var/log/syslog | grep -i truenas
+```
+
+### TrueNAS Logs
+
+```bash
+# Middleware logs (API calls)
+tail -f /var/log/middlewared.log
+
+# iSCSI logs
+journalctl -u iscsitarget -f
+
+# System logs
+tail -f /var/log/syslog | grep -i iscsi
+```
+
+### Storage Diagnostics
+
+```bash
+# Storage status
+pvesm status
+
+# List volumes
+pvesm list truenas-storage
+
+# iSCSI sessions
+iscsiadm -m session -P 3
+
+# Multipath status
+multipath -ll
+
+# Disk devices
+ls -la /dev/disk/by-path/ | grep iscsi
+lsblk
+```
+
+### Enable Debug Logging
+
+The plugin has built-in debug logging with configurable verbosity levels. All log messages are prefixed with `[TrueNAS]` for easy filtering.
+
+```ini
+# In /etc/pve/storage.cfg, add debug level to your storage entry:
+truenasplugin: truenas-storage
+    tn_api_host 192.168.1.100
+    # ... other parameters ...
+    tn_debug 1    # Light debug (function calls)
+    # OR
+    tn_debug 2    # Verbose debug (full API trace with parameters/responses)
+```
+
+**Debug Levels**:
+| Level | Description | Typical Log Count* |
+|-------|-------------|-------------------|
+| `0` (default) | Errors only - always logged regardless of setting | 0 (unless errors occur) |
+| `1` | Light debug - function entry points and major operations | ~25-30 per operation |
+| `2` | Verbose debug - all API calls with full JSON parameters/responses | ~65-75 per operation |
+
+*Log counts based on a typical alloc/free cycle. Actual counts vary by operation complexity.
+
+**Log Message Format**:
+All plugin log messages include the `[TrueNAS]` prefix:
+```
+Nov 22 17:01:07 pve-node pvesm[12345]: [TrueNAS] alloc_image: vmid=100, name=vm-100-disk-0, size=10485760 KiB
+Nov 22 17:01:08 pve-node pvesm[12345]: [TrueNAS] Pre-flight: checking target visibility for iqn.2005-10.org.freenas.ctl:proxmox
+Nov 22 17:01:09 pve-node pvesm[12345]: [TrueNAS] _api_call: method=pool.dataset.create, transport=ws
+```
+
+**Syslog Identifier**:
+The syslog identifier inherits from the calling process, not from the plugin:
+- `pvesm` - When running pvesm commands manually
+- `pvesh` - When using pvesh API commands
+- `pvestatd` - When pvestatd performs background storage checks
+- `pvedaemon` - When the Proxmox daemon invokes storage operations
+
+The `[TrueNAS]` prefix ensures all plugin messages are easily searchable regardless of the calling process.
+
+**Viewing Logs**:
+```bash
+# Best method: Search for [TrueNAS] prefix (works regardless of calling process)
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\]'
+
+# Real-time monitoring
+journalctl -f | grep '\[TrueNAS\]'
+
+# Count log messages (useful for verifying debug level)
+journalctl --since '5 minutes ago' | grep -c '\[TrueNAS\]'
+
+# View logs from specific process (e.g., pvesm commands only)
+journalctl -t pvesm --since '10 minutes ago' | grep '\[TrueNAS\]'
+
+# Filter by log level (Level 2 shows _api_call entries)
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\].*_api_call'
+
+# View pre-flight check logs
+journalctl --since '10 minutes ago' | grep '\[TrueNAS\].*Pre-flight'
+```
+
+**Level 1 Message Types** (Light Debug):
+- `alloc_image` - Volume allocation entry/exit
+- `free_image` - Volume deletion entry/exit
+- `Pre-flight` - Pre-flight validation checks (~90% of level 1 messages)
+- `_free_image_iscsi` / `_free_image_nvme` - Transport-specific deletion
+
+**Level 2 Adds** (Verbose Debug):
+- `_api_call` - Full API request/response with JSON payloads
+- Internal state decisions and computed values
+- Detailed error context for troubleshooting API issues
+- SCSI device cleanup operations (captured devices, cleanup results)
+
+**Note**: After changing the debug level, the new setting takes effect immediately for new operations (no service restart required). However, if you want to clear cached storage status, restart Proxmox services:
+```bash
+systemctl restart pvedaemon pveproxy
+```
+
+## Getting Help
+
+If troubleshooting doesn't resolve your issue:
+
+1. **Gather Information**:
+   - Proxmox VE version: `pveversion`
+   - TrueNAS SCALE version
+   - Plugin configuration from `/etc/pve/storage.cfg`
+   - Relevant log entries from Proxmox and TrueNAS
+   - Network configuration details
+
+2. **Check Known Limitations**: Review [Known Limitations](Known-Limitations.md)
+
+3. **Search Existing Issues**: Check GitHub issues for similar problems
+
+4. **Report Issue**: Create new GitHub issue with all gathered information
+
+## See Also
+- [Configuration Reference](Configuration.md) - Configuration parameters
+- [Known Limitations](Known-Limitations.md) - Known issues and workarounds
+- [Advanced Features](Advanced-Features.md) - Performance tuning

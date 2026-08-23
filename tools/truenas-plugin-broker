@@ -1,0 +1,750 @@
+#!/usr/bin/perl
+# truenas-plugin-broker
+#
+# Holds one persistent authenticated WebSocket per (host, api_key) pair to
+# the TrueNAS middleware and proxies JSON-RPC for any number of local PVE
+# plugin clients via a Unix socket.
+#
+# Goal: every PVE plugin invocation (forked qm/pvesh/pveproxy worker, every
+# pvedaemon process) reuses the broker's WS instead of opening a fresh one.
+# TrueNAS rate-limits auth.login_with_api_key at 20 calls / 60 s / IP /
+# method, so per-process re-auth used to trip a sticky 60 s lockout
+# (death-spiral D2). With the broker, the node logs in once per upstream
+# session and never re-auths under normal operation.
+#
+# Protocol (newline-delimited JSON over Unix socket):
+#   client -> broker:
+#     {"scfg":{"api_host":"...","api_key":"...","api_scheme":"wss",
+#              "api_insecure":0,"prefer_ipv4":1,"api_port":443},
+#      "method":"system.version","params":[]}
+#   broker -> client:
+#     {"result":...}            on success
+#     {"error":"..."}           on failure (string contains TN error body)
+#
+# Trust model: Unix socket is root-only (mode 0600). API keys are passed
+# in each request because the broker is stateless w.r.t. credentials.
+
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+use IO::Socket::SSL;
+use IO::Socket::INET;
+use IO::Select;
+use Fcntl qw(:flock);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR);
+use POSIX qw(setsid strftime);
+use Digest::SHA qw(sha1 sha1_hex);
+use MIME::Base64 qw(encode_base64);
+use JSON::PP;
+use Socket;
+# IPPROTO_TCP is not in Socket's default export list; the keepalive tuning
+# below needs it by name.
+use Socket qw(IPPROTO_TCP);
+use Time::HiRes qw(time);
+
+# Paths are overridable so the daemon can be exercised by a test as an
+# unprivileged user against a scratch directory. The systemd unit sets none of
+# these, so a real install is unaffected.
+my $RUN_DIR        = $ENV{TRUENAS_BROKER_RUNDIR} || '/run/truenas-plugin';
+my $SOCKET_PATH    = "$RUN_DIR/broker.sock";
+my $PIDFILE        = "$RUN_DIR/broker.pid";
+my $LOG_FILE       = $ENV{TRUENAS_BROKER_LOG} || '/var/log/truenas-plugin-broker.log';
+my $IDLE_REAP_SECS = 600;   # close WS conns idle longer than this
+# Ceiling on any single upstream read. A TrueNAS that reboots, a fabric that
+# blips, or a firewall that forgets the flow leaves this end of the TCP
+# connection believing it is established: writes land in the kernel buffer and
+# reads never return. Since requests are served inline, one such connection
+# silently takes the whole daemon - and every TrueNAS storage on this node -
+# out of service until someone restarts it by hand. Overridable for slow
+# arrays via TRUENAS_BROKER_TIMEOUT.
+my $UPSTREAM_TIMEOUT = $ENV{TRUENAS_BROKER_TIMEOUT} || 30;
+# A typo in the unit file should not produce a deadline in the past, which
+# would fail every request instantly and look like a total outage.
+if ($UPSTREAM_TIMEOUT !~ /^\d+(?:\.\d+)?$/ || $UPSTREAM_TIMEOUT < 1) {
+    warn "TRUENAS_BROKER_TIMEOUT is not a positive number; using 30\n";
+    $UPSTREAM_TIMEOUT = 30;
+}
+# Ceiling on a client-declared budget, so one caller cannot hold the single
+# accept thread for an arbitrary time. Requests are served inline, so this
+# number is the worst case for every OTHER storage on the node as well: at 600,
+# one caller that asked for a ten-minute timeout left every TrueNAS storage here
+# unserved for ten minutes, and pvestatd - which polls on a far shorter timer -
+# stacked up behind it instead of failing cleanly. 90 is above any operation
+# this plugin issues in practice and below the point where waiting is worse than
+# reporting a failure. Raising it raises the blast radius, not just the patience.
+my $MAX_BUDGET = $ENV{TRUENAS_BROKER_MAX_BUDGET} || 90;
+if ($MAX_BUDGET !~ /^\d+(?:\.\d+)?$/ || $MAX_BUDGET < 5) {
+    warn "TRUENAS_BROKER_MAX_BUDGET is not a number >= 5; using 90\n";
+    $MAX_BUDGET = 90;
+}
+# The liveness probe on a pooled connection gets a much shorter budget: its
+# whole purpose is to find out quickly whether the socket is still real, and a
+# probe that waits the full timeout defeats the point of probing.
+my $PING_TIMEOUT = 5;
+# How long a connected client gets to finish sending its request line. A local
+# client has the whole thing in hand before it connects, so this only ever
+# expires on a client that has stopped, and it must expire: an unbounded read
+# here wedges the accept loop exactly as an unbounded upstream read did.
+my $CLIENT_READ_TIMEOUT = 10;
+# And a ceiling on how much we will buffer before giving up on finding the
+# newline, so a peer that never sends one cannot grow us out of memory.
+my $MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+# And the same on the way in from the upstream, for the same reason.
+my $MAX_FRAME_BYTES = 64 * 1024 * 1024;
+my $WS_PATH = '/api/current';
+
+my $foreground = grep { $_ eq '--foreground' || $_ eq '-f' } @ARGV;
+my $debug      = grep { $_ eq '--debug' || $_ eq '-d' } @ARGV;
+
+# ---------------- logging ----------------
+sub _log_line {
+    my ($lvl, $msg) = @_;
+    my $ts = strftime('%Y-%m-%dT%H:%M:%S', gmtime());
+    my $line = "$ts $lvl $msg\n";
+    if ($foreground) {
+        print STDERR $line;
+    } else {
+        if (open(my $fh, '>>', $LOG_FILE)) {
+            print $fh $line;
+            close $fh;
+        }
+    }
+}
+sub linfo  { _log_line('INFO',  $_[0]); }
+sub lwarn  { _log_line('WARN',  $_[0]); }
+sub lerr   { _log_line('ERROR', $_[0]); }
+sub ldebug { _log_line('DEBUG', $_[0]) if $debug; }
+
+# ---------------- setup ----------------
+sub ensure_rundir {
+    my $dir = $RUN_DIR;
+    mkdir($dir, 0700) unless -d $dir;
+    chmod 0700, $dir;
+}
+
+sub daemonize {
+    return if $foreground;
+    defined(my $pid = fork()) or die "fork failed: $!";
+    exit 0 if $pid;
+    setsid() or die "setsid failed: $!";
+    chdir('/') or die "chdir / failed: $!";
+    open(STDIN,  '<', '/dev/null');
+    open(STDOUT, '>>', '/dev/null');
+    open(STDERR, '>>', $LOG_FILE) or open(STDERR, '>>', '/dev/null');
+}
+
+sub write_pidfile {
+    open(my $fh, '>', $PIDFILE) or die "cannot write pidfile $PIDFILE: $!";
+    print $fh "$$\n";
+    close $fh;
+}
+
+# ---------------- WebSocket helpers (subset of plugin code) ----------------
+
+# Resolve $host to an IPv4 literal so IO::Socket::INET/SSL cannot pick the
+# AAAA record on a dual-stack TrueNAS when the caller asked for IPv4. Mirrors
+# TrueNASPlugin.pm::_host_ipv4. Returns $host unchanged when it is already an
+# IPv4 literal, when the lookup fails, or when the host is an IPv6 literal.
+sub _host_ipv4 {
+    my ($host) = @_;
+    return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/;
+    my @ent = gethostbyname($host);
+    if (@ent && defined $ent[4]) {
+        my $ip = inet_ntoa($ent[4]);
+        return $ip if $ip;
+    }
+    return $host;
+}
+
+sub ws_open {
+    my ($scfg, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
+    # Normalize scheme the same way TrueNASPlugin.pm::_ws_defaults does.
+    # Without this, an operator who set tn_api_scheme=https (rejected by the
+    # plugin's own validator only against the direct-WS path) would slip
+    # through the broker envelope raw, and the eq 'wss' check below would
+    # miss — the broker would open plain TCP and the handshake would 400.
+    my $scheme = $scfg->{api_scheme} || 'wss';
+    if    ($scheme =~ /^https$/i) { $scheme = 'wss'; }
+    elsif ($scheme =~ /^http$/i)  { $scheme = 'ws';  }
+    my $host   = $scfg->{api_host} or die "ws_open: no api_host";
+    my $port   = $scfg->{api_port} // (($scheme eq 'wss') ? 443 : 80);
+    # Honor prefer_ipv4 (default 1). The wire schema always listed this field
+    # but the earlier broker ignored it, so the OS resolver could pick AAAA
+    # on a dual-stack TN even though the plugin had resolved A already.
+    my $peer   = (($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host);
+
+    my $sock;
+    if ($scheme eq 'wss') {
+        $sock = IO::Socket::SSL->new(
+            PeerHost => $peer, PeerPort => $port,
+            SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
+            SSL_hostname    => $host,
+            Timeout => 15,
+        ) or die "TLS connect to $host:$port failed: $SSL_ERROR";
+    } else {
+        $sock = IO::Socket::INET->new(
+            PeerHost => $peer, PeerPort => $port, Proto => 'tcp', Timeout => 15,
+        ) or die "TCP connect to $host:$port failed: $!";
+    }
+
+    # Keepalive so the kernel eventually tears down a peer that went away
+    # without a FIN. The read deadline above already stops us waiting on such a
+    # socket; this stops us handing a corpse back out of the pool as if it were
+    # live. Best-effort: the constants are Linux-specific and the daemon must
+    # still work if they are missing.
+    # setsockopt returns false on failure rather than dying, so an earlier
+    # eval{...1} here could never have detected anything; check the returns.
+    # Partial failure matters: SO_KEEPALIVE alone, without the three intervals,
+    # leaves the system default of two hours - keepalive in name only.
+    for my $opt (
+        [ 'SO_KEEPALIVE',   SOL_SOCKET,  SO_KEEPALIVE, 1  ],
+        [ 'TCP_KEEPIDLE',   IPPROTO_TCP, 4,            30 ],
+        [ 'TCP_KEEPINTVL',  IPPROTO_TCP, 5,            10 ],
+        [ 'TCP_KEEPCNT',    IPPROTO_TCP, 6,            3  ],
+    ) {
+        my ($name, $level, $optname, $value) = @$opt;
+        ldebug("could not set $name on the upstream socket: $!")
+            unless setsockopt($sock, $level, $optname, pack('l', $value));
+    }
+
+    # Kernel-level backstop on both directions. The select-based deadlines
+    # above cover the cases they can see, but on TLS they cannot see all of
+    # them: select fires on ciphertext, and SSL_read then needs a whole record,
+    # so a connection cut in the middle of a record can still block inside a
+    # single sysread. SO_RCVTIMEO/SO_SNDTIMEO bound that in the kernel
+    # regardless of what the SSL layer is doing. Set slightly above the
+    # request budget so the ordinary deadline logic, which gives far better
+    # diagnostics, is what normally fires.
+    my $backstop = pack('l!l!', $UPSTREAM_TIMEOUT + 5, 0);
+    ldebug("could not set SO_RCVTIMEO on the upstream socket: $!")
+        unless setsockopt($sock, SOL_SOCKET, SO_RCVTIMEO, $backstop);
+    ldebug("could not set SO_SNDTIMEO on the upstream socket: $!")
+        unless setsockopt($sock, SOL_SOCKET, SO_SNDTIMEO, $backstop);
+
+    my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
+    my $key_b64 = encode_base64($key_raw, '');
+    my $req =
+      "GET $WS_PATH HTTP/1.1\r\n".
+      "Host: $host:$port\r\n".
+      "Upgrade: websocket\r\n".
+      "Connection: Upgrade\r\n".
+      "Sec-WebSocket-Key: $key_b64\r\n".
+      "Sec-WebSocket-Version: 13\r\n".
+      "\r\n";
+    print $sock $req;
+    # Bounded like every other read here: a peer that completes the TCP
+    # handshake and then never sends the 101 would otherwise hold the daemon
+    # for good, and this path runs with no pooled connection to fall back on.
+    my $resp = '';
+    while (1) {
+        die "WS handshake timed out waiting for the HTTP response"
+            unless ws_wait_readable($sock, $deadline);
+        my $got = $sock->sysread(my $buf, 1024);
+        last unless defined $got && $got > 0;
+        $resp .= $buf;
+        last if $resp =~ /\r\n\r\n/s;
+    }
+    die "WS handshake failed: no HTTP 101 response" if $resp !~ m#^HTTP/1\.([01]) 101#;
+    my ($accept) = $resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i;
+    my $expect = encode_base64(sha1($key_b64 . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), '');
+    die "WS handshake invalid accept key" if ($accept // '') ne $expect;
+
+    my $conn = { sock => $sock, next_id => 1 };
+    my $auth = ws_rpc($conn, {
+        jsonrpc => "2.0", id => $conn->{next_id}++,
+        method  => "auth.login_with_api_key",
+        params  => [ $scfg->{api_key} ],
+    }, $deadline);
+    # Silence and rejection are different faults and want different responses:
+    # one is the network, the other is the API key. Reporting a timed-out read
+    # as "authentication failed" sent the reader to check credentials while the
+    # real problem was a TrueNAS that had stopped answering.
+    die "no response from TrueNAS during authentication (timed out or connection lost)"
+        unless defined $auth;
+    if (ref($auth) eq 'HASH' && exists $auth->{error}) {
+        my $e = ref($auth->{error}) ? encode_json($auth->{error}) : $auth->{error};
+        # A rate-limit lockout on this very method is the daemon's signature
+        # failure - it is the whole reason the daemon exists - and it arrives
+        # as a structured error just like a bad key does. Calling it a rejected
+        # key would send someone rotating credentials in the middle of an
+        # outage that has nothing to do with credentials.
+        die "TrueNAS is rate-limiting authentication; wait for the lockout to expire: $e"
+            if $e =~ /rate.?limit|too many|throttl/i;
+        die "TrueNAS rejected the API key: $e";
+    }
+    return $conn;
+}
+
+sub xor_mask {
+    my ($data, $mask) = @_;
+    my $out = $data;
+    my $len = length($data);
+    for (my $i = 0; $i < $len; $i++) {
+        substr($out, $i, 1) = chr(ord(substr($data, $i, 1)) ^ ord(substr($mask, $i % 4, 1)));
+    }
+    return $out;
+}
+
+# Wait until $sock has something to read, or the deadline passes. Returns 1 if
+# readable, 0 on timeout. IO::Socket::SSL decodes a whole TLS record at a time,
+# so bytes can already be sitting in its buffer with nothing left on the wire -
+# select() would then block on a socket whose data has in fact arrived. Ask the
+# SSL layer first and only fall through to select() when it holds nothing.
+sub ws_wait_readable {
+    my ($sock, $deadline) = @_;
+    return 1 if $sock->can('pending') && $sock->pending();
+    my $remaining = $deadline - time();
+    return 0 if $remaining <= 0;
+    my $sel = IO::Select->new($sock);
+    return $sel->can_read($remaining) ? 1 : 0;
+}
+
+# Write the whole buffer, bounded by an absolute deadline. Returns 1 on
+# success, 0 on timeout or error.
+#
+# syswrite is under no obligation to take everything, and on TLS it does not:
+# measured on IO::Socket::SSL 2.085, one call caps at a single TLS record -
+# 8 KB and 16 KB went out whole, 64 KB and 256 KB both returned 16384. The
+# daemon used to call syswrite once and discard what it returned, so any frame
+# past that size went out truncated and the far end sat waiting for the rest of
+# a frame that was never coming; the request then died on its own deadline
+# reporting "no response", with the real cause invisible. Plain Unix sockets
+# short-write the same way once the reader stops draining, which is the same
+# story on the reply path.
+sub write_all {
+    my ($sock, $data, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
+    my $len = length($data);
+    my $off = 0;
+    while ($off < $len) {
+        my $remaining = $deadline - time();
+        if ($remaining <= 0) {
+            lwarn("write timed out with " . ($len - $off) . " of $len byte(s) unsent");
+            return 0;
+        }
+        my $sel = IO::Select->new($sock);
+        unless ($sel->can_write($remaining)) {
+            lwarn("write timed out with " . ($len - $off) . " of $len byte(s) unsent");
+            return 0;
+        }
+        my $n = $sock->syswrite(substr($data, $off));
+        if (!defined $n) {
+            next if $!{EAGAIN} || $!{EWOULDBLOCK} || $!{EINTR};
+            lwarn("write failed after $off of $len byte(s): $!");
+            return 0;
+        }
+        last if $n == 0;
+        $off += $n;
+    }
+    return $off == $len ? 1 : 0;
+}
+
+# Read exactly $len bytes, bounded by an absolute deadline.
+#
+# The deadline covers the whole read rather than each sysread, so a slow but
+# advancing transfer is not cut off - the same envelope the plugin applies to
+# its own end of the Unix socket. Without it, a peer that accepts the connection
+# and then says nothing blocks here forever: the constructor's Timeout only ever
+# covered connect(). And because this daemon serves clients inline, one such
+# block is not a single stalled request, it is every request that follows.
+sub ws_read_exact {
+    my ($sock, $bufref, $len, $deadline) = @_;
+    $$bufref = '';
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
+    while (length($$bufref) < $len) {
+        unless (ws_wait_readable($sock, $deadline)) {
+            # Deliberately does not name a number of seconds. The probe and a
+            # full call run on different budgets, and an earlier draft of this
+            # line printed the global default for both - which would have sent
+            # the reader hunting for a 30 s stall that was really a 5 s one.
+            lwarn("upstream read timed out waiting for "
+                . ($len - length($$bufref)) . " more byte(s)");
+            return 0;
+        }
+        my $got = $sock->sysread(my $tmp, $len - length($$bufref));
+        return 0 unless defined $got && $got > 0;
+        $$bufref .= $tmp;
+    }
+    return 1;
+}
+
+# Frame and send one masked client-to-server frame. RFC 6455 requires every
+# frame a client sends to be masked and obliges the server to fail the
+# connection on an unmasked one, so this is used for control frames too.
+sub ws_send_frame {
+    my ($sock, $opcode, $payload, $deadline) = @_;
+    $payload //= '';
+    my $len = length($payload);
+    my $mask_key = join '', map { chr(int(rand(256))) } 1..4;
+    my $hdr = pack('C', 0x80 | $opcode);   # FIN=1
+    my $masked_flag = 0x80;
+    if    ($len <= 125)       { $hdr .= pack('C',   $masked_flag | $len); }
+    elsif ($len <= 0xFFFF)    { $hdr .= pack('C n', $masked_flag | 126, $len); }
+    else                      { $hdr .= pack('C Q>',$masked_flag | 127, $len); }
+    return write_all($sock, $hdr . $mask_key . xor_mask($payload, $mask_key), $deadline);
+}
+
+sub ws_send_text {
+    my ($sock, $text, $deadline) = @_;
+    return ws_send_frame($sock, 0x1, $text, $deadline);
+}
+
+sub ws_recv_text {
+    my ($sock, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
+    my $message = '';
+    while (1) {
+        my $hdr;
+        return undef unless ws_read_exact($sock, \$hdr, 2, $deadline);
+        my ($b1, $b2) = unpack('CC', $hdr);
+        my $fin    = $b1 & 0x80;
+        my $opcode = $b1 & 0x0F;
+        my $masked = $b2 & 0x80;
+        my $len    = $b2 & 0x7F;
+        if ($len == 126) {
+            my $ext; return undef unless ws_read_exact($sock, \$ext, 2, $deadline);
+            $len = unpack('n', $ext);
+        } elsif ($len == 127) {
+            my $ext; return undef unless ws_read_exact($sock, \$ext, 8, $deadline);
+            $len = unpack('Q>', $ext);
+        }
+        # A declared length is not a promise. Now that a read can time out
+        # part-way through a payload, the stream can resume mis-aligned and a
+        # byte of JSON gets parsed as a frame header - and sysread pre-grows
+        # its target to the length asked for, so a bogus 64-bit value is an
+        # immediate out-of-memory abort. The unit sets no MemoryMax, so the
+        # kernel would then pick the largest process on the node to kill, which
+        # on a hypervisor is somebody's VM.
+        if ($len > $MAX_FRAME_BYTES) {
+            lwarn("upstream frame claims $len bytes, over the $MAX_FRAME_BYTES limit; dropping the connection");
+            return undef;
+        }
+        my $mask_key = '';
+        if ($masked) {
+            return undef unless ws_read_exact($sock, \$mask_key, 4, $deadline);
+        }
+        my $payload = '';
+        if ($len > 0) {
+            return undef unless ws_read_exact($sock, \$payload, $len, $deadline);
+            $payload = xor_mask($payload, $mask_key) if $masked;
+        }
+        if    ($opcode == 0x01) { $message  = $payload; return $message if $fin; }
+        elsif ($opcode == 0x00) { $message .= $payload; return $message if $fin; }
+        elsif ($opcode == 0x08) { return undef; }            # close
+        elsif ($opcode == 0x09) {                            # ping
+            # Masked, like every other frame we send. The hand-rolled pong this
+            # replaces was unmasked, which RFC 6455 requires the server to
+            # answer by failing the connection - and a dropped session here
+            # means a fresh login, which is the rate-limit spiral this daemon
+            # exists to avoid.
+            ws_send_frame($sock, 0xA, $payload, $deadline);
+        }
+        elsif ($opcode == 0x0A) { }                          # pong
+        else { return undef; }
+    }
+}
+
+sub ws_rpc {
+    # $deadline is absolute, and is the caller's to set. Taking a relative
+    # timeout here instead let each step start its own clock: a probe that
+    # spent 5 s followed by a reconnect that spent 30 s produced a 35 s
+    # request - longer than the deadline the plugin gives the whole round
+    # trip, so the client gave up first and the work was wasted.
+    my ($conn, $obj, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
+    my $req_id = $obj->{id};
+    my $text = encode_json($obj);
+    ws_send_text($conn->{sock}, $text, $deadline)
+        or die "could not send the request upstream (timed out or connection lost)";
+    my $max_skip = 10;
+    for (my $skipped = 0; $skipped <= $max_skip; $skipped++) {
+        my $resp = ws_recv_text($conn->{sock}, $deadline);
+        return undef unless defined $resp;
+        my $decoded = eval { decode_json($resp) };
+        next if $@ || !$decoded;
+        if (defined($req_id) && ref($decoded) eq 'HASH'
+            && defined($decoded->{id}) && "$decoded->{id}" eq "$req_id")
+        {
+            return $decoded;
+        }
+    }
+    return undef;
+}
+
+# ---------------- per-(host,key) connection pool ----------------
+my %POOL;       # scfg_key -> { conn => $ws_conn, last_used => $epoch }
+
+sub scfg_key {
+    my ($scfg) = @_;
+    my $host = $scfg->{api_host} // '';
+    my $key  = $scfg->{api_key}  // '';
+    # Don't put raw api_key in memory key; hash it
+    return $host . ':' . sha1_hex($key);
+}
+
+sub get_or_open_ws {
+    my ($scfg, $deadline) = @_;
+    $deadline //= time() + $UPSTREAM_TIMEOUT;
+    my $sk = scfg_key($scfg);
+    my $entry = $POOL{$sk};
+    if ($entry && $entry->{conn} && $entry->{conn}->{sock}) {
+        # Quick liveness check: ping. Given a tight budget of its own - this is
+        # the read most likely to meet a half-open socket, because a pooled
+        # connection is by definition one nobody has touched recently - but
+        # never more than the request as a whole has left, so that a failed
+        # probe still leaves room to reconnect inside the same deadline.
+        my $ping_deadline = time() + $PING_TIMEOUT;
+        $ping_deadline = $deadline if $ping_deadline > $deadline;
+        my $ok = eval {
+            ws_rpc($entry->{conn}, {
+                jsonrpc => "2.0", id => 999999, method => "core.ping", params => [],
+            }, $ping_deadline);
+        };
+        if ($ok) {
+            $entry->{last_used} = time();
+            return $entry->{conn};
+        }
+        # Dead; drop and reopen
+        eval { $entry->{conn}->{sock}->close(); };
+        delete $POOL{$sk};
+    }
+    my $conn = ws_open($scfg, $deadline);
+    $POOL{$sk} = { conn => $conn, last_used => time() };
+    linfo("opened WS for $sk (pool size " . scalar(keys %POOL) . ")");
+    return $conn;
+}
+
+sub reap_idle {
+    my $now = time();
+    for my $sk (keys %POOL) {
+        my $e = $POOL{$sk};
+        next unless $e && $e->{conn};
+        if ($now - $e->{last_used} > $IDLE_REAP_SECS) {
+            linfo("reaping idle WS for $sk");
+            eval { $e->{conn}->{sock}->close(); };
+            delete $POOL{$sk};
+        }
+    }
+}
+
+# ---------------- Unix-socket server ----------------
+sub make_listener {
+    unlink $SOCKET_PATH if -e $SOCKET_PATH;
+    my $srv = IO::Socket::UNIX->new(
+        Local  => $SOCKET_PATH,
+        # Clients wait here while the single thread serves the one in flight,
+        # and a client sitting in the backlog has not been accepted yet, so its
+        # own read timeout has not started counting. A short queue turns one
+        # slow request into refused connections for everybody else.
+        Listen => 128,
+        Type   => SOCK_STREAM,
+    ) or die "cannot bind $SOCKET_PATH: $!";
+    chmod 0600, $SOCKET_PATH;
+    return $srv;
+}
+
+# Read one line (ending in \n) from a non-blocking-ish client. Returns
+# undef on EOF/error, string (without trailing \n) on success.
+# Read one newline-terminated request from a client, bounded.
+#
+# This was the last unbounded read in the daemon, and it wedged it just as
+# thoroughly as the upstream one did: measured against the already-deadlined
+# build, a local client that connected and then sent a request without its
+# trailing newline left the accept loop stuck here, and a second, healthy
+# client went unanswered for as long as it waited. A client that DIES is
+# harmless - the socket reports EOF - but one that merely stops, because it is
+# stopped, or blocked in D state on the very storage this daemon serves, does
+# not. Returns undef on EOF, error, timeout, or an over-long request.
+sub read_line_blocking {
+    my ($fh, $deadline) = @_;
+    $deadline //= time() + $CLIENT_READ_TIMEOUT;
+    my $buf = '';
+    while (1) {
+        unless (ws_wait_readable($fh, $deadline)) {
+            lwarn("client sent no complete request before its read deadline");
+            return undef;
+        }
+        my $got = $fh->sysread(my $tmp, 4096);
+        return undef unless defined $got && $got > 0;
+        $buf .= $tmp;
+        if ((my $idx = index($buf, "\n")) >= 0) {
+            my $line = substr($buf, 0, $idx);
+            return $line;
+        }
+        # A peer that never sends a newline would otherwise grow this buffer
+        # until the daemon is killed for it.
+        if (length($buf) > $MAX_REQUEST_BYTES) {
+            lwarn("client request exceeded $MAX_REQUEST_BYTES bytes with no newline; dropping");
+            return undef;
+        }
+    }
+}
+
+sub handle_request {
+    my ($client) = @_;
+    my $line = read_line_blocking($client, time() + $CLIENT_READ_TIMEOUT);
+    return unless defined $line;
+    my $req = eval { decode_json($line) };
+    if ($@ || !$req) {
+        lwarn("bad request JSON: $@");
+        my $err = encode_json({ error => "broker: bad request JSON: $@" });
+        write_all($client, "$err\n", time() + $CLIENT_READ_TIMEOUT);
+        return;
+    }
+    my $scfg = $req->{scfg};
+    if (!$scfg || !$scfg->{api_host} || !$scfg->{api_key}) {
+        my $h    = ref($scfg) eq 'HASH' && defined $scfg->{api_host} ? $scfg->{api_host} : '<undef>';
+        my $kraw = ref($scfg) eq 'HASH' ? $scfg->{api_key} : undef;
+        my $k    = !defined $kraw       ? '<undef>'
+                 : length($kraw) == 0   ? '<empty>'
+                                        : '<set len=' . length($kraw) . '>';
+        my $m    = $req->{method} // '<no method>';
+        lwarn("scfg missing api_host/api_key in request (api_host=$h api_key=$k method=$m)");
+        if (ref($scfg) eq 'HASH') {
+            lwarn("  scfg keys: " . join(",", sort keys %$scfg));
+        } else {
+            lwarn("  scfg is not a HASH (ref=" . ref($scfg) . ")");
+        }
+        # Dump the raw line so we can tell whether the client really
+        # sent a malformed envelope or whether our decode is at fault.
+        # Redact any api_key= occurrences before logging (defense in
+        # depth; the key shouldn't be in this code path but we still
+        # don't want it in journal). Truncate to 600 bytes.
+        my $raw = $line // '<undef>';
+        $raw =~ s/("api_key"\s*:\s*)"[^"]*"/$1"<redacted>"/g;
+        $raw = substr($raw, 0, 600) . (length($raw) > 600 ? "...[truncated]" : "");
+        lwarn("  raw request: $raw");
+        # Top-level keys of the decoded request envelope.
+        if (ref($req) eq 'HASH') {
+            lwarn("  request top-level keys: " . join(",", sort keys %$req));
+        }
+        my $err = encode_json({ error => "broker: scfg missing api_host/api_key" });
+        write_all($client, "$err\n", time() + $CLIENT_READ_TIMEOUT);
+        return;
+    }
+    my $method = $req->{method};
+    my $params = $req->{params} // [];
+    if (!$method) {
+        lwarn("request missing method (host=$scfg->{api_host})");
+        my $err = encode_json({ error => "broker: no method" });
+        write_all($client, "$err\n", time() + $CLIENT_READ_TIMEOUT);
+        return;
+    }
+
+    my $sk = scfg_key($scfg);
+    my $result_obj;
+    # One budget for the whole request - probe, reconnect, authenticate and
+    # call all draw from it.
+    #
+    # The client applies a deadline of its own, and when the two are equal it
+    # wins the race by a hair: measured at 30.03 s against a client deadline of
+    # 30 s, so the operator always saw the client's generic "read timeout" and
+    # never the broker's account of what actually failed. Clients that send
+    # their budget get answered a margin before it expires; clients that do not
+    # (older plugin builds) keep the previous behaviour.
+    # The client's declared budget wins in BOTH directions, not just downwards.
+    # Clamping it to the daemon default meant an operator who raised the plugin
+    # side for a slow array got no change and no log line, and had to discover
+    # that a second knob existed in the unit file. Bounded above so a bad value
+    # cannot pin the single thread for an unreasonable time.
+    my $budget = $UPSTREAM_TIMEOUT;
+    my $client_timeout = $req->{timeout};
+    if (defined($client_timeout) && !ref($client_timeout)
+        && $client_timeout =~ /^\d+(?:\.\d+)?$/ && $client_timeout > 2) {
+        $budget = $client_timeout - 2;
+        $budget = $MAX_BUDGET if $budget > $MAX_BUDGET;
+    }
+    my $deadline = time() + $budget;
+    eval {
+        my $conn = get_or_open_ws($scfg, $deadline);
+        my $rpc = {
+            jsonrpc => "2.0", id => $conn->{next_id}++,
+            method => $method, params => $params,
+        };
+        $result_obj = ws_rpc($conn, $rpc, $deadline);
+    };
+    if (my $err = $@) {
+        # Drop the cached conn — likely dead — and surface the failure in
+        # the journal so the operator can tell the difference between
+        # "broker quiet because all RPCs succeed" and "broker quiet because
+        # auth keeps failing". Before this lwarn the daemon was opaque on
+        # failure: only WS lifecycle events were logged.
+        lwarn("upstream RPC failed (sk=$sk method=$method): $err");
+        if (my $e = delete $POOL{$sk}) {
+            eval { $e->{conn}->{sock}->close(); };
+        }
+        my $msg = encode_json({ error => "broker: $err" });
+        write_all($client, "$msg\n", time() + $CLIENT_READ_TIMEOUT);
+        return;
+    }
+    if (!$result_obj) {
+        # No response means the read gave up, and the connection is now of
+        # unknown state: the answer we stopped waiting for may still arrive and
+        # be sitting unread in front of the next request's. Leaving it pooled
+        # also charged every following request the probe timeout for as long as
+        # the outage lasted. Drop it - the die path already did; this path used
+        # to put it straight back.
+        lwarn("no response from upstream (sk=$sk method=$method); dropping the pooled connection");
+        if (my $e = delete $POOL{$sk}) {
+            eval { $e->{conn}->{sock}->close(); };
+        }
+        my $msg = encode_json({ error => "broker: no response from upstream" });
+        write_all($client, "$msg\n", time() + $CLIENT_READ_TIMEOUT);
+        return;
+    }
+
+    if (exists $result_obj->{error}) {
+        # Upstream returned a structured JSON-RPC error (e.g. EBUSY /
+        # Rate Limit Exceeded, invalid params, method not found). Worth
+        # logging so users can match a failing test to a TN-side cause.
+        my $err_repr = ref($result_obj->{error}) ? encode_json($result_obj->{error}) : $result_obj->{error};
+        lwarn("upstream error (sk=$sk method=$method): $err_repr");
+        my $msg = encode_json({ error => encode_json($result_obj->{error}) });
+        write_all($client, "$msg\n", time() + $CLIENT_READ_TIMEOUT);
+    } else {
+        my $msg = encode_json({ result => $result_obj->{result} });
+        write_all($client, "$msg\n", time() + $CLIENT_READ_TIMEOUT);
+    }
+}
+
+# ---------------- main ----------------
+ensure_rundir();
+daemonize();
+write_pidfile();
+linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
+
+$SIG{TERM} = $SIG{INT} = sub {
+    linfo("shutting down");
+    for my $sk (keys %POOL) {
+        my $e = $POOL{$sk};
+        eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
+    }
+    unlink $SOCKET_PATH;
+    unlink $PIDFILE;
+    exit 0;
+};
+$SIG{PIPE} = 'IGNORE';
+
+my $srv = make_listener();
+my $sel = IO::Select->new($srv);
+my $last_reap = time();
+
+while (1) {
+    my @ready = $sel->can_read(60);
+    for my $fh (@ready) {
+        if ($fh == $srv) {
+            my $c = $srv->accept();
+            next unless $c;
+            # Handle inline (single-threaded). Per-conn the round trip is
+            # microseconds; broker bottleneck is the upstream WS not us.
+            eval { handle_request($c); };
+            if ($@) { lerr("handle_request died: $@"); }
+            eval { $c->close(); };
+        }
+    }
+    if (time() - $last_reap > 60) {
+        reap_idle();
+        $last_reap = time();
+    }
+}

@@ -1,0 +1,362 @@
+--- /root/TrueNASPlugin.pm.bak-idk7-20260823-132513	2026-08-23 13:25:13.437664904 -0500
++++ /root/build-idk6/TrueNASPlugin.pm	2026-08-23 15:09:18.077281154 -0500
+@@ -419,9 +419,19 @@
+         my $left = $deadline - time();
+         if ($left <= 0) {
+             my $spent = time() - $started;
+-            _log($scfg, 0, 'err', "[TrueNAS] Budget of ${budget}s spent after $attempt "
++            # Name the budget that actually governed. $budget is the configured
++            # knob, but an outer deadline (the 2s marker cap, cluster_lock's
++            # window) may have shrunk the effective one - and "Budget of 120s
++            # spent" after two real seconds sends the diagnosis the wrong way,
++            # 18 lines for every 1 of the note that explains the cap.
++            my $granted = $deadline - $started;
++            $granted = 0 if $granted < 0;   # an already-expired outer deadline
++            my $bnote = ($granted + 0.5 < $budget)
++                ? sprintf('%ss, capped to %.0fs by an outer deadline', $budget, $granted)
++                : "${budget}s";
++            _log($scfg, 0, 'err', "[TrueNAS] Budget of $bnote spent after $attempt "
+                 . "attempt(s) for $operation_name: $last_error");
+-            die "Gave up on $operation_name after ${spent}s (budget ${budget}s, "
++            die "Gave up on $operation_name after ${spent}s (budget $bnote, "
+               . "$attempt attempt(s)); the array did not answer in time, so the "
+               . "outcome is unknown: $last_error";
+         }
+@@ -3775,6 +3785,50 @@
+         return;
+     }
+ 
++    # Do not BEGIN a mutation the budget cannot plausibly finish. The order
++    # below is close-first-authorize-second (the target refuses the reverse),
++    # so dying between the two steps leaves the subsystem shut with an EMPTY
++    # host list until a later ensure heals it. Better never to start: an open,
++    # not-yet-tightened subsystem is degraded security for a while; a closed,
++    # empty one refuses every host trying to (re)connect.
++    # Paren-call form, not the bareword: this sub sits ABOVE the constants
++    # block in the file, so the bareword does not exist yet when this compiles.
++    # The reserve exists for the CLOSE step only: dying between closing and
++    # authorizing is what leaves the subsystem shut with an empty host list.
++    # When the subsystem is already closed ($cur_allow_any_host false - which
++    # is what both real call sites pass in whitelist mode), the only work left
++    # is the authorize, and deferring THAT is the opposite of protection: it
++    # leaves the closed-and-empty state standing, and kills the repair-mode
++    # self-heal in _nvme_connect() for as long as the marker keeps renewing.
++    # An authorize that dies of budget at most leaves a reusable host record
++    # behind (host.create/update can land before the death); the next ensure
++    # picks it up idempotently.
++    my $will_close = !defined($cur_allow_any_host) || $cur_allow_any_host;
++    my $left_budget = _api_budget_remaining();
++    if ($will_close && defined($left_budget) && $left_budget < WHITELIST_MIN_BUDGET_S()) {
++        # Level 0 via the throttled note, not level 1: "I did not harden the
++        # subsystem" is exactly the class of fact this file already paid a
++        # debugging session (2026-08-23) to learn must not live at a level the
++        # default config discards.
++        if (defined(my $marker_s = _api_recently_down($scfg))) {
++            # Keyed per SUBSYSTEM - the unit of work. A per-host bucket let one
++            # storage's defer swallow its sibling's for good (proven in review).
++            _log_api_down_note($scfg, 'whitelist-defer', "subsys$subsys_id", $marker_s,
++                "deferring close-then-authorize, only ${left_budget}s of API "
++                . 'budget left (need ' . WHITELIST_MIN_BUDGET_S() . 's)', 'warning');
++        } else {
++            # No marker: something else shrank the budget (cluster lock, an op
++            # budget). The note's fixed "array marked down" suffix would blame a
++            # healthy array and send the diagnosis chasing a dead cabinet that
++            # does not exist - say what actually happened instead.
++            _log($scfg, 0, 'warning', "[TrueNAS] nvme_reconcile_host_whitelist: "
++                . "deferring close-then-authorize on subsys $subsys_id, only "
++                . "${left_budget}s of API budget left (need "
++                . WHITELIST_MIN_BUDGET_S() . 's) under an outer deadline');
++        }
++        return;
++    }
++
+     # Close first, authorize second. The kernel holds allow_any_host and an
+     # explicit host list as mutually exclusive: linking a host into a subsystem
+     # that is still open is refused with EINVAL, and so is reopening one that
+@@ -3788,7 +3842,10 @@
+     # already established, because the host ACL is evaluated at connect time.
+     # Existing I/O rides through it; only a reconnect landing inside the window
+     # is refused.
+-    if (!defined($cur_allow_any_host) || $cur_allow_any_host) {
++    # $will_close above IS this predicate - single source. They drifting apart
++    # re-opens the original HIGH: undef + short budget skipping the reserve and
++    # then executing the close it had no budget to finish.
++    if ($will_close) {
+         eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
+             [ $subsys_id, { allow_any_host => JSON::PP::false } ]) };
+         if ($@) {
+@@ -3986,6 +4043,16 @@
+                                        # TCP handshake succeeds and the NVMe one
+                                        # then hangs.
+     NVME_DEGRADED_LOG_S       => 300,  # throttle for the "reduced redundancy" warning
++    API_DOWN_LOG_S            => 60,   # throttle for recent-failure-marker notices
++                                       # (its own knob: reusing NVME_DEGRADED_LOG_S
++                                       # meant tuning portal warnings silently moved
++                                       # the breaker's visibility)
++    API_DOWN_PROBE_BUDGET_S   => 2,    # deadline for API work while the marker stands
++    WHITELIST_MIN_BUDGET_S    => 5,    # don't BEGIN the close-then-authorize
++                                       # whitelist mutation with less API budget
++                                       # than this; deliberately above the probe
++                                       # budget, so a marker-capped ensure always
++                                       # defers it instead of starting it
+     NVME_HOST_ADDR_TTL_S      => 300,  # memoize portal hostname lookups
+     NVME_HOST_ADDR_FAIL_TTL_S => 10,   # ...but do not cache a failure that long
+ };
+@@ -5474,6 +5541,22 @@
+     my $existing_bindings = eval {
+         _api_call($scfg, 'nvmet.port_subsys.query', []);
+     } // [];
++    # "Could not ask" must not impersonate "no bindings". The empty default is
++    # survivable (sync only creates, and duplicate creates are handled), but
++    # the assumption has to be on the record - under the 2s marker cap this
++    # query now fails routinely during outages instead of almost never.
++    if (my $q_err = $@) {
++        # Level 0, not level 1: with tn_debug=0 (the default) level 1 never
++        # prints, and "the assumption has to be on the record" was not - the
++        # exact silence this file already paid a debugging session to learn.
++        if (defined(my $marker_s = _api_recently_down($scfg))) {
++            _log_api_down_note($scfg, 'portal-query', "subsys$subsys_id", $marker_s,
++                'port_subsys.query failed, assuming no existing bindings', 'warning');
++        } else {
++            _log($scfg, 0, 'warning', "[TrueNAS] sync_portals: port_subsys.query "
++                . "failed, assuming no existing bindings: $q_err");
++        }
++    }
+ 
+     # Build lookup of existing "addr:port" for this subsystem
+     my %existing_set;
+@@ -5583,12 +5666,17 @@
+     $name =~ s/[^a-zA-Z0-9_\-]/_/g;
+ 
+     # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation
+-    my $subsys = _api_call_mutate($scfg, 'nvmet.subsys.create', [{
++    my $subsys = eval { _api_call_mutate($scfg, 'nvmet.subsys.create', [{
+         name => $name,
+         subnqn => $nqn,
+         # Open by default (back-compat); whitelist when tn_nvme_allow_any_host=0.
+         allow_any_host => _nvme_allow_any_host_json($scfg),
+-    }]);
++    }]) };
++    # Wrapped like its sibling mutations. This was the one mutation that still
++    # propagated a bare "Gave up on ... outcome is unknown" to the marker
++    # classifier, which filed it as routine probe noise - a CREATE whose outcome
++    # is unknown is news, not noise.
++    die "nvme_ensure_subsystem: failed to create subsystem $nqn: $@" if $@;
+ 
+     my $subsys_id = ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
+ 
+@@ -7377,6 +7465,73 @@
+     _log($scfg, 2, 'debug', "[TrueNAS] status-cache: invalidate key=$method");
+ }
+ 
++# ======== recent-failure marker: shared helpers ========
++# Single source of truth for the probe backoff window. It governs the READ of the
++# marker (here and in activate_storage) and the WRITE in status(); keeping the
++# default in two places let the two sides drift apart with no error.
++sub _status_probe_backoff {
++    my ($scfg) = @_;
++    my $backoff = $scfg->{tn_status_probe_backoff_s};
++    return 30 if !defined($backoff) || $backoff !~ /^\d+(?:\.\d+)?$/;
++    return $backoff;
++}
++
++# %_status_api_down is a fact about THE ARRAY, but until 2026-08-23 only status()
++# ever read it. PVE::Storage::storage_info() calls activate_storage() BEFORE
++# status() on every sweep, so a marker honoured only inside status() cannot keep a
++# poll from paying a full API timeout: measured 15 of 15 polls at ~10s each inside
++# _nvme_ensure_subsystem() while status() itself returned instantly from the marker.
++# Returns seconds remaining while the marker stands, else undef.
++sub _api_recently_down {
++    my ($scfg) = @_;
++    return undef if _status_probe_backoff($scfg) <= 0;
++    my $down_until = $_status_api_down{_cache_host_key($scfg)};
++    return undef if !defined($down_until);
++    my $left = $down_until - time();
++    return $left > 0 ? $left : undef;
++}
++
++# The short probe deadline, clamped to any outer deadline already standing.
++# _retry_with_backoff() takes the nearer of the outer and its own budget on
++# entry, so handing it a LATER deadline than the one it inherited would extend
++# what e.g. cluster_lock_storage already bounded - a cap must only ever shrink.
++sub _capped_api_deadline {
++    my $cap = time() + API_DOWN_PROBE_BUDGET_S;
++    $cap = $_api_deadline if defined($_api_deadline) && $_api_deadline < $cap;
++    return $cap;
++}
++
++# The marker used to work in total silence: its only trace was a level-1 _log,
++# which _log() drops whenever tn_debug is unset - the default. That silence cost a
++# debugging session on 2026-08-23: the breaker was suppressing 11 of 15 probes and
++# the journal showed nothing, so it looked broken and got "fixed".
++# Keyed per call site AND per storeid. A single per-host bucket let whichever
++# caller ran first (always activate_storage) swallow the other's line for good, and
++# made one storeid speak for its siblings on the same array. tn_debug bypasses the
++# throttle, because asking for detail must not yield less of it than before.
++# Clock-went-backwards guard mirrors the degraded-portal warning in _nvme_connect().
++our %_api_down_log_last;   # `our`, so tests can reach the throttle state
++sub _log_api_down_note {
++    my ($scfg, $tag, $storeid, $left, $what, $sev) = @_;
++    my $key = _cache_host_key($scfg) . "|$tag|" . ($storeid // '-');
++    my $now = time();
++    my $last = $_api_down_log_last{$key} // 0;
++    $last = 0 if $now < $last;
++    my $verbose = ($scfg->{tn_debug} // 0) >= 1;
++    # API_DOWN_LOG_S is a CEILING: when the marker window itself is shorter, the
++    # throttle follows it. A fixed 60s against the default 30s backoff meant every
++    # other marker period logged nothing and the journal undercounted outages 2x.
++    my $win = _status_probe_backoff($scfg);
++    $win = API_DOWN_LOG_S if $win <= 0 || $win > API_DOWN_LOG_S;
++    return if !$verbose && ($now - $last) < $win;
++    $_api_down_log_last{$key} = $now;
++    # Severity per tag: chatter ('status', 'activate_storage') stays info, but a
++    # note that CARRIES A CAUSE ('ensure-budget', 'ensure-fault', ...) must
++    # survive a >=warning syslog filter, or nobody who filters ever reads it.
++    _log($scfg, 0, $sev // 'info', "[TrueNAS] $tag: '" . ($storeid // '-') . "' $what; "
++        . "array marked down for another " . int($left) . "s");
++}
++
+ # ======== status(): dataset capacity ========
+ # total = quota (if set) else (written/used + available)
+ # avail = (quota - written/used) when quota present, else dataset available
+@@ -7394,8 +7549,26 @@
+     # per backoff window - and never on the VM start path. Detection itself is a
+     # pure sysfs read. Never allowed to break capacity reporting.
+     if (($scfg->{tn_transport_mode} // '') eq 'nvme-tcp') {
++        # Detection is sysfs, but repair mode has one API-capable branch: the
++        # whitelist self-heal inside _nvme_connect() calls
++        # _nvme_ensure_subsystem() when portals refused us. This runs BEFORE
++        # the marker gate below, so without its own cap it was the second
++        # uncapped API path on the poll - the very hole the gate closes.
++        # RHS evaluates before localization, so `local $x = $x` is a no-op
++        # rebind - verified against this exact call shape in review.
++        local $_api_deadline = defined(_api_recently_down($scfg))
++            ? _capped_api_deadline() : $_api_deadline;
+         eval { _nvme_connect($scfg, repair => 1) };
+-        _log($scfg, 2, 'debug', "[TrueNAS] status: path reconcile failed: $@") if $@;
++        if (my $rep_err = $@) {
++            if (defined(my $marker_s = _api_recently_down($scfg))) {
++                # Routine under the 2s cap, but losing NVMe path redundancy must
++                # not be a debug-only fact: one throttled warning per window.
++                _log_api_down_note($scfg, 'repair-fail', $storeid, $marker_s,
++                    'path reconcile failed', 'warning');
++            } else {
++                _log($scfg, 2, 'debug', "[TrueNAS] status: path reconcile failed: $rep_err");
++            }
++        }
+     }
+ 
+     # An array that just refused to answer will refuse again a second later,
+@@ -7410,16 +7583,12 @@
+     # The cost is that recovery is noticed up to tn_status_probe_backoff_s
+     # late, which is a poll or two - against pvestatd going silent for the
+     # whole outage, that is a trade worth making.
+-    my $backoff = $scfg->{tn_status_probe_backoff_s};
+-    $backoff = 30 if !defined($backoff) || $backoff !~ /^\d+(?:\.\d+)?$/;
+-    if ($backoff > 0) {
+-        my $down_until = $_status_api_down{$host_key};
+-        if (defined($down_until) && time() < $down_until) {
+-            _log($scfg, 1, 'info', "[TrueNAS] status: '$storeid' reported inactive from "
+-                . "the recent-failure marker; not probing the API again for "
+-                . int($down_until - time()) . "s");
+-            return (0, 0, 0, 0);
+-        }
++    # $backoff is still needed further down, where the marker is WRITTEN.
++    my $backoff = _status_probe_backoff($scfg);
++    if (defined(my $left = _api_recently_down($scfg))) {
++        _log_api_down_note($scfg, 'status', $storeid, $left,
++            'reported inactive from the recent-failure marker');
++        return (0, 0, 0, 0);
+     }
+ 
+     # Bound the probe itself. This is deliberately far shorter than the budget
+@@ -7844,7 +8013,75 @@
+ 
+         # Ensure subsystem exists and connect
+         eval {
+-            _nvme_ensure_subsystem($scfg);
++            # storage_info() calls activate_storage() BEFORE status(), so the marker
++            # status() sets has to be honoured here too. Otherwise every pvestatd
++            # poll pays a full API timeout inside _nvme_ensure_subsystem() for as
++            # long as the array is unreachable, whatever tn_status_probe_backoff_s
++            # is set to. Measured 2026-08-23: 15 of 15 polls at ~10s each, while
++            # status() itself returned instantly from the marker.
++            #
++            # CAP the work; do NOT skip it. _nvme_ensure_subsystem() is the only
++            # periodic caller of _nvme_sync_portals(), which republishes ports the
++            # target lost - and that cache is invalidated exactly when a connect
++            # fails, which is precisely when we would have skipped. Skipping also
++            # stranded _nvme_ensure_host_registered() in whitelist mode, the one
++            # path that registers this node's NQN. A short deadline keeps the
++            # reconciliation while refusing to wait on a dead array.
++            # The ensure also gets its OWN eval, in both branches. It used to
++            # share one with _nvme_connect() below, so a die here took the
++            # connect with it - and connect is sysfs + nvme-cli, able to repair a
++            # portal with the API unreachable. That is precisely the correlated
++            # failure (array reboots, API and portals drop together) where
++            # reconnecting matters most, and it was the one case that never even
++            # got tried.
++            my $marker_left = _api_recently_down($scfg);
++            if (defined($marker_left)) {
++                _log_api_down_note($scfg, 'activate_storage', $storeid, $marker_left,
++                    'capping subsystem ensure at ' . API_DOWN_PROBE_BUDGET_S . 's');
++                local $_api_deadline = _capped_api_deadline();
++                eval { _nvme_ensure_subsystem($scfg) };
++            } else {
++                eval { _nvme_ensure_subsystem($scfg) };
++            }
++            if (my $ensure_err = $@) {
++                # Two different facts used to share one warning, and only one is
++                # news. A capped ensure running out of ITS OWN probe budget is
++                # the marker doing its job - throttle it like the marker's other
++                # notes, or a 10s-poll node emits a level-0 warning six times a
++                # minute for the whole outage. Anything else (401, DHCHAP
++                # mismatch, EINVAL...) is a real fault and keeps the loud path:
++                # mixing the two is how real faults hide inside expected noise.
++                my $excerpt = $ensure_err;
++                $excerpt =~ s/\s+/ /g;
++                $excerpt = substr($excerpt, 0, 160) . '...' if length($excerpt) > 160;
++                # Classify by the retry engine's own two death sentences - both
++                # self-generated, matched from the string START. Never by
++                # substrings of a foreign payload: a constraint error towing a
++                # Python traceback can contain the word "timeout", and that is
++                # the one error class the engine logs only at debug level, so
++                # misfiling it here erased its last visible trace. Wrapped or
++                # nested deaths ("failed to authorize host: Gave up on...")
++                # stay loud on purpose: they mean work beyond the probe died.
++                if (defined($marker_left)
++                    && $ensure_err =~ /^Gave up on |^Operation failed after \d+ retries: /) {
++                    _log_api_down_note($scfg, 'ensure-budget', $storeid, $marker_left,
++                        "subsystem ensure hit the probe budget ($excerpt); will retry next poll",
++                        'warning');
++                } elsif (defined($marker_left)) {
++                    # A real fault (wrapped death, auth failure, DHCHAP...) that
++                    # REPEATS while the marker stands: still a warning - the cause
++                    # rides in the excerpt - but throttled. Unthrottled, a 10s-poll
++                    # node re-prints it 6x/min for the whole outage (measured on
++                    # the self-heal path the narrowed reserve re-enabled), which
++                    # buries anything new. First occurrence still logs at once.
++                    _log_api_down_note($scfg, 'ensure-fault', $storeid, $marker_left,
++                        "subsystem ensure failed ($excerpt), still attempting connect",
++                        'warning');
++                } else {
++                    _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: subsystem "
++                        . "ensure failed for $storeid, still attempting connect: $ensure_err");
++                }
++            }
+             # Initial bring-up only. With nothing live yet _nvme_connect()
+             # attempts every configured portal regardless of mode, so this
+             # still establishes full redundancy on a cold start. Repairing a
+@@ -7855,7 +8092,11 @@
+             _nvme_connect($scfg);
+         };
+         if ($@) {
+-            _log($scfg, 1, 'warning', "[TrueNAS] activate_storage: NVMe/TCP subsystem connection failed for $storeid: $@");
++            # Level 0: this is the fail-open path (we still return 1 below), so the
++            # warning is the only thing standing between a half-activated storage
++            # and total silence. The rest of the file already logs its swallowed
++            # errors at 0; this one was missed.
++            _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: NVMe/TCP subsystem connection failed for $storeid: $@");
+         }
+     }
+ 

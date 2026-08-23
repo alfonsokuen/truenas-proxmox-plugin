@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_install:
+	dh_install --sourcedir=.
+	set -eu; \
+	DEB_VERSION="$$(dpkg-parsechangelog -S Version)"; \
+	: # Upstream trims at the first '+' so a +debN build reports the bare \
+	: # version. This build carries a +idkN suffix that identifies it, and \
+	: # dropping it would make an internal build indistinguishable from \
+	: # upstream's from inside PVE - which is the first thing anyone asks \
+	: # when a node misbehaves. \
+	PLUGIN_VERSION="$$DEB_VERSION"; \
+	STAGED_FILE='debian/truenas-proxmox-plugin/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm'; \
+	if [ ! -f "$$STAGED_FILE" ]; then \
+		echo "Missing staged plugin file: $$STAGED_FILE" >&2; \
+		exit 1; \
+	fi; \
+	PLUGIN_VERSION="$$PLUGIN_VERSION" perl -0pi -e 's/^our \x24VERSION = \x27[^\x27]*\x27;/our \x24VERSION = \x27$$ENV{PLUGIN_VERSION}\x27;/m;' "$$STAGED_FILE"
+	dh_perl

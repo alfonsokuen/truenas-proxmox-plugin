@@ -1,0 +1,51 @@
+# Cap the NVMe/TCP command size on fabric namespaces.
+#
+# WHY. The TrueNAS target advertises MDTS = 0 -- no limit -- so the command size
+# is decided entirely on the host: 1280 KB by default, and up to 16 MB on newer
+# kernels. nvmet_tcp on TrueNAS 25.10.x fails to map data buffers for very large
+# read commands and returns Internal Error, which surfaces as I/O errors during
+# vzdump and disk moves (upstream #45, and most likely the window in which the
+# corruption of #32 happened).
+#
+# WHY subsysnqn AND NOT transport. The obvious rule,
+#
+#     ATTRS{transport}=="tcp"
+#
+# never fires. With native multipath (nvme_core.multipath=Y) the transport
+# attribute lives on the per-path controllers (nvme0c0n1), not on the namespace
+# head (nvme0n1) that carries the queue limits. The head's parent exposes only
+# subsysnqn and model. A rule written that way installs cleanly, reports no
+# error, and does nothing at all -- verify, do not assume.
+#
+# WHY NOT a blanket nvme match. That would also throttle the node's local NVMe,
+# which is where local-lvm lives. The NQN match is what keeps this off it.
+#
+# MEASURED (lab, 3-node cluster, kernel 6.8 and 7.0.2-pve):
+#
+#     head 1280 / paths 1280  ->  actual request size 1024 KB
+#     head  128 / paths 1280  ->  actual request size  128 KB     <- this rule
+#     head  128 / paths  128  ->  actual request size  128 KB
+#
+# Setting it on the head is enough: it splits the bio before forwarding to the
+# path. Also verified to survive a full disconnect/reconnect of the subsystem,
+# which is what matters -- namespaces come and go.
+#
+# INSTALL
+#     cp 99-nvme-tcp-max-sectors.rules /etc/udev/rules.d/
+#     udevadm control --reload-rules
+#     udevadm trigger --subsystem-match=block --action=change
+#     cat /sys/block/<dev>/queue/max_sectors_kb        # must say 128
+#
+# The trigger applies it to already-connected namespaces, so no reboot and no
+# disconnect is needed. Confirm the value actually changed -- a rule that does
+# not match fails silently.
+#
+# ROLLBACK
+#     rm /etc/udev/rules.d/99-nvme-tcp-max-sectors.rules
+#     udevadm control --reload-rules
+#     echo 1280 > /sys/block/<dev>/queue/max_sectors_kb
+#
+# Adjust the NQN glob if the array's subsystem NQNs do not contain "truenas".
+
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", \
+  ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="128"
