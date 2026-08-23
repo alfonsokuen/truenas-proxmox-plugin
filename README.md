@@ -2,6 +2,24 @@
 
 <p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI or NVMe/TCP, featuring live snapshots, LXC container storage, ZFS integration, and cluster compatibility.</p>
 
+
+> ### This is a modified fork
+>
+> Fork of [truenas/truenas-proxmox-plugin](https://github.com/truenas/truenas-proxmox-plugin),
+> modified by **IDK MANAGER** in August 2026 (patch series `idk6`, `idk7` and `idk8`).
+> What differs from upstream, and why, is documented in [DIVERGENCE-IDK.md](DIVERGENCE-IDK.md).
+>
+> Two of the fixes in this fork are proposed back upstream in
+> [PR #95](https://github.com/truenas/truenas-proxmox-plugin/pull/95): iSCSI CHAP could not
+> work against TrueNAS SCALE 25.10 because discovery-CHAP became implicit and the main login
+> loop in `_iscsi_login_all` was dead code, so every session silently fell through to an
+> unauthenticated fallback.
+>
+> **Upstream does not support this copy.** Report anything you find here against this
+> repository, not against the TrueNAS project. Links to `truenas/...` further down this README
+> are upstream's own install instructions and are left as they are on purpose — installing
+> from them gives you upstream's build, not this one.
+
 ## Features
 
 - **Dual Transport Support** - iSCSI (traditional) or NVMe/TCP (lower latency) block storage
