@@ -1,3 +1,23 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk8b) unstable; urgency=medium
+
+  * iSCSI CHAP could not establish a single session against TrueNAS SCALE
+    25.10; both fixes are also proposed upstream as PR #95:
+    - Discovery now goes through iscsiadm discoverydb carrying the configured
+      CHAP credentials. 25.10 enforces discovery-CHAP implicitly as soon as
+      any iscsi auth group exists on the array (the per-portal
+      discovery_authmethod knob is gone from the API), and the old one-shot
+      discovery additionally reset the discoverydb record.
+    - _iscsi_login_all: list all nodes and filter by IQN, tolerating the
+      ",tpgt" suffix. `iscsiadm -m node -T <iqn>` prints the full node
+      record, not the "portal,tpgt iqn" list the loop parsed, so the main
+      login path was dead code and every session silently fell through to
+      the unauthenticated fallback. The retry fallback is CHAP-aware now.
+  * Package version now states the tree's full identity. No functional
+    change beyond the CHAP fixes: the resilience series described in the
+    previous entry already shipped in the +idk6 package.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Sun, 24 Aug 2026 09:30:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk6) unstable; urgency=medium
 
   Everything here came out of one fault injection: tools/i32-apiloss.sh, which
