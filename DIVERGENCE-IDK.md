@@ -61,3 +61,17 @@ forma literal, no por ERE — la version lleva `~` y `+`, que en una expresion r
 otra cosa y dejaban pasar cadenas que no eran la esperada. Lo destapo el workflow heredado de
 upstream al publicar el repo.
 
+## Capas base NO contabilizadas como serie (descubiertas 2026-08-26 al portar idk7 a upstream)
+El arbol del fork lleva, ademas de idk6/7/8, TRES capas previas sin serie propia que upstream
+(main v2.1.5) no tiene: (1) motor de reintentos con presupuesto wall-clock (`tn_api_budget_s`,
+`$_api_deadline`, mensaje "Gave up on..."); (2) whitelist NVMe + DH-HMAC-CHAP
+(`tn_nvme_allow_any_host`, `_nvme_reconcile_host_whitelist`, ~200 lineas); (3) reconciliacion
+de portales desde status() (`_nvme_connect(repair=>1)` en cada poll). El "2.1.24~alpha1" base
+fue bump PROPIO (la alpha upstream mas nueva es 2.1.23-alpha34) — estas capas son nuestras.
+
+## PRs/issues upstream (estado 2026-08-26)
+- PR #95 (OPEN): fixes CHAP iSCSI (idk8+idk8b).
+- Issue #96: bug del target nvmet (sc 0x6 en I/O 6-32MB bajo carga) + mitigacion max_sectors_kb.
+- PR #97 (OPEN): resiliencia con budget opt-in — port de idk7 piezas 1/3/5/6 + prerrequisitos
+  (motor budget behavior-neutral + marker). Piezas 2 y 4 fuera de alcance (dependen de las capas
+  self-heal y whitelist; candidatas a PRs futuros propios).
