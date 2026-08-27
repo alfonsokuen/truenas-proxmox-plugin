@@ -5380,7 +5380,7 @@ sub _nvme_get_subsystem_device_paths {
 # their own limit, so both are capped. sysfs is written directly: the
 # temp-file-and-rename of file_set_contents does not work there.
 sub _nvme_cap_max_io {
-    my ($scfg, @heads) = @_;
+    my ($scfg, $ctx, @heads) = @_;
 
     my $cap = $scfg->{tn_nvme_max_io_kb} // NVME_DEFAULT_MAX_IO_KB;
     return (0, 0, 0) if !$cap;
@@ -5415,7 +5415,15 @@ sub _nvme_cap_max_io {
             }
         }
     }
-    _log($scfg, 1, 'info', "[TrueNAS] nvme_cap_max_io: capped $changed of $total queue(s) at ${cap}KB" . ($failed ? ", $failed failed" : ''))
+    # In the periodic sweep every device is already capped, so anything that is
+    # not means something reset it (namespace revalidation, reconnect) - and a
+    # repair nobody sees is how the original data loss stayed invisible for two
+    # days. That is a warning. On first activation the device still carries the
+    # kernel default, so capping it is expected and only worth an info line.
+    my $drift = ($ctx // '') eq 'sweep' && $changed;
+    _log($scfg, ($drift ? 0 : 1), ($drift ? 'warning' : 'info'),
+         "[TrueNAS] nvme_cap_max_io: " . ($drift ? 'REPAIRED DRIFT on' : 'capped')
+         . " $changed of $total queue(s) at ${cap}KB" . ($failed ? ", $failed failed" : ''))
         if $changed || $failed;
     return ($changed, $failed, $total);
 }
@@ -8243,7 +8251,7 @@ sub activate_storage {
         # connect above - a cap that could not be written must not stop a VM.
         eval {
             my @heads = grep { m{^/dev/nvme\d+n\d+$} } _nvme_get_subsystem_device_paths($scfg);
-            _nvme_cap_max_io($scfg, @heads);
+            _nvme_cap_max_io($scfg, 'sweep', @heads);
             _nvme_warn_target_no_mdts($scfg, $storeid, $heads[0]) if @heads;
         };
         _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: request size cap sweep failed for $storeid: $@") if $@;
@@ -8546,7 +8554,7 @@ sub activate_volume {
             my $link = _nvme_wait_for_uuid_link($scfg, $device_uuid, $dev);
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: stable link ready at $link");
             # The device is about to carry I/O: cap it before qemu-img or QEMU opens it.
-            _nvme_cap_max_io($scfg, $dev);
+            _nvme_cap_max_io($scfg, 'activate', $dev);
         };
         if ($@) {
             my $err = $@;

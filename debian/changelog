@@ -25,6 +25,10 @@ truenas-proxmox-plugin (2.1.24~alpha1+idk9) unstable; urgency=medium
     (max_hw_sectors_kb = 2147483647), naming the cap that is standing in for it.
     The warning stops on its own the day the array declares a limit, which is
     the signal that the cap can be retired.
+  * The periodic sweep logs a repair as a warning ("REPAIRED DRIFT"), not as an
+    info line: in the sweep every device is already capped, so one that is not
+    means something reset it, and a repair nobody sees is how the original data
+    loss stayed invisible for two days. First-activation capping stays at info.
 
  -- IDKmanager <gerencia@idkmanager.com>  Thu, 27 Aug 2026 11:15:00 -0500
 
