@@ -1,3 +1,33 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk9) unstable; urgency=medium
+
+  * Cap the NVMe-oF request size from inside the plugin (new tn_nvme_max_io_kb,
+    default 1024 KiB). TrueNAS SCALE 25.10.4 exports NVMe/TCP with mdts=0
+    because nvmet-tcp in the Linux kernel defines no .get_mdts (nvmet_rdma_ops
+    does), so the initiator takes max_hw_sectors = UINT_MAX and merges requests
+    up to 32 MiB. On the target, nvmet_tcp_map_data() needs an order-5/6 kmalloc
+    for that request's SGL and fails it as NVME_SC_INTERNAL under memory
+    pressure -- silently, because of __GFP_NOWARN, and with a *generic* status,
+    which NVMe multipath does not fail over from. A 1 MiB request needs an
+    order-0 allocation, which is why the failure was intermittent rather than
+    deterministic. Measured 2026-08-27: 980 of ~1040 failed requests were
+    exactly 32 MiB, and a page-cached copy lost ~98 GiB of a 2 TiB disk while
+    qemu-img exited 0. Reported upstream as issue #96.
+    - Applied in activate_volume() before the device carries I/O, and swept in
+      activate_storage() on every poll, so a namespace revalidation (which
+      resets max_sectors_kb to the kernel default) is repaired within one cycle.
+    - Both the head and the path devices (nvmeXcYnZ) are capped: the bio-based
+      head only splits requests, the path devices re-merge up to their own
+      limit, so capping the head alone is cosmetic.
+    - Fail-open in both call sites: a cap that cannot be written logs a warning
+      and never blocks a VM start.
+    - Set tn_nvme_max_io_kb to 0 to disable once the array declares an MDTS.
+  * Warn once per boot and per storage when the target declares no MDTS
+    (max_hw_sectors_kb = 2147483647), naming the cap that is standing in for it.
+    The warning stops on its own the day the array declares a limit, which is
+    the signal that the cap can be retired.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Thu, 27 Aug 2026 11:15:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk8b) unstable; urgency=medium
 
   * iSCSI CHAP could not establish a single session against TrueNAS SCALE

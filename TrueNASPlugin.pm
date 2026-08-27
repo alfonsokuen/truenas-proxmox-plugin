@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.24~alpha1+idk8b';
+our $VERSION = '2.1.24~alpha1+idk9';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -111,6 +111,11 @@ use constant {
     DATASET_DELETE_TIMEOUT_S         => 30,  # dataset deletion job timeout (increased for reliability)
     DEVICE_CLEANUP_VERIFY_TIMEOUT_S  => 5,   # device cleanup verification timeout
     DATASET_DELETE_RETRY_COUNT       => 3,   # max retries for dataset deletion on "busy" errors
+
+    # NVMe-oF request size cap (KiB). See _nvme_cap_max_io().
+    NVME_DEFAULT_MAX_IO_KB           => 1024,
+    # What the kernel reports in max_hw_sectors_kb when the target declares mdts=0.
+    NVME_NO_MDTS_HW_SECTORS_KB       => 2147483647,
 };
 
 sub _cache_key {
@@ -682,6 +687,18 @@ sub properties {
                           "to 0 to probe on every poll. Default: 30.",
             type => 'integer', optional => 1, default => 30, minimum => 0, maximum => 600,
         },
+        tn_nvme_max_io_kb => {
+            description => "Cap every NVMe-oF namespace of this storage (head and path " .
+                          "devices) at this request size, in KiB, when a volume is " .
+                          "activated and on every storage poll. TrueNAS SCALE exports " .
+                          "NVMe/TCP with mdts=0 (the Linux nvmet-tcp target declares no " .
+                          "limit), so the initiator issues requests of up to 32 MiB and " .
+                          "the target fails them under memory pressure with a generic " .
+                          "status that multipath does not fail over from. Measured " .
+                          "2026-08-27: 32 MiB requests failed, 1 MiB never did. Set to 0 " .
+                          "once the array declares a limit. Default: 1024.",
+            type => 'integer', optional => 1, default => 1024, minimum => 0, maximum => 32768,
+        },
         tn_op_budget_s => {
             description => "Wall-clock ceiling, in seconds, for the API calls of one " .
                           "locked storage operation. tn_api_budget_s bounds a single " .
@@ -816,6 +833,7 @@ sub options {
         tn_api_retry_delay => { optional => 1 },
         tn_status_budget_s => { optional => 1 },
         tn_status_probe_backoff_s => { optional => 1 },
+        tn_nvme_max_io_kb => { optional => 1 },
         tn_op_budget_s => { optional => 1 },
         tn_api_budget_s => { optional => 1 },
         tn_broker_timeout => { optional => 1 },
@@ -5343,6 +5361,89 @@ sub _nvme_get_subsystem_device_paths {
     return @paths;
 }
 
+# ======== NVMe-oF request size cap (issue #96) ========
+# The target does not declare MDTS: nvmet-tcp in the Linux kernel has no
+# .get_mdts (RDMA does), so identify-controller says mdts=0 and the initiator
+# takes max_hw_sectors = UINT_MAX, merging up to 32 MiB per request. On the
+# target, nvmet_tcp_map_data() then needs an order-5/6 kmalloc for the SGL of
+# that request and fails it silently (__GFP_NOWARN) as NVME_SC_INTERNAL - a
+# generic status, so multipath does not fail over. A 1 MiB request needs an
+# order-0 allocation. Measured 2026-08-27 on TrueNAS 25.10.4: 980 of ~1040
+# failed requests were exactly 32 MiB; a copy through the page cache lost
+# ~98 GiB of a 2 TiB disk with exit 0.
+#
+# The cap is applied where the devices appear: activate_volume() for the
+# volume about to be used, and activate_storage() as a sweep on every poll,
+# so a namespace revalidation (which resets max_sectors_kb to the kernel
+# default) is repaired within one cycle. Capping the head alone is cosmetic:
+# the bio-based head only splits, the path devices (nvmeXcYnZ) re-merge up to
+# their own limit, so both are capped. sysfs is written directly: the
+# temp-file-and-rename of file_set_contents does not work there.
+sub _nvme_cap_max_io {
+    my ($scfg, @heads) = @_;
+
+    my $cap = $scfg->{tn_nvme_max_io_kb} // NVME_DEFAULT_MAX_IO_KB;
+    return (0, 0, 0) if !$cap;
+
+    my ($changed, $failed, $total) = (0, 0, 0);
+    for my $head (@heads) {
+        my $real = abs_path($head) // next;
+        my ($name, $subsys, $ns) = $real =~ m{^/dev/(nvme(\d+)n(\d+))$} ? ($1, $2, $3) : next;
+        for my $q ("/sys/block/$name/queue/max_sectors_kb",
+                   glob("/sys/block/nvme${subsys}c*n${ns}/queue/max_sectors_kb")) {
+            # Untaint: glob results are tainted under pvedaemon's -T.
+            next unless $q =~ m{^(/sys/block/nvme\d+(?:c\d+)?n\d+/queue/max_sectors_kb)$};
+            $q = $1;
+            next if !-w $q;
+            $total++;
+            my $cur = PVE::Tools::file_read_firstline($q) // '';
+            next if $cur eq $cap;
+            my $ok = eval {
+                open(my $fh, '>', $q) or die "$!\n";
+                print $fh "$cap\n" or die "$!\n";
+                close($fh) or die "$!\n";
+                1;
+            };
+            my $err = $@;
+            my $now = PVE::Tools::file_read_firstline($q) // '';
+            if ($ok && $now eq $cap) {
+                $changed++;
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_cap_max_io: $q $cur -> $cap");
+            } else {
+                $failed++;
+                _log($scfg, 0, 'warning', "[TrueNAS] nvme_cap_max_io: could not cap $q at ${cap}KB (reads '$now'): " . ($err || 'value did not stick'));
+            }
+        }
+    }
+    _log($scfg, 1, 'info', "[TrueNAS] nvme_cap_max_io: capped $changed of $total queue(s) at ${cap}KB" . ($failed ? ", $failed failed" : ''))
+        if $changed || $failed;
+    return ($changed, $failed, $total);
+}
+
+# Say once per boot, per storage, that the cap is standing in for a limit the
+# target should declare. The day the array starts declaring MDTS this stops
+# firing on its own, which is the signal that tn_nvme_max_io_kb can go to 0.
+sub _nvme_warn_target_no_mdts {
+    my ($scfg, $storeid, $head) = @_;
+
+    my $real = abs_path($head) // return;
+    my ($name) = $real =~ m{^/dev/(nvme\d+n\d+)$} or return;
+    my $hw = PVE::Tools::file_read_firstline("/sys/block/$name/queue/max_hw_sectors_kb") // return;
+    return if $hw ne NVME_NO_MDTS_HW_SECTORS_KB;
+
+    my ($sid) = $storeid =~ /^([\w\-.]+)$/ or return;
+    my $dir = '/run/truenas-plugin';
+    my $marker = "$dir/no-mdts.$sid";
+    return if -e $marker;
+    mkdir $dir if !-d $dir;
+    if (open(my $fh, '>', $marker)) { close($fh); }
+
+    my $cap = $scfg->{tn_nvme_max_io_kb} // NVME_DEFAULT_MAX_IO_KB;
+    _log($scfg, 0, 'warning', "[TrueNAS] $storeid: the target declares no MDTS (max_hw_sectors_kb=$hw); "
+        . ($cap ? "requests are capped at ${cap}KB by tn_nvme_max_io_kb" : "tn_nvme_max_io_kb is 0, requests are NOT capped")
+        . ". Once the array declares a limit, set tn_nvme_max_io_kb 0 (issue #96).");
+}
+
 # Check if any of the given device paths are in use by a running process.
 # Returns: 1 if any device is in use (unsafe to disconnect), 0 if all clear.
 sub _nvme_check_devices_in_use {
@@ -8135,6 +8236,17 @@ sub activate_storage {
             # errors at 0; this one was missed.
             _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: NVMe/TCP subsystem connection failed for $storeid: $@");
         }
+
+        # Every poll passes through here (storage_info() activates before
+        # status()), which makes this the cheapest periodic sweep there is:
+        # ~140 sysfs reads per cycle, writes only on drift. Fail-open like the
+        # connect above - a cap that could not be written must not stop a VM.
+        eval {
+            my @heads = grep { m{^/dev/nvme\d+n\d+$} } _nvme_get_subsystem_device_paths($scfg);
+            _nvme_cap_max_io($scfg, @heads);
+            _nvme_warn_target_no_mdts($scfg, $storeid, $heads[0]) if @heads;
+        };
+        _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: request size cap sweep failed for $storeid: $@") if $@;
     }
 
     return 1;
@@ -8433,6 +8545,8 @@ sub activate_volume {
             # block device exists. Activation is not done until it is there.
             my $link = _nvme_wait_for_uuid_link($scfg, $device_uuid, $dev);
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: stable link ready at $link");
+            # The device is about to carry I/O: cap it before qemu-img or QEMU opens it.
+            _nvme_cap_max_io($scfg, $dev);
         };
         if ($@) {
             my $err = $@;
