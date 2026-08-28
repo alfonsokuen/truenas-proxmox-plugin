@@ -51,9 +51,15 @@ To: hch@lst.de, sagi@grimberg.me, kch@nvidia.com — cc linux-nvme, linux-kernel
 - Sent with `git send-email`, `Content-Transfer-Encoding: 8bit`, `From` matching the
   `Signed-off-by` (DCO wants a real personal name, not a company handle).
 
-While preparing it: `nvmet_pci_epf_ops` has gained a `.get_mdts`, so TCP is now the only
-transport without one. That is in the submission — it makes the omission look like an
-oversight rather than a decision.
+A claim I got wrong, and had to retract publicly (issuecomment-5458913439): I said TCP was
+the only transport without a `.get_mdts`. Checked properly against `548e7bcd0c54`, three
+lack it -- `fc.c`, `loop.c` and `tcp.c` -- while `rdma.c` and `pci-epf.c` have it. I had
+grepped only the transports I already had in mind and generalised from that sample. The
+accurate framing is that the mechanism was added for RDMA in 2020 and never generalised,
+not that TCP was singled out.
+
+The patch as sent does not carry the claim -- it says the 2020 series "deliberately left
+other transports untouched", which is correct -- so nothing needed correcting on the list.
 
 ## Still owed
 
