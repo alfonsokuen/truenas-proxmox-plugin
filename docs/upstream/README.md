@@ -36,11 +36,12 @@ August 2026, and what is still pending.
   32 MiB, ~98 GiB lost from a 2 TiB copy) is the part a maintainer cannot reproduce on their
   own, and it is what distinguishes this from a theoretical cleanup.
 
-- **iXsystems ticket** — ship the kernel fix in the TrueNAS SCALE kernel, or document the
-  initiator-side mitigation. Issue #96 covers the technical content; the vendor channel is
-  a separate step.
+- **iXsystems ticket** — draft in `ixsystems-ticket.md`. Issue #96 already carries the
+  technical content; this is the vendor channel, asking them to carry the kernel patch or
+  document the mitigation in a release note. Needs an iXsystems support/Jira account;
+  not filed.
 
-- **Proxmox** — `PVE/QemuServer/QemuImage.pm` should pass `-t none` for any block
-  destination, not only `zfspool`. This is the highest-impact of the three: it affects
-  iSCSI, FC, LVM over SAN and every third-party storage plugin, and it is the difference
-  between silent corruption and a failed task. Not reported yet.
+- **Proxmox** — draft in `proxmox-qemu-img-cache-unsafe.md`, re-verified 2026-08-28 against
+  `qemu-server 9.1.18`: the gap is still there, and line 122 has the same problem for the
+  *source* cache. Highest impact of the three. Needs a Bugzilla account or a pve-devel post;
+  not filed.
