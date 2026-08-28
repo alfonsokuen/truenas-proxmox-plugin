@@ -1,61 +1,63 @@
 # Upstream reports
 
 What was sent outside this repository about the NVMe/TCP corruption investigated in
-August 2026, and what is still pending.
+August 2026.
 
-## Sent
+## Sent, 2026-08-28
 
-- **truenas/truenas-proxmox-plugin issue #96** — root-cause write-up, posted 2026-08-28:
-  https://github.com/truenas/truenas-proxmox-plugin/issues/96#issuecomment-5455179449
+### 1. truenas/truenas-proxmox-plugin issue #96 — root cause
 
-  Covers both bugs: `nvmet-tcp` advertising `mdts=0` (so initiators merge to 32 MiB and the
-  target's order-5/6 SGL allocation fails silently under `__GFP_NOWARN`, with a *generic*
-  status multipath will not fail over), and `qemu-img convert` running with
-  `--target-cache unsafe` for every PVE block storage that is not `zfspool`, which turns a
-  lost write into `TASK OK`.
+https://github.com/truenas/truenas-proxmox-plugin/issues/96#issuecomment-5455179449
 
-## Ready to send, not sent
+Both bugs: `nvmet-tcp` advertising `mdts=0` (so initiators merge to 32 MiB and the
+target's order-5/6 SGL allocation fails silently under `__GFP_NOWARN`, with a *generic*
+status multipath will not fail over), and `qemu-img convert` running with
+`--target-cache unsafe` for every PVE block storage that is not `zfspool`, which turns a
+lost write into `TASK OK`.
 
-### `0001-nvmet-tcp-report-a-bounded-MDTS-instead-of-no-limit.patch`
+The maintainer (johntdavis84) replied the same day asking whether the other channels had
+been opened, and routed the kernel fix to the nvme-cli repo — which is wrong, `.get_mdts`
+lives in `drivers/nvme/target/tcp.c`. Answered at:
 
-Adds `.get_mdts` to `nvmet_tcp_ops`, returning the same 1 MiB (`2^8 * 4KB`) that
-`nvmet-rdma` has advertised since 2020. **This one is genuinely submittable**: generated
-with `git format-patch` against a real tree, not hand-written.
+https://github.com/truenas/truenas-proxmox-plugin/issues/96#issuecomment-5458394213
+
+### 2. Proxmox — `pve-devel@lists.proxmox.com`
+
+Subject: *qemu-img convert runs with cache=unsafe for every block storage except zfspool*
+Message-ID: `<178795574681.28052.11392785472014160013@idkmanager.com>`
+
+Content as in `proxmox-qemu-img-cache-unsafe.md`, re-verified against `qemu-server 9.1.18`
+before sending: `QemuImage.pm:149` still gates `-t none` on `zfspool` alone, and line 122
+does the same for the source cache (`-T`). Offered to refile in Bugzilla if the list is the
+wrong venue.
+
+Worth remembering if this stalls: Proxmox patch their own kernel while waiting on upstream,
+so this channel can bear fruit before the kernel patch does.
+
+### 3. Kernel — `linux-nvme` + LKML
+
+Subject: *[PATCH] nvmet-tcp: report a bounded MDTS instead of "no limit"*
+Message-ID: `<20260828222356.1264-1-gerencia@idkmanager.com>`
+To: hch@lst.de, sagi@grimberg.me, kch@nvidia.com — cc linux-nvme, linux-kernel.
+
+`0001-nvmet-tcp-report-a-bounded-MDTS-instead-of-no-limit.patch`, kept here as sent.
 
 - Base: mainline `548e7bcd0c5460ddcbca9600cea603ebeebf4da7`.
-- `checkpatch.pl --strict`: **0 errors, 0 warnings, 0 checks**.
-- Compiles clean, including `make W=1`; `nvmet_tcp_get_mdts` verified present in
-  `tcp.o`.
-- The bug was re-confirmed in that tree: `nvmet_tcp_ops` has no `.get_mdts`, while both
-  `nvmet_rdma_ops` and `nvmet_pci_epf_ops` do — TCP is the only transport left without one.
-- Signature checked against `nvmet.h:432`; the value is combined with any port-configured
-  mdts through `min_not_zero()` (`nvmet.h:783`), so an administrator's lower limit still
-  wins.
+- `checkpatch.pl --strict`: 0 errors, 0 warnings, 0 checks.
+- Compiles clean including `make W=1`; `nvmet_tcp_get_mdts` verified present in `tcp.o`.
+- Signature checked against `nvmet.h:432`; `nvmet_ctrl_mdts()` combines the value with any
+  port-configured mdts through `min_not_zero()` (`nvmet.h:783`), so an administrator's
+  lower limit still wins.
+- Sent with `git send-email`, `Content-Transfer-Encoding: 8bit`, `From` matching the
+  `Signed-off-by` (DCO wants a real personal name, not a company handle).
 
-Recipients, from `scripts/get_maintainer.pl`:
+While preparing it: `nvmet_pci_epf_ops` has gained a `.get_mdts`, so TCP is now the only
+transport without one. That is in the submission — it makes the omission look like an
+oversight rather than a decision.
 
-```
-git send-email \
-  --to=hch@lst.de \
-  --to=sagi@grimberg.me \
-  --to=kch@nvidia.com \
-  --cc=linux-nvme@lists.infradead.org \
-  --cc=linux-kernel@vger.kernel.org \
-  0001-nvmet-tcp-report-a-bounded-MDTS-instead-of-no-limit.patch
-```
+## Still owed
 
-Note the `Signed-off-by` uses a real personal name, which the DCO requires — a company
-handle would get the patch bounced. Rebase onto current mainline (or the `nvme` tree) and
-re-run `checkpatch.pl` if it sits here for more than a few weeks.
-
-## Not sent, needs an account
-
-- **Proxmox** — draft in `proxmox-qemu-img-cache-unsafe.md`, re-verified 2026-08-28 against
-  `qemu-server 9.1.18`: the gap is still there, and line 122 has the same problem for the
-  *source* cache. **Highest impact of the three** — it affects every block destination, not
-  just this plugin's — and the only one nobody has been told about. Needs a Bugzilla
-  account (https://bugzilla.proxmox.com) or a post to `pve-devel@lists.proxmox.com`.
-
-- **iXsystems** — draft in `ixsystems-ticket.md`. Issue #96 already carries the technical
-  content; this is the vendor channel, asking them to carry the kernel patch or document
-  the mitigation in a release note. Needs an iXsystems support/Jira account.
+- **iXsystems** — draft in `ixsystems-ticket.md`, not filed. Needs a support/JIRA account;
+  the maintainer confirmed iX require a JIRA report even for issues raised on a repo they
+  watch. When filing, cite the build the mitigation was measured on: **`2.1.24~alpha1+idk10`**
+  — note the worktree and branch are still named `idk9`, the version is not.
