@@ -1,3 +1,44 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk10) unstable; urgency=medium
+
+  * Declare storage API version 15 and honour its contract. PVE 9.2.4 ships
+    APIVER 15 while the plugin declared 14, so every plugin load emitted
+    "implementing an older storage API". The warning was cosmetic -- APIAGE 6
+    puts the floor at 9 -- but it was covering two real defects.
+  * volume_resize(): reject a snapshot target explicitly instead of resizing
+    the live zvol. APIVER 15 added an optional $snapname argument
+    (libpve-storage-perl 9.1.6: "the new optional 'snapname' parameter of
+    volume_resize() and the new 'virtual-size' field returned by
+    volume_snapshot_info()"). The signature captured (..., $new_size_bytes,
+    @rest) and swallowed it, so a caller passing $snapname would have grown the
+    live volume with no error at all. The path is unreachable today -- it needs
+    'snapshot-as-volume-chain', which needs volume_qemu_snapshot_method eq
+    'mixed', and this plugin is raw-only and reports 'storage' -- but
+    unreachable by configuration is not the same as safe, and the failure mode
+    was silent corruption. Snapshots here are native ZFS and immutable, so
+    resizing one is refused with a clear message rather than emulated.
+    volume_snapshot_info() already satisfies the contract that applies to it:
+    the POD documents a separate, smaller shape for replication ('id' and
+    'timestamp'), and 'virtual-size' is only consumed on volume-chain storages.
+  * api(): clamp the declared version to the host's, fixing a regression that
+    kept the plugin from loading at all on older PVE. The three-branch
+    negotiation returned $TESTED_APIVER unclamped whenever the host reported
+    below APIVER 11, and PVE aborts the load -- not warns -- when a plugin
+    claims a version above the host's. On PVE that shipped APIVER 10 ("bump
+    plugin APIVER (10) and APIAGE (1)") the plugin therefore refused to load,
+    despite a header comment claiming PVE 8.x support. The mismatch is
+    asymmetric: overclaiming costs the whole storage, underclaiming costs one
+    log line. A plain min(host, tested) is correct on every version, including
+    hosts newer than us, where PVE now reports our real version instead of a
+    hardcoded 11. New test t/nvme/16-api-version-clamp.t covers APIVER 9 to 20;
+    it fails 7 of 16 against the previous logic.
+  * get_identity() is deliberately left unimplemented. It arrived in APIVER 14
+    and PVE calls it without a version gate, but the base class implementation
+    is a die() and only PBSPlugin overrides it -- dir, nfs, lvm, zfs and iscsi
+    all behave the same way in stock PVE. Implementing it would mean inventing
+    an identity format with no consumer.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Fri, 28 Aug 2026 11:40:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk9) unstable; urgency=medium
 
   * Cap the NVMe-oF request size from inside the plugin (new tn_nvme_max_io_kb,

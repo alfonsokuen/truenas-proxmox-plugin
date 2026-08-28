@@ -4,9 +4,9 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.24~alpha1+idk9';
+our $VERSION = '2.1.24~alpha1+idk10';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 14;
+our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -467,25 +467,24 @@ sub _retry_with_backoff {
 # Storage API version - dynamically adapts to PVE version
 # Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 14)
 sub api {
-    my $tested_apiver = $TESTED_APIVER;  # Latest tested version (PVE 9.x)
+    # Declare the newest API we are validated against, clamped to what the host
+    # actually implements. The asymmetry matters: PVE aborts the plugin load
+    # outright when a plugin claims a version ABOVE the host's APIVER, and only
+    # warns when the claim is merely below it. Overclaiming costs the whole
+    # storage; underclaiming costs a log line.
+    #
+    # The previous three-branch negotiation returned $TESTED_APIVER unclamped
+    # whenever the host was below 11, so on every PVE that shipped APIVER 10 or
+    # 9 this plugin refused to load - the exact opposite of the backward
+    # compatibility it was written for. A plain min() is correct on every host
+    # version, including hosts newer than us: there we return $TESTED_APIVER and
+    # PVE decides, reporting our real version if it is too old to accept.
+    my $system_apiver = eval { require PVE::Storage; PVE::Storage::APIVER() };
 
-    # Get current system API version (safely, as PVE::Storage may not be loaded yet)
-    my $system_apiver = eval { require PVE::Storage; PVE::Storage::APIVER() } // 11;
-    my $system_apiage = eval { PVE::Storage::APIAGE() } // 2;
+    # PVE::Storage unavailable (out-of-tree use, unit tests): nothing to clamp to.
+    return $TESTED_APIVER if !defined($system_apiver);
 
-    # If system API is within our tested range, return system version
-    # This ensures we never claim a higher version than the system supports
-    if ($system_apiver >= 11 && $system_apiver <= $tested_apiver) {
-        return $system_apiver;
-    }
-
-    # If we're within APIAGE of tested version, return tested version
-    if ($system_apiver - $system_apiage < $tested_apiver) {
-        return $tested_apiver;
-    }
-
-    # Fallback for very old systems (shouldn't happen with PVE 7+)
-    return 11;
+    return $system_apiver < $TESTED_APIVER ? $system_apiver : $TESTED_APIVER;
 }
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
@@ -2413,7 +2412,21 @@ sub volume_has_feature {
 
 # Grow-only resize of a raw iSCSI-backed zvol, with TrueNAS 80% preflight and initiator rescan.
 sub volume_resize {
-    my ($class, $scfg, $storeid, $volname, $new_size_bytes, @rest) = @_;
+    my ($class, $scfg, $storeid, $volname, $new_size_bytes, $running, $snapname) = @_;
+
+    # Storage APIVER 15: volume_resize() gained an optional $snapname argument
+    # (resize a snapshot volume; only reachable on 'snapshot-as-volume-chain'
+    # storages via the qemu 'mixed' snapshot method). This plugin uses native
+    # ZFS snapshots (immutable) and always reports the 'storage' method, so a
+    # snapshot target is unsupported: refuse loudly instead of silently
+    # resizing the live zvol.
+    die "resizing a snapshot is not supported on storage type '" . $class->type() . "'\n"
+        if defined($snapname);
+
+    # $running is intentionally not special-cased: growing the backing zvol is
+    # safe while the guest runs; qemu-server follows up with a block_resize QMP
+    # command and the initiator-side rescan below makes the new size visible.
+
     # Parse our custom volname: "vol-<zname>-lun<N>"
     my (undef, $zname, undef, undef, undef, undef, $fmt, $lun) =
         $class->parse_volname($volname);
