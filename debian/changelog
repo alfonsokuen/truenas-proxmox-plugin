@@ -1,3 +1,35 @@
+truenas-proxmox-plugin (2.1.24~alpha1+idk11) unstable; urgency=medium
+
+  * volume_resize(): test $snapname for truth, not defined(). PVE's base plugin
+    and every native one that refuses a snapshot resize use truthiness
+    (Plugin.pm:1368, BTRFSPlugin.pm:503, LvmThinPlugin.pm:362), so an empty
+    string means "no snapshot" everywhere else in the stack while this guard
+    treated it as one. Unreachable in practice - the only caller that passes
+    $snapname is QemuServer.pm on volume-chain storages, and it passes a real
+    name - but a guard whose semantics differ from the code it stands in for is
+    wrong in whichever direction it diverges, and this one diverged silently.
+    Found by writing the regression test the guard shipped without.
+  * t/nvme/17-resize-snapshot-guard.t: the test +idk10 should have had. An audit
+    deleted the guard's die() and all 348 tests stayed green. This one goes red:
+    with the guard removed, 3 of its 6 assertions fail. Note assertion 1 passes
+    either way - volume_resize dies regardless, just later, on the missing
+    config - which is why assertions 2 and 3 pin down *why* it died. A test that
+    only checked "it dies" would have been decorative.
+  * t/nvme/16-api-version-clamp.t: fail instead of skipping when the plugin does
+    not load. The probe treated every subprocess failure as "no PVE on this box"
+    and sent the child's stderr to /dev/null, so a plugin with a syntax error, a
+    missing module, or a die in api() reported skip_all / NOTESTS / exit 0.
+    Verified by mutation: injecting an unresolvable `use` made the suite green.
+    Now only the three PVE modules the plugin loads at startup earn a skip;
+    anything else fails and prints the child's stderr. A new assertion covers
+    the distinction itself.
+  * Fix two comments that described the code wrongly. api() claimed PVE "only
+    warns when the claim is merely below" the host's APIVER - it also dies below
+    APIVER - APIAGE; the window is closed on both sides. And the header still
+    advertised "PVE 9.x (APIVER 14)" after TESTED_APIVER went to 15.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Fri, 29 Aug 2026 00:35:00 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk10) unstable; urgency=medium
 
   * Declare storage API version 15 and honour its contract. PVE 9.2.4 ships

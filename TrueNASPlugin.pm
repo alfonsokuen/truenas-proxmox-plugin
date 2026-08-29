@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.24~alpha1+idk10';
+our $VERSION = '2.1.24~alpha1+idk11';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -464,14 +464,15 @@ sub _retry_with_backoff {
 }
 
 # ======== Storage plugin identity ========
-# Storage API version - dynamically adapts to PVE version
-# Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 14)
+# Storage API version - clamped to whatever the host implements. See api().
 sub api {
     # Declare the newest API we are validated against, clamped to what the host
-    # actually implements. The asymmetry matters: PVE aborts the plugin load
-    # outright when a plugin claims a version ABOVE the host's APIVER, and only
-    # warns when the claim is merely below it. Overclaiming costs the whole
-    # storage; underclaiming costs a log line.
+    # actually implements. PVE's loader accepts a claim only inside
+    # [APIVER - APIAGE, APIVER]: above that range it dies ("newer than current"),
+    # below it, it also dies ("too old"), and inside the range it merely warns
+    # when the claim is not exactly APIVER. So the cost is asymmetric only at the
+    # top: overclaiming by one loses the whole storage, while underclaiming costs
+    # a log line right up until it falls out of the APIAGE window.
     #
     # The previous three-branch negotiation returned $TESTED_APIVER unclamped
     # whenever the host was below 11, so on every PVE that shipped APIVER 10 or
@@ -2420,8 +2421,13 @@ sub volume_resize {
     # ZFS snapshots (immutable) and always reports the 'storage' method, so a
     # snapshot target is unsupported: refuse loudly instead of silently
     # resizing the live zvol.
+    # Truthiness, not defined(): PVE's base plugin and every native one that
+    # refuses a snapshot resize tests $snapname for truth (Plugin.pm:1368,
+    # BTRFSPlugin.pm:503, LvmThinPlugin.pm:362), so an empty string means "no
+    # snapshot" everywhere else in the stack. A guard whose semantics differ from
+    # the code it stands in for is wrong in whichever direction it diverges.
     die "resizing a snapshot is not supported on storage type '" . $class->type() . "'\n"
-        if defined($snapname);
+        if $snapname;
 
     # $running is intentionally not special-cased: growing the backing zvol is
     # safe while the guest runs; qemu-server follows up with a block_resize QMP
