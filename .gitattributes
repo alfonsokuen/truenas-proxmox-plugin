@@ -1,0 +1,3 @@
+# Los .patch se envian a listas de correo: CRLF rompe `git am`.
+*.patch -text
+*.mbox -text

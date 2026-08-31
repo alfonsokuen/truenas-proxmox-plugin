@@ -1,0 +1,104 @@
+From edb3a73025039a75d0d0b6b45808dd0203e479a2 Mon Sep 17 00:00:00 2001
+From: Alfonso Kuen <gerencia@idkmanager.com>
+Date: Fri, 28 Aug 2026 15:01:47 -0500
+Subject: [PATCH v3] nvmet-tcp: report a bounded MDTS instead of "no limit"
+
+nvmet-tcp does not implement .get_mdts, so nvmet_ctrl_mdts() falls back
+to the port value (0 by default) and identify-controller advertises "no
+maximum data transfer size". The initiator believes it:
+nvme_init_ctrl_finish() sets max_hw_sectors to UINT_MAX.
+
+What the initiator then issues is decided by the block layer. The
+generic cap is 4 MiB (BLK_DEF_MAX_SECTORS_CAP), but a namespace that
+advertises a large NOWS raises it: blk_validate_limits() takes
+max_sectors from io_opt once io_opt exceeds that cap. On the array we
+measured, NOWS is 65535, so io_opt is 32 MiB and the initiator emitted
+32 MiB commands -- from a controller that advertised no MDTS at all.
+
+The target cannot serve those, in one of two ways depending on the
+kernel.
+
+Since commit 4a3f00262a04 ("nvmet-tcp: bound SGL data length before
+allocating command buffers"), nvmet_tcp_map_data() rejects any len above
+NVMET_TCP_MAXH2CDATA (4 MiB) with NVME_SC_SGL_INVALID_DATA | DNR, so the
+command fails hard and deterministically. That is the right response to
+an oversized command, but the initiator had no way to avoid sending it:
+nothing advertised the limit it was exceeding.
+
+Before that commit the command reached sgl_alloc(), which for 32 MiB
+needs 8192 scatterlist entries -- 256 KiB, an order-6 kmalloc. Under
+fragmentation that fails, and it surfaces as NVME_SC_INTERNAL, a generic
+status, so NVMe multipath does not fail the command over to another
+path. A 1 MiB command needs 256 entries, 8 KiB, served from the
+kmalloc-8k slab, which does not fail. That failure mode is intermittent
+and load-dependent rather than deterministic; on a vendor kernel
+predating the bound it cost us roughly 98 GiB of a 2 TiB image copy,
+with the copy tool exiting 0.
+
+Commit ec6d20e16c2d ("nvmet-rdma: Implement get_mdts controller op")
+left the other transports untouched. Do the same for TCP, using the
+same 1 MiB value, so initiators size their commands to something the
+target accepts instead of discovering the limit by failing.
+
+Signed-off-by: Alfonso Kuen <gerencia@idkmanager.com>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+---
+Changes in v3:
+- Cite the RDMA change as commit ec6d20e16c2d ("nvmet-rdma: Implement
+  get_mdts controller op") rather than by patch title, per Sagi's review.
+- Pick up Sagi's Reviewed-by.
+- No functional change: the diff is byte-identical to v1 and v2.
+
+Changes in v2:
+- Rewrite the rationale. v1 described the sgl_alloc() order-6 failure as
+  current behaviour; since 4a3f00262a04 that path is unreachable and an
+  oversized command is rejected earlier with SGL_INVALID_DATA | DNR. Both
+  failure modes are now described, and which kernels see which.
+- v1 attributed the 32 MiB command size to a "generic 32 MiB ceiling" in
+  the block layer. The generic cap is 4 MiB; the 32 MiB came from the
+  target's own NOWS raising io_opt. Corrected -- and it sharpens the
+  point, since the same controller advertises an optimal I/O size it
+  cannot serve.
+- v1 called the 1 MiB SGL an order-0 allocation; it is 8 KiB.
+- No functional change: the diff is byte-identical to v1.
+
+ drivers/nvme/target/tcp.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/nvme/target/tcp.c b/drivers/nvme/target/tcp.c
+index e4f603b2a..414ba896e 100644
+--- a/drivers/nvme/target/tcp.c
++++ b/drivers/nvme/target/tcp.c
+@@ -23,6 +23,9 @@
+ #include "nvmet.h"
+ 
+ #define NVMET_TCP_DEF_INLINE_DATA_SIZE	(4 * PAGE_SIZE)
++
++/* Assume mpsmin == device_page_size == 4KB */
++#define NVMET_TCP_MAX_MDTS		8
+ #define NVMET_TCP_MAXH2CDATA		0x400000 /* 16M arbitrary limit */
+ #define NVMET_TCP_BACKLOG 128
+ 
+@@ -2243,6 +2246,11 @@ static ssize_t nvmet_tcp_host_port_addr(struct nvmet_ctrl *ctrl,
+ 			(struct sockaddr *)&queue->sockaddr_peer);
+ }
+ 
++static u8 nvmet_tcp_get_mdts(const struct nvmet_ctrl *ctrl)
++{
++	return NVMET_TCP_MAX_MDTS;
++}
++
+ static const struct nvmet_fabrics_ops nvmet_tcp_ops = {
+ 	.owner			= THIS_MODULE,
+ 	.type			= NVMF_TRTYPE_TCP,
+@@ -2254,6 +2262,7 @@ static const struct nvmet_fabrics_ops nvmet_tcp_ops = {
+ 	.install_queue		= nvmet_tcp_install_queue,
+ 	.disc_traddr		= nvmet_tcp_disc_port_addr,
+ 	.host_traddr		= nvmet_tcp_host_port_addr,
++	.get_mdts		= nvmet_tcp_get_mdts,
+ };
+ 
+ static int __init nvmet_tcp_init(void)
+-- 
+2.47.3
+
