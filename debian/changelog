@@ -1,3 +1,43 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk12) unstable; urgency=medium
+
+  * La version declarada era falsa en dos direcciones a la vez, y una de ellas
+    era un riesgo vivo de produccion.
+
+    (1) Base inventada. El arbol declaraba 2.1.24~alpha1, pero upstream NUNCA
+    publico un 2.1.24: sus tags llegan a v2.1.23-alpha36 y hoy 2026-09-02 a
+    v2.1.23-beta1. Medido por distancia de contenido, nuestra base real es
+    2.1.23~alpha1 (2649 lineas de diferencia, contra 4294 frente a beta1). El
+    numero no nos situaba 4 releases por detras sino ~35, afirmando lo
+    contrario: dpkg --compare-versions ordenaba 2.1.24~alpha1+idk11 POR ENCIMA
+    de alpha36 y de beta1.
+
+    (2) Paquete y fichero divergentes. dpkg registraba idk10 mientras el .pm
+    instalado en pve1/pve2/pve3 declaraba y contenia idk11: alguien copio el
+    modulo sobre un fichero gestionado por dpkg. `dpkg -V` lo confirma en los
+    tres nodos (??5?????? sobre TrueNASPlugin.pm). Consecuencia: cualquier
+    apt upgrade, apt install --reinstall o resolucion de dependencias que
+    tocara el paquete habria restaurado idk10 ENCIMA de idk11 en silencio,
+    revirtiendo en produccion el cap de tamano de peticion de NVMe (idk9) y
+    los arreglos posteriores. Esta version se instala como paquete para que
+    dpkg, el fichero y el arbol vuelvan a coincidir.
+
+  * Epoch 1: es solo metadato de empaquetado y no forma parte de la identidad
+    del plugin ($VERSION en el .pm sigue siendo 2.1.23~alpha1+idk12, sin epoch).
+    Cumple dos funciones. Permite corregir la numeracion a la baja sin que dpkg
+    lo trate como downgrade frente al 2.1.24 instalado. Y sobre todo, el repo
+    apt de upstream ESTA configurado en los nodos
+    (/etc/apt/sources.list.d/truenas-proxmox-plugin.sources, hoy ofreciendo
+    2.1.17+deb1): sin epoch, en cuanto upstream publique 2.1.23~beta1 o
+    superior en ese repo, un apt upgrade sustituiria nuestro fork por el suyo
+    y se llevaria todo el trabajo idk. Verificado en Debian real (dpkg 1.22.22,
+    pve1): 1:2.1.23~alpha1+idk12 ordena por encima de 2.1.24~alpha1+idk10,
+    2.1.17+deb1, 2.1.23~beta1 y 2.1.99, y por debajo de un futuro +idk13.
+
+  * Sin cambios de comportamiento: el unico delta de codigo frente a idk11 es
+    la cadena de version y su comentario.
+
+ -- IDKmanager <gerencia@idkmanager.com>  Wed, 02 Sep 2026 09:53:59 -0500
+
 truenas-proxmox-plugin (2.1.24~alpha1+idk11) unstable; urgency=medium
 
   * volume_resize(): test $snapname for truth, not defined(). PVE's base plugin

@@ -3,8 +3,12 @@ use v5.36;
 use strict;
 use warnings;
 
-# Plugin Version
-our $VERSION = '2.1.24~alpha1+idk11';
+# Plugin Version. Base upstream real: 2.1.23~alpha1 -- el "2.1.24" que este
+# fork declaro hasta idk11 NUNCA existio en upstream y ordenaba por ENCIMA de
+# todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
+# el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
+# de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
+our $VERSION = '2.1.23~alpha1+idk12';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
