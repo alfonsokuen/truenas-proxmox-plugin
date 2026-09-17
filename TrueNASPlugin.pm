@@ -130,6 +130,7 @@ sub _cache_key {
 # Returns the cache host key for a storage config (api_host preferred, storeid fallback)
 sub _cache_host_key {
     my ($scfg) = @_;
+    _scfg_accept_legacy_keys($scfg);
     return $scfg->{tn_api_host} || $scfg->{storeid} || 'unknown';
 }
 
@@ -2072,20 +2073,27 @@ sub _delete_dataset_with_retry {
 # $opts is an optional hashref with:
 #   - retry_opts: options passed to _retry_with_backoff
 # Upstream's `main` install.sh (the curl one-liner in every README) still
-# builds the scfg it hands us with the pre-2.1.23 field names: api_host,
-# api_key, api_scheme, api_port, api_insecure, prefer_ipv4. Every code path
-# here reads the tn_* names, so that wizard reached the broker with no host
-# and no key and failed with "scfg missing api_host/api_key" although the
-# network and the key were fine. Accept the old names as a fallback, tn_*
-# always wins. storage.cfg stanzas never carry both: the postinst migration
-# renames them.
-my %_LEGACY_API_KEYS = map { ("tn_$_" => $_) }
-    qw(api_host api_key api_scheme api_port api_insecure prefer_ipv4);
-sub _scfg_accept_legacy_api_keys($scfg) {
+# builds the scfg it hands us with the pre-2.1.23 field names (api_host,
+# api_key, dataset, target_iqn, discovery_portal, ...). Every code path here
+# reads the tn_* names, so that wizard reached the broker with no host and no
+# key, and _ensure_target_visible with no target. Accept the old names as a
+# fallback, tn_* always wins. The list is the one the postinst migration
+# renames; storage.cfg stanzas never carry both.
+my %_LEGACY_KEYS = map { ("tn_$_" => $_) } qw(
+    api_host api_key api_scheme api_transport api_port api_insecure
+    api_retry_max api_retry_delay prefer_ipv4 dataset zvol_blocksize
+    compression transport_mode target_iqn discovery_portal portals
+    use_multipath force_delete_on_inuse logout_on_free use_by_path
+    ipv6_by_path chap_user chap_password subsystem_nqn hostnqn
+    nvme_dhchap_secret nvme_dhchap_ctrl_secret enable_live_snapshots
+    snapshot_volume_chains vmstate_storage enable_bulk_operations
+    storage_lock_timeout debug device_ready_retries
+);
+sub _scfg_accept_legacy_keys($scfg) {
     return $scfg unless ref($scfg) eq 'HASH';
     my @taken;
-    for my $new (sort keys %_LEGACY_API_KEYS) {
-        my $old = $_LEGACY_API_KEYS{$new};
+    for my $new (sort keys %_LEGACY_KEYS) {
+        my $old = $_LEGACY_KEYS{$new};
         next if defined $scfg->{$new} || !defined $scfg->{$old};
         $scfg->{$new} = $scfg->{$old};
         push @taken, $old;
@@ -2097,7 +2105,7 @@ sub _scfg_accept_legacy_api_keys($scfg) {
 }
 
 sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
-    _scfg_accept_legacy_api_keys($scfg);
+    _scfg_accept_legacy_keys($scfg);
     my $retry_opts = $opts && $opts->{retry_opts};
 
     # Level 2: Verbose - log all API calls with parameters
@@ -2149,7 +2157,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
 # $opts->{retry_opts}, so a bare { retry_max => 0 } is accepted, ignored, and
 # leaves the call on the default three retries.
 sub _api_call_mutate($scfg, $ws_method, $ws_params, $opts = undef) {
-    _scfg_accept_legacy_api_keys($scfg);
+    _scfg_accept_legacy_keys($scfg);
     return _api_call($scfg, $ws_method, $ws_params, $opts);
 }
 
@@ -7885,6 +7893,7 @@ sub status {
 # This function creates a small "weight" zvol to keep the target visible.
 sub _ensure_target_visible {
     my ($scfg, %opts) = @_;
+    _scfg_accept_legacy_keys($scfg);
 
     my $iqn = $scfg->{tn_target_iqn};
 

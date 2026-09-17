@@ -7,6 +7,13 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk15) unstable; urgency=medium
     _api_call_write como alias para el wizard de upstream main, que sigue
     usando el nombre viejo.
 
+  * El respaldo de nombres de campo pre-2.1.23 (idk14) cubre ahora TODAS las
+    claves que renombra la migracion (dataset, target_iqn, discovery_portal,
+    portals, chap_*, subsystem_nqn, ...), no solo las api_*, y se aplica
+    tambien en _ensure_target_visible y _cache_host_key: el wizard de upstream
+    main pasa dataset/target_iqn/discovery_portal con los nombres viejos y
+    el preflight iSCSI no veia el target (hallazgo de la revision Codex).
+
  -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 17 Sep 2026 00:55:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk14) unstable; urgency=medium
