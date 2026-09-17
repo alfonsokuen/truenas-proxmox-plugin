@@ -1,3 +1,19 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk13) unstable; urgency=medium
+
+  * postinst: los daemons de PVE se reinician con
+    `deb-systemd-invoke reload-or-try-restart` (lo que hace pve-manager:
+    PVE::Daemon se re-ejecuta y sigue sirviendo) en vez de `systemctl
+    try-restart`, que mataba los workers de cualquier tarea en curso
+    (backup, migracion) al instalar o actualizar el paquete.
+
+  * postinst: el detector de claves antiguas en storage.cfg nunca detectaba
+    nada: `exit(0)` ejecutaba igualmente el `END { exit(1) }`, que ganaba el
+    codigo de salida, asi que la migracion a claves tn_* no corria jamas
+    (mismo bug en upstream). Se decide una sola vez en END. Probado en rojo y
+    verde con storage.cfg de ejemplo.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 17 Sep 2026 00:10:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk12) unstable; urgency=medium
 
   * Empaquetado: el epoch «1:» se colaba en el our $VERSION del .pm al construir

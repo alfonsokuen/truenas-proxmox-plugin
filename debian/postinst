@@ -42,7 +42,16 @@ enable_broker() {
 
 restart_proxmox_services() {
     if have_systemd; then
-        systemctl try-restart pvedaemon pveproxy pvestatd || true
+        # reload-or-try-restart is what pve-manager itself does: PVE::Daemon
+        # re-execs on reload and keeps serving, while a plain try-restart
+        # kills the workers of any task in flight (backup, migration).
+        for unit in pvedaemon.service pvestatd.service pveproxy.service; do
+            if command -v deb-systemd-invoke >/dev/null 2>&1; then
+                deb-systemd-invoke reload-or-try-restart "$unit" || true
+            else
+                systemctl reload-or-try-restart "$unit" || true
+            fi
+        done
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true
         invoke-rc.d pveproxy restart || true
@@ -111,8 +120,10 @@ migrate_storage_cfg() {
     local KEYS="api_host|api_key|api_scheme|api_transport|api_port|api_insecure|api_retry_max|api_retry_delay|prefer_ipv4|dataset|zvol_blocksize|compression|transport_mode|target_iqn|discovery_portal|portals|use_multipath|force_delete_on_inuse|logout_on_free|use_by_path|ipv6_by_path|chap_user|chap_password|subsystem_nqn|hostnqn|nvme_dhchap_secret|nvme_dhchap_ctrl_secret|enable_live_snapshots|snapshot_volume_chains|vmstate_storage|enable_bulk_operations|storage_lock_timeout|debug|device_ready_retries"
     perl -ne '
         if (/^truenasplugin:/) { $in=1 } elsif (/^\S/) { $in=0 }
-        exit(0) if $in && /^\s+('"$KEYS"')\s/;
-        END { exit(1) }
+        # exit(0) still runs END, and END { exit(1) } won the exit status: the
+        # detector always reported "nothing to migrate". Decide once, in END.
+        if ($in && /^\s+('"$KEYS"')\s/) { $found = 1; last }
+        END { $? = $found ? 0 : 1 }
     ' "$STORAGE_CFG" || return 0
 
     echo ""
