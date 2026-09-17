@@ -1,3 +1,14 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk15) unstable; urgency=medium
+
+  * install.sh: el wizard llamaba a _api_call_write, que el plugin no define
+    desde que upstream la renombro a _api_call_mutate (beta2): toda creacion
+    (target iSCSI, volumen de peso) moria con «Undefined subroutine
+    ..._api_call_write». Corregido en el wizard, y el plugin conserva
+    _api_call_write como alias para el wizard de upstream main, que sigue
+    usando el nombre viejo.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 17 Sep 2026 00:55:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk14) unstable; urgency=medium
 
   * _api_call/_api_call_mutate aceptan los nombres de campo anteriores a

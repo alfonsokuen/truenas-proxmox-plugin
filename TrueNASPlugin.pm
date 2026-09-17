@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk14';
+our $VERSION = '2.1.23~alpha1+idk15';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -2152,6 +2152,14 @@ sub _api_call_mutate($scfg, $ws_method, $ws_params, $opts = undef) {
     _scfg_accept_legacy_api_keys($scfg);
     return _api_call($scfg, $ws_method, $ws_params, $opts);
 }
+
+# Older wizards - this fork's install.sh before idk15, and upstream main's -
+# call _api_call_write for every mutating call. Upstream renamed it to
+# _api_call_mutate in beta2 and never shipped the old name, so those wizards
+# die with "Undefined subroutine ..._api_call_write" at the first create.
+# Keep the old name as an alias.
+sub _api_call_write { goto &_api_call_mutate }
+
 
 # ======== TrueNAS API ops (WebSocket) ========
 sub _tn_get_target($scfg) {

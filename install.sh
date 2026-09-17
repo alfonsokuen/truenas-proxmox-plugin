@@ -6716,7 +6716,7 @@ tn_api_call_write() {
 
         # Make the API call with ephemeral connection
         my $result = eval {
-            PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params);
+            PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, $method, $params);
         };
 
         if ($@) {
