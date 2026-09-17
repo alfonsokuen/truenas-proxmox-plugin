@@ -90,6 +90,12 @@ apt install "./truenas-proxmox-plugin_${V}_all.deb"
 If the same version is already installed, `apt install` is a no-op: use
 `apt reinstall ./<file>.deb` or `dpkg -i`. The options below are upstream's.
 
+**Storage wizard:** run `truenas-proxmox-manage` (the installer shipped in this
+package). Do not pipe upstream's `main` `install.sh` from the options below over
+this package: that script still uses the pre-2.1.23 `api_host`/`api_key` field
+names, the plugin expects `tn_api_*`, and the wizard fails with
+`broker: scfg missing api_host/api_key` even though network and key are fine.
+
 **Option 1 (Recommended): APT Repository**
 
 Install from the official APT repository with the installer:
