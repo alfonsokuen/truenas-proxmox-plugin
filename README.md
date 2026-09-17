@@ -71,6 +71,25 @@
 
 ### Installation
 
+**IDK fork: prebuilt .deb from GitHub Releases**
+
+This fork publishes its builds as release assets on
+`github.com/alfonsokuen/truenas-proxmox-plugin`. GitHub rewrites `~` in asset
+names (the `.deb` is served as `…_2.1.23.alpha1+idkN_all.deb`), so download it
+to its original name for `sha256sum -c` to match:
+
+```bash
+V=2.1.23~alpha1+idk13
+B=https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/download/v2.1.23-alpha1+idk13
+wget -O "truenas-proxmox-plugin_${V}_all.deb" "$B/truenas-proxmox-plugin_2.1.23.alpha1+idk13_all.deb"
+wget "$B/SHA256SUMS"
+sha256sum -c SHA256SUMS
+apt install "./truenas-proxmox-plugin_${V}_all.deb"
+```
+
+If the same version is already installed, `apt install` is a no-op: use
+`apt reinstall ./<file>.deb` or `dpkg -i`. The options below are upstream's.
+
 **Option 1 (Recommended): APT Repository**
 
 Install from the official APT repository with the installer:

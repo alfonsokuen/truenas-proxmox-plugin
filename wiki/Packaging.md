@@ -52,6 +52,8 @@ Rules:
 - Keep runtime plugin version in lockstep with upstream feature version, not the Debian packaging suffix.
 - Ensure release workflow validates changelog version and tag mapping before publishing assets.
 
+GitHub Releases rewrite `~` to `.` in asset file names (`truenas-proxmox-plugin_2.1.23~alpha1+idk13_all.deb` is served as `truenas-proxmox-plugin_2.1.23.alpha1+idk13_all.deb`, upstream's `~beta3` becomes `.beta3`). `SHA256SUMS` keeps the original name, so install instructions must download with `wget -O "<original name>" "<rewritten URL>"`; a plain `wget` of the original name returns 404. Learned from a user report on the idk12 release, 2026-09-16.
+
 ## Signing Key Handling
 
 Use a dedicated APT repository signing key for CI publishing.
