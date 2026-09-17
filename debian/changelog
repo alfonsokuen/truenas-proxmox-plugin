@@ -1,5 +1,11 @@
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk12) unstable; urgency=medium
 
+  * Empaquetado: el epoch «1:» se colaba en el our $VERSION del .pm al construir
+    con dpkg-buildpackage (el nodo declaraba «1:2.1.23~alpha1+idk12»), y
+    build-deb.sh buscaba el artefacto con el epoch en el nombre, que dpkg nunca
+    pone. Se recorta el epoch en ambos sitios; el paquete sigue siendo 1:… para
+    dpkg y el plugin declara 2.1.23~alpha1+idk12.
+
   * La version declarada era falsa en dos direcciones a la vez, y una de ellas
     era un riesgo vivo de produccion.
 

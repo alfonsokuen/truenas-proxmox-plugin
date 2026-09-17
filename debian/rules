@@ -12,7 +12,9 @@ override_dh_install:
 	: # dropping it would make an internal build indistinguishable from \
 	: # upstream's from inside PVE - which is the first thing anyone asks \
 	: # when a node misbehaves. \
-	PLUGIN_VERSION="$$DEB_VERSION"; \
+	: # The epoch (1:) is packaging-only: it orders this fork above upstream's apt \
+	: # repo and must never reach the Perl $VERSION, which is what PVE reports. \
+	PLUGIN_VERSION="$${DEB_VERSION#*:}"; \
 	STAGED_FILE='debian/truenas-proxmox-plugin/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm'; \
 	if [ ! -f "$$STAGED_FILE" ]; then \
 		echo "Missing staged plugin file: $$STAGED_FILE" >&2; \

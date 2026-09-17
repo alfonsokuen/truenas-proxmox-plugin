@@ -76,6 +76,8 @@ main() {
     package_name="$(dpkg-parsechangelog -S Source)"
     local deb_version
     deb_version="$(dpkg-parsechangelog -S Version)"
+    # dpkg strips the epoch from artifact names and the plugin must not carry it either
+    deb_version="${deb_version#*:}"
     local plugin_version
     plugin_version="${deb_version%%+*}"
 
