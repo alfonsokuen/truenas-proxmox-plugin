@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk13';
+our $VERSION = '2.1.23~alpha1+idk14';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -2071,7 +2071,33 @@ sub _delete_dataset_with_retry {
 # ======== WebSocket API operations ========
 # $opts is an optional hashref with:
 #   - retry_opts: options passed to _retry_with_backoff
+# Upstream's `main` install.sh (the curl one-liner in every README) still
+# builds the scfg it hands us with the pre-2.1.23 field names: api_host,
+# api_key, api_scheme, api_port, api_insecure, prefer_ipv4. Every code path
+# here reads the tn_* names, so that wizard reached the broker with no host
+# and no key and failed with "scfg missing api_host/api_key" although the
+# network and the key were fine. Accept the old names as a fallback, tn_*
+# always wins. storage.cfg stanzas never carry both: the postinst migration
+# renames them.
+my %_LEGACY_API_KEYS = map { ("tn_$_" => $_) }
+    qw(api_host api_key api_scheme api_port api_insecure prefer_ipv4);
+sub _scfg_accept_legacy_api_keys($scfg) {
+    return $scfg unless ref($scfg) eq 'HASH';
+    my @taken;
+    for my $new (sort keys %_LEGACY_API_KEYS) {
+        my $old = $_LEGACY_API_KEYS{$new};
+        next if defined $scfg->{$new} || !defined $scfg->{$old};
+        $scfg->{$new} = $scfg->{$old};
+        push @taken, $old;
+    }
+    _log($scfg, 1, 'info', "[TrueNAS] accepted legacy API field name(s) "
+        . join(', ', @taken) . " (pre-2.1.23 wizard); the tn_* names are canonical")
+        if @taken;
+    return $scfg;
+}
+
 sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
+    _scfg_accept_legacy_api_keys($scfg);
     my $retry_opts = $opts && $opts->{retry_opts};
 
     # Level 2: Verbose - log all API calls with parameters
@@ -2123,6 +2149,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
 # $opts->{retry_opts}, so a bare { retry_max => 0 } is accepted, ignored, and
 # leaves the call on the default three retries.
 sub _api_call_mutate($scfg, $ws_method, $ws_params, $opts = undef) {
+    _scfg_accept_legacy_api_keys($scfg);
     return _api_call($scfg, $ws_method, $ws_params, $opts);
 }
 

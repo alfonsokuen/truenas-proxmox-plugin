@@ -1,3 +1,16 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk14) unstable; urgency=medium
+
+  * _api_call/_api_call_mutate aceptan los nombres de campo anteriores a
+    2.1.23 (api_host, api_key, api_scheme, api_port, api_insecure,
+    prefer_ipv4) como respaldo de los tn_*. El install.sh de la rama main de
+    upstream (el curl del README) sigue construyendo el scfg con esos nombres,
+    y contra este plugin el asistente llegaba al broker sin host ni clave:
+    «broker: scfg missing api_host/api_key» con red y clave correctas
+    (reportado por el primer usuario externo del fork). Reproducido en rojo
+    contra idk13 y en verde con este cambio; tn_* sigue mandando.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 17 Sep 2026 00:40:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk13) unstable; urgency=medium
 
   * postinst: los daemons de PVE se reinician con
