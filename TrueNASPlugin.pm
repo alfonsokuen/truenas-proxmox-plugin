@@ -1039,14 +1039,20 @@ sub check_config {
 }
 
 # ======== DNS/IPv4 helper ========
+# Perl 5.40 (Debian Trixie, PVE 9) removed the AUTOLOAD path that let
+# Socket::gethostbyname resolve to the core builtin, so the older
+# implementation died with "Undefined subroutine Socket::AUTOLOAD" on
+# every FQDN tn_api_host (issue #102). Use Socket::inet_aton instead:
+# it's the proper Socket export for an A-record lookup, works on every
+# supported Perl, and returns the packed 4-byte form directly.
 sub _host_ipv4($host) {
     return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
-    my @ent = Socket::gethostbyname($host); # A-record lookup
-    if (@ent && defined $ent[4]) {
-        my $ip = inet_ntoa($ent[4]);
+    my $packed = eval { Socket::inet_aton($host) };
+    if ($packed) {
+        my $ip = inet_ntoa($packed);
         return $ip if $ip;
     }
-    return $host; # fallback (could be IPv6 literal or DNS)
+    return $host; # fallback (could be IPv6 literal or DNS failure)
 }
 
 # ======== WebSocket JSON-RPC client ========
@@ -3374,6 +3380,24 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
     my $iqn = $scfg->{tn_target_iqn};
     my $norm_portal = _normalize_portal($portal);
 
+    # An FQDN portal in storage.cfg never matches iscsiadm's session
+    # line, which always reports the resolved IPv4 (issue #102).
+    # Precompute the IP-resolved form so a session on 192.0.2.10:3260
+    # still counts as "connected" for a configured portal like
+    # storage.example.com:3260. On IP literals _host_ipv4 is a no-op
+    # so this costs nothing there. Failures resolve back to the
+    # original host (fallback in _host_ipv4), which just falls
+    # through to the existing literal-compare path.
+    my $ip_portal = $norm_portal;
+    if ($norm_portal =~ /^(.+):(\d+)$/) {
+        my ($host, $port) = ($1, $2);
+        # Skip IPv6 literals ($host still contains ':' after strip)
+        if ($host !~ /:/) {
+            my $ip = _host_ipv4($host);
+            $ip_portal = "$ip:$port" if $ip && $ip ne $host;
+        }
+    }
+
     # Get active sessions if not provided
     my @session_lines;
     if ($session_lines_ref && ref($session_lines_ref) eq 'ARRAY') {
@@ -3387,6 +3411,10 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
     for my $line (@session_lines) {
         # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
         if ($line =~ /\Q$norm_portal\E.*\Q$iqn\E/) {
+            return 1;
+        }
+        if ($ip_portal ne $norm_portal
+            && $line =~ /\Q$ip_portal\E.*\Q$iqn\E/) {
             return 1;
         }
     }

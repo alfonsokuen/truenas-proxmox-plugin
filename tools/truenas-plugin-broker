@@ -126,12 +126,18 @@ sub write_pidfile {
 # AAAA record on a dual-stack TrueNAS when the caller asked for IPv4. Mirrors
 # TrueNASPlugin.pm::_host_ipv4. Returns $host unchanged when it is already an
 # IPv4 literal, when the lookup fails, or when the host is an IPv6 literal.
+#
+# Perl 5.40 (Debian Trixie, PVE 9) removed the AUTOLOAD path that let
+# Socket::gethostbyname resolve to the core builtin; the older code died
+# with "Undefined subroutine Socket::AUTOLOAD" on every FQDN tn_api_host
+# (issue #102). Socket::inet_aton is the proper Socket export for an
+# A-record lookup and works on every supported Perl.
 sub _host_ipv4 {
     my ($host) = @_;
     return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/;
-    my @ent = Socket::gethostbyname($host);
-    if (@ent && defined $ent[4]) {
-        my $ip = inet_ntoa($ent[4]);
+    my $packed = eval { Socket::inet_aton($host) };
+    if ($packed) {
+        my $ip = inet_ntoa($packed);
         return $ip if $ip;
     }
     return $host;
