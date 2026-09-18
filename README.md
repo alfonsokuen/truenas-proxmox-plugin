@@ -79,9 +79,9 @@ names (the `.deb` is served as `…_2.1.23.alpha1+idkN_all.deb`), so download it
 to its original name for `sha256sum -c` to match:
 
 ```bash
-V=2.1.23~alpha1+idk16
-B=https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/download/v2.1.23-alpha1+idk16
-wget -O "truenas-proxmox-plugin_${V}_all.deb" "$B/truenas-proxmox-plugin_2.1.23.alpha1+idk16_all.deb"
+V=2.1.23~alpha1+idk17
+B=https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/download/v2.1.23-alpha1+idk17
+wget -O "truenas-proxmox-plugin_${V}_all.deb" "$B/truenas-proxmox-plugin_2.1.23.alpha1+idk17_all.deb"
 wget "$B/SHA256SUMS"
 sha256sum -c SHA256SUMS
 apt install "./truenas-proxmox-plugin_${V}_all.deb"
