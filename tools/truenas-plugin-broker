@@ -36,10 +36,9 @@ use POSIX qw(setsid strftime);
 use Digest::SHA qw(sha1 sha1_hex);
 use MIME::Base64 qw(encode_base64);
 use JSON::PP;
-use Socket;
 # IPPROTO_TCP is not in Socket's default export list; the keepalive tuning
 # below needs it by name.
-use Socket qw(IPPROTO_TCP);
+use Socket qw(inet_ntoa getaddrinfo getnameinfo AF_INET SOCK_STREAM NI_NUMERICHOST NIx_NOSERV IPPROTO_TCP);
 use Time::HiRes qw(time);
 
 # Paths are overridable so the daemon can be exercised by a test as an
@@ -145,14 +144,37 @@ sub write_pidfile {
 # AAAA record on a dual-stack TrueNAS when the caller asked for IPv4. Mirrors
 # TrueNASPlugin.pm::_host_ipv4. Returns $host unchanged when it is already an
 # IPv4 literal, when the lookup fails, or when the host is an IPv6 literal.
+#
+# Do not call Socket::gethostbyname: on Perl 5.40 / Debian Trixie (PVE 9)
+# that name is gone from the Socket package and the call dies via
+# Socket::AUTOLOAD, which made FQDN api_host unusable with prefer_ipv4=1.
 sub _host_ipv4 {
     my ($host) = @_;
-    return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/;
-    my @ent = gethostbyname($host);
-    if (@ent && defined $ent[4]) {
-        my $ip = inet_ntoa($ent[4]);
-        return $ip if $ip;
+    return $host if !defined $host || $host eq '';
+    return $1 if $host =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+    return $host if $host =~ /:/; # IPv6 literal
+
+    my @ips;
+    eval {
+        my ($err, @res) = getaddrinfo($host, '', {
+            family   => AF_INET,
+            socktype => SOCK_STREAM,
+        });
+        return if $err || !@res;
+        for my $ai (@res) {
+            my ($nerr, $ip) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
+            next if $nerr;
+            push @ips, $1 if defined($ip) && $ip =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+        }
+    };
+    if (!@ips) {
+        my @ent = eval { CORE::gethostbyname($host) };
+        if (@ent && defined $ent[4]) {
+            my $ip = eval { inet_ntoa($ent[4]) };
+            push @ips, $1 if defined($ip) && $ip =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+        }
     }
+    return $ips[0] if @ips;
     return $host;
 }
 

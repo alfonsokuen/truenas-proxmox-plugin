@@ -513,8 +513,8 @@ Migrating from iSCSI to NVMe/TCP requires creating new storage and moving VM dis
 
 **ZFS Block Size:**
 ```ini
-tn_zvol_blocksize 64K  # Default - good for general workloads
-tn_zvol_blocksize 16K  # Better for database workloads (small random I/O)
+tn_zvol_blocksize 16K  # Default (what the plugin uses when unset) - small random I/O, databases
+tn_zvol_blocksize 64K  # Good general-purpose choice for VM disks
 tn_zvol_blocksize 128K # Better for sequential I/O (media, backups)
 ```
 

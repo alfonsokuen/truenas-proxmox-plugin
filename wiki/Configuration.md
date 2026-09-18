@@ -130,17 +130,20 @@ tn_dataset tank/proxmox
 
 ### `tn_discovery_portal`
 **Description**: Primary portal for target/subsystem discovery
-**Type**: String (IP:PORT format)
+**Type**: String (`hostname[:port]`, `IP[:port]`, or `[IPv6]:port`)
 **Default Port**:
   - `3260` for iSCSI transport mode
   - `4420` for NVMe/TCP transport mode
 **Example**:
-  - iSCSI: `192.168.1.100:3260`
-  - NVMe/TCP: `192.168.1.100:4420`
+  - iSCSI: `192.168.1.100:3260` or `nas.example.com:3260`
+  - NVMe/TCP: `192.168.1.100:4420` or `nas.example.com:4420`
+
+A hostname/FQDN is valid. open-iscsi still logs the session as an IP; the plugin treats that IP session as belonging to the configured hostname.
 
 ```ini
 # iSCSI mode
 tn_discovery_portal 192.168.1.100:3260
+tn_discovery_portal nas.example.com:3260
 
 # NVMe/TCP mode
 tn_discovery_portal 192.168.1.100:4420
@@ -274,7 +277,7 @@ tn_storage_lock_timeout 300
 **Type**: Boolean (0 or 1)
 **Default**: `1`
 
-Useful when TrueNAS has both IPv4 and IPv6 addresses.
+Useful when TrueNAS has both IPv4 and IPv6 addresses. Applies to `tn_api_host` (plugin and broker). On Proxmox VE 9 this uses `getaddrinfo`, not `Socket::gethostbyname`.
 
 ```ini
 tn_prefer_ipv4 1
@@ -282,7 +285,7 @@ tn_prefer_ipv4 1
 
 ### `tn_portals`
 **Description**: Additional iSCSI portals for redundancy
-**Type**: Comma-separated list of IP:PORT
+**Type**: Comma-separated list of `hostname:PORT` or `IP:PORT`
 **Example**: `192.168.1.101:3260,192.168.1.102:3260`
 
 Configure multiple portals for failover and multipath.
@@ -628,7 +631,7 @@ tn_logout_on_free 0
 **Description**: ZFS volume block size
 **Type**: String (power of 2 from 4K to 1M)
 **Valid Values**: `4K`, `8K`, `16K`, `32K`, `64K`, `128K`, `256K`, `512K`, `1M`
-**Default**: None (uses TrueNAS default, typically 16K)
+**Default**: `16K` (the plugin passes it explicitly when the option is unset)
 **Recommended**: `128K` for VM workloads
 
 Larger block sizes improve sequential I/O performance but increase space overhead.

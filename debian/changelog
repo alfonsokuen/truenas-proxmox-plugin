@@ -1,3 +1,22 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk17) unstable; urgency=medium
+
+  * Resolucion de nombres (de upstream PR #103, issue #102): el plugin y el
+    broker resuelven tn_api_host con getaddrinfo (todas las A, con
+    CORE::gethostbyname de respaldo) en vez de una sola A. Este fork no sufria
+    el crash de upstream (usaba el builtin, no Socket::gethostbyname, que
+    Perl 5.40 / PVE 9 ya no tiene) — verificado: core.ping con FQDN y
+    prefer_ipv4 via broker idk16 responde. Lo que si cambia para usuarios
+    iSCSI: un portal configurado por FQDN se reconoce como conectado cuando
+    open-iscsi ya tiene sesion con su IP, y deja de reintentar --login en
+    cada arranque de VM («Could not log into all portals»). Test
+    t/unit/01-fqdn.t.
+
+  * Documentacion (upstream #108): el default de tn_zvol_blocksize es 16K
+    (el plugin lo pasa explicitamente cuando no se configura); NVMe-Setup
+    decia 64K.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Fri, 18 Sep 2026 12:30:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk16) unstable; urgency=medium
 
   * Clasificador de reintentos: «dataset already exists» (y EEXIST/EZFS_EXISTS)
