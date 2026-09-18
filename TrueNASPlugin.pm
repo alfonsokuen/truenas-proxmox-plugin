@@ -42,6 +42,18 @@ package PVE::Storage::Custom::TrueNASPlugin;
 my %API_CACHE = ();
 my $CACHE_TTL = 60; # seconds
 my $STATUS_CAPACITY_TTL_S = 10;
+# On-disk (/run/truenas-plugin/status-<key>) capacity-cache TTL. Shared
+# across processes so every `pvesm status` doesn't pay the full
+# pool.dataset.get_instance round-trip (issue #106). pvestatd polls
+# every 10 s, so 60 s still refreshes six times per minute -- more than
+# often enough for the UI -- while shielding cross-node upload probes
+# (PVE::API2::Storage::Status::upload's synchronous
+# `ssh peer pvesm status --storage local` runs from a fresh Perl
+# process, misses the in-process cache 100% of the time, and if we
+# don't cover it here the ~600ms fixed middleware overhead per
+# pool.dataset.* call scaled by the number of storages busted a 5-s
+# pveproxy idle timeout on the reporter's cluster).
+my $STATUS_CAPACITY_STAMP_TTL_S = 60;
 my $TARGET_VISIBLE_SKIP_TTL_S = 60;
 
 # Per-host cache for preflight check results
@@ -53,6 +65,9 @@ my %_status_capacity_cache_stats = (
     hit => 0,
     miss => 0,
     invalidate => 0,
+    stamp_hit => 0,      # on-disk stamp fed a value across processes
+    stamp_write => 0,    # freshly-fetched value written to on-disk stamp
+    stamp_fail => 0,     # on-disk stamp read/write errored (best-effort)
 );
 
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
@@ -3134,6 +3149,84 @@ sub _preflight_stamp_path {
     my $safe = $host_key;
     $safe =~ s/[^A-Za-z0-9._-]/_/g;
     return "/run/truenas-plugin/preflight-$safe";
+}
+
+# Filesystem path for the status()-capacity cache stamp. The stamp
+# holds the JSON-encoded pool.dataset.get_instance result so a fresh
+# process (i.e. every `pvesm status` invocation) can pick up a recent
+# value without hitting TrueNAS again. Keyed on the same host+storeid+
+# dataset triple as the in-process cache method so entries don't
+# false-share across storages pointing at different TN hosts.
+sub _status_stamp_path {
+    my ($status_method) = @_;
+    my $safe = $status_method;
+    $safe =~ s/[^A-Za-z0-9._-]/_/g;
+    return "/run/truenas-plugin/status-$safe";
+}
+
+# Read the on-disk status stamp for $status_method. Returns the cached
+# dataset hashref on hit within $STATUS_CAPACITY_STAMP_TTL_S, undef
+# otherwise. Never dies; a corrupt / unreadable stamp is treated as
+# a miss (and stats counter bumped so tuning can spot it).
+sub _read_status_stamp {
+    my ($scfg, $status_method) = @_;
+    my $path = _status_stamp_path($status_method);
+    my $mtime = (stat($path))[9];
+    return undef if !defined $mtime;
+    my $age = time() - $mtime;
+    return undef if $age < 0 || $age >= $STATUS_CAPACITY_STAMP_TTL_S;
+    my $decoded = eval {
+        open(my $fh, '<', $path) or die "open: $!";
+        local $/;
+        my $blob = <$fh>;
+        close($fh);
+        decode_json($blob);
+    };
+    if ($@ || ref($decoded) ne 'HASH') {
+        $_status_capacity_cache_stats{stamp_fail}++;
+        _log($scfg, 2, 'debug', "[TrueNAS] status-cache: stamp read failed at $path: " . ($@ // 'not a hash'));
+        return undef;
+    }
+    return $decoded;
+}
+
+# Atomically write the pool.dataset.get_instance result to the on-disk
+# status stamp. Uses tmp+rename so a concurrent reader never sees a
+# partial JSON blob. Best-effort: filesystem trouble never bubbles up
+# to the caller's status() path.
+sub _write_status_stamp {
+    my ($scfg, $status_method, $ds) = @_;
+    my $path = _status_stamp_path($status_method);
+    my $rc = eval {
+        my $dir = $path;
+        $dir =~ s{/[^/]+$}{};
+        if (!-d $dir) {
+            require File::Path;
+            File::Path::make_path($dir, { mode => 0700 });
+        }
+        my $tmp = "$path.$$";
+        open(my $fh, '>', $tmp) or die "open $tmp: $!";
+        chmod 0600, $tmp;
+        print $fh encode_json($ds);
+        close($fh) or die "close $tmp: $!";
+        rename($tmp, $path) or die "rename $tmp -> $path: $!";
+        1;
+    };
+    if ($@ || !$rc) {
+        $_status_capacity_cache_stats{stamp_fail}++;
+        _log($scfg, 2, 'debug', "[TrueNAS] status-cache: stamp write failed at $path: " . ($@ // 'unknown'));
+        return;
+    }
+    $_status_capacity_cache_stats{stamp_write}++;
+}
+
+# Remove the on-disk status stamp (best-effort). Called by
+# _invalidate_status_capacity_cache so any mutation that already
+# invalidates the in-process cache also drops the shared entry.
+sub _unlink_status_stamp {
+    my ($status_method) = @_;
+    my $path = _status_stamp_path($status_method);
+    unlink($path);
 }
 
 # Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
@@ -7169,6 +7262,9 @@ sub _invalidate_status_capacity_cache {
     my $host_key = _cache_host_key($scfg);
     my $method = _status_capacity_cache_method($effective_storeid, $scfg);
     _invalidate_cache_key($host_key, $method);
+    # Drop the on-disk stamp too so a stale value can't outlive a
+    # mutation that just invalidated the in-process cache.
+    _unlink_status_stamp($method);
     $_status_capacity_cache_stats{invalidate}++;
     _log($scfg, 2, 'debug', "[TrueNAS] status-cache: invalidate key=$method");
 }
@@ -7190,25 +7286,45 @@ sub status {
             $_status_capacity_cache_stats{hit}++;
             _log($scfg, 2, 'debug', "[TrueNAS] status-cache: hit key=$status_method");
         } else {
-            $_status_capacity_cache_stats{miss}++;
-            _log($scfg, 2, 'debug', "[TrueNAS] status-cache: miss key=$status_method");
-            # retry_max => 2 (was 0): a single 60 s broker deadline on
-            # pool.dataset.get_instance under concurrent cluster load was
-            # marking storage inactive on transient slowness, which then
-            # cascaded into "storage is not active" failures on unrelated
-            # tests. Two retries add up to 3 x 60 s = 180 s worst case, but
-            # normal path is 1 attempt and the STATUS_CAPACITY_TTL_S cache
-            # keeps pvestatd from re-hitting this every poll.
-            $ds = _tn_dataset_get($scfg, $scfg->{tn_dataset}, { retry_max => 2 });
-            _set_cache($host_key, $status_method, $ds);
+            # Cross-process stamp check (issue #106). status() is
+            # frequently called from short-lived processes (every
+            # `pvesm status` is a fresh Perl interpreter), so the
+            # in-process cache always misses in exactly the path that
+            # PVE's cross-node upload probe hits. The on-disk stamp
+            # in /run/truenas-plugin/status-<key> is shared across
+            # processes and lets a fresh invocation reuse a value
+            # that any process wrote within STATUS_CAPACITY_STAMP_TTL_S.
+            $ds = _read_status_stamp($scfg, $status_method);
+            if ($ds) {
+                $_status_capacity_cache_stats{stamp_hit}++;
+                _log($scfg, 2, 'debug', "[TrueNAS] status-cache: stamp-hit key=$status_method");
+                # Seed the in-process cache so any second call in the
+                # same process (rare, but pvestatd's own polling in
+                # the resident daemon does re-enter this path) still
+                # gets the fast in-process short-TTL path.
+                _set_cache($host_key, $status_method, $ds);
+            } else {
+                $_status_capacity_cache_stats{miss}++;
+                _log($scfg, 2, 'debug', "[TrueNAS] status-cache: miss key=$status_method");
+                # retry_max => 2 (was 0): a single 60 s broker deadline on
+                # pool.dataset.get_instance under concurrent cluster load was
+                # marking storage inactive on transient slowness, which then
+                # cascaded into "storage is not active" failures on unrelated
+                # tests. Two retries add up to 3 x 60 s = 180 s worst case, but
+                # normal path is 1 attempt and the STATUS_CAPACITY_TTL_S cache
+                # keeps pvestatd from re-hitting this every poll.
+                $ds = _tn_dataset_get($scfg, $scfg->{tn_dataset}, { retry_max => 2 });
+                _set_cache($host_key, $status_method, $ds);
+                _write_status_stamp($scfg, $status_method, $ds);
 
-            # Pool health check on cache miss only (non-fatal — log warning if degraded)
-            my $pool = _tn_pool_health($scfg);
-            if ($pool && !$pool->{healthy}) {
-                my ($pool_name) = split('/', $scfg->{tn_dataset}, 2);
-                _log($scfg, 0, 'warning',
-                    "[TrueNAS] status: pool '$pool_name' is not healthy (status: " .
-                    ($pool->{status} // 'UNKNOWN') . ")");
+                # Pool health check on cache miss only (non-fatal — log warning if degraded)
+                my $pool = _tn_pool_health($scfg);
+                if ($pool && !$pool->{healthy}) {
+                    my ($pool_name) = split('/', $scfg->{tn_dataset}, 2);
+                    _log($scfg, 0, 'warning',
+                        "[TrueNAS] status: pool '$pool_name' is not healthy (status: " .
+                        ($pool->{status} // 'UNKNOWN') . ")");
+                }
             }
         }
 
