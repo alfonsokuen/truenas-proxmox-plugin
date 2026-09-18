@@ -44,16 +44,16 @@ my $CACHE_TTL = 60; # seconds
 my $STATUS_CAPACITY_TTL_S = 10;
 # On-disk (/run/truenas-plugin/status-<key>) capacity-cache TTL. Shared
 # across processes so every `pvesm status` doesn't pay the full
-# pool.dataset.get_instance round-trip (issue #106). pvestatd polls
-# every 10 s, so 60 s still refreshes six times per minute -- more than
-# often enough for the UI -- while shielding cross-node upload probes
-# (PVE::API2::Storage::Status::upload's synchronous
-# `ssh peer pvesm status --storage local` runs from a fresh Perl
-# process, misses the in-process cache 100% of the time, and if we
-# don't cover it here the ~600ms fixed middleware overhead per
-# pool.dataset.* call scaled by the number of storages busted a 5-s
-# pveproxy idle timeout on the reporter's cluster).
-my $STATUS_CAPACITY_STAMP_TTL_S = 60;
+# pool.dataset.get_instance round-trip (issue #106). Kept short --
+# 15 s -- because tests (disk_discard.pl fill/observe) and users
+# expect `pvesm status` to reflect a ~30 s in-guest write, and a
+# longer TTL masks that growth. 15 s is still 3-30x fewer TN calls
+# than the 10 s in-process cache alone under the cross-node upload
+# probe pattern that motivated #106 (PVE::API2::Storage::Status::
+# upload's synchronous `ssh peer pvesm status --storage local`
+# always misses the in-process cache -- burst probes complete in
+# well under one second and reuse the same on-disk stamp).
+my $STATUS_CAPACITY_STAMP_TTL_S = 15;
 my $TARGET_VISIBLE_SKIP_TTL_S = 60;
 
 # Per-host cache for preflight check results
