@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk15';
+our $VERSION = '2.1.23~alpha1+idk16';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -310,6 +310,32 @@ sub _is_auth_error {
     return $error =~ /401 Unauthorized|403 Forbidden|authentication.*failed|unauthorized|forbidden|invalid.*key/i;
 }
 
+# What a failed JSON-RPC call dies with. middlewared answers "Method call
+# error" with the full Python traceback in data.trace, and dying with the
+# whole encoded payload put 15 KB of frames in every log line - and fed the
+# retry classifier text it was never meant to see (see _is_retryable_error).
+# Die with [errname]: reason, keep the payload at debug level.
+sub _rpc_error_message {
+    my ($err, $scfg) = @_;
+    my $obj = $err;
+    if (defined $obj && !ref $obj && $obj =~ /^\s*\{/) {
+        $obj = eval { decode_json($obj) } // $err;
+    }
+    if (ref $obj eq 'HASH') {
+        my $data = ref $obj->{data} eq 'HASH' ? $obj->{data} : {};
+        my $reason = $data->{reason} // $obj->{message};
+        if (defined $reason && !ref $reason) {
+            $reason =~ s/\s+\z//;
+            my $name = $data->{errname} // $obj->{code};
+            _log($scfg, 2, 'debug', "[TrueNAS] JSON-RPC error payload: "
+                . (ref $err ? encode_json($err) : $err));
+            return 'JSON-RPC error' . (defined $name ? " [$name]" : '') . ": $reason";
+        }
+    }
+    return 'JSON-RPC error: ' . (ref $err ? encode_json($err) : ($err // 'unknown'));
+}
+
+
 # ======== Retry logic with exponential backoff ========
 sub _is_retryable_error {
     my ($error) = @_;
@@ -319,6 +345,15 @@ sub _is_retryable_error {
     # because FK errors include Python traceback paths containing "connection.py"
     # which would otherwise false-match the /connection.*failed/ pattern below
     return 0 if $error =~ /FOREIGN KEY constraint failed|IntegrityError|constraint failed/i;
+
+    # Do NOT retry on ZFS "already exists": that is a definitive verdict from
+    # the server, and the caller decides what to do with it. Gated BEFORE the
+    # connection check because middlewared's error payload carries a Python
+    # traceback whose text ("...RpcWebSocketApp object ... closed=False")
+    # false-matches the retryable /WebSocket.*closed/ pattern: every second
+    # activate_volume of an LXC snapshot backup paid a useless retry and left
+    # a "Max retries exhausted" line at err level. Same gate as upstream.
+    return 0 if $error =~ /already exists|EEXIST|EZFS_EXISTS|zfs_create.*failed/i;
 
     # Retry on transient connection/network errors
     return 1 if _is_connection_error($error);
@@ -1295,13 +1330,13 @@ sub _ws_rpc {
         # Match response to our request by id
         if (defined($request_id) && ref($decoded) eq 'HASH'
             && defined($decoded->{id}) && "$decoded->{id}" eq "$request_id") {
-            die "JSON-RPC error: ".encode_json($decoded->{error}) if exists $decoded->{error};
+            die _rpc_error_message($decoded->{error}, $conn->{scfg}) if exists $decoded->{error};
             return $decoded->{result};
         }
 
         # No id in request (shouldn't happen) — accept the first response
         if (!defined($request_id)) {
-            die "JSON-RPC error: ".encode_json($decoded->{error})
+            die _rpc_error_message($decoded->{error}, $conn->{scfg})
                 if ref($decoded) eq 'HASH' && exists $decoded->{error};
             return ref($decoded) eq 'HASH' ? $decoded->{result} : $decoded;
         }
@@ -1465,7 +1500,7 @@ sub _broker_rpc {
         my $decoded = eval { decode_json($line) };
         die "broker: bad response: $@" if $@ || ref($decoded) ne 'HASH';
 
-        die "JSON-RPC error: $decoded->{error}" if exists $decoded->{error};
+        die _rpc_error_message($decoded->{error}, $conn->{scfg}) if exists $decoded->{error};
         $result = $decoded->{result};
     };
     my $err = $@;
@@ -8347,7 +8382,11 @@ sub _clone_snapshot_zvol {
     my $clone_result = eval { _tn_dataset_clone($scfg, $source_snapshot, $clone_full) };
     if (my $err = $@) {
         # Already present from a prior activate — reuse it.
-        return if $err =~ /dataset already exists/i;
+        if ($err =~ /already exists/i) {
+            _log($scfg, 1, 'info', "[TrueNAS] clone $clone_full already present "
+                . "(PVE activates a backup snapshot twice) - reusing it");
+            return;
+        }
         die "Failed to clone snapshot $source_snapshot to $clone_full: $err\n";
     }
 

@@ -1,3 +1,28 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk16) unstable; urgency=medium
+
+  * Clasificador de reintentos: «dataset already exists» (y EEXIST/EZFS_EXISTS)
+    ya no se reintenta. El payload de error de middlewared trae el traceback
+    de Python entero y su texto («RpcWebSocketApp ... closed=False») casaba
+    el patron /WebSocket.*closed/: en cada backup LXC en modo snapshot PVE
+    activa el snapshot dos veces por disco, la segunda daba «already exists»,
+    se reintentaba y dejaba «Max retries exhausted» a nivel err aunque el
+    backup seguia bien. Misma puerta que upstream. Test con la linea real
+    del journal como fixture, en las dos direcciones (QA dual Fable+Codex).
+
+  * Los errores JSON-RPC mueren con «[errname]: reason» en vez del payload
+    completo (15 KB por linea); el payload queda a nivel debug. El clon que
+    ya existe se registra a nivel info como reutilizado.
+
+  * postinst: el aviso de migracion de storage.cfg imprime solo fichero,
+    linea y nombre de clave; antes volcaba la linea entera, con api_key,
+    chap_password y secretos DH-CHAP (solo alcanzable migrando desde <2.1.0).
+
+  * tools/build-deb.sh: los metadatos del paquete (dpkg-deb -f Version,
+    .changes) conservan el epoch; el script los comparaba con la version sin
+    epoch desde idk12 y abortaba tras construir.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Fri, 18 Sep 2026 10:30:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk15) unstable; urgency=medium
 
   * install.sh: el wizard llamaba a _api_call_write, que el plugin no define

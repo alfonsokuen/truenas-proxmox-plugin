@@ -132,7 +132,8 @@ migrate_storage_cfg() {
     echo "Affected lines:"
     perl -ne '
         if (/^truenasplugin:/) { $in=1; $f=$.." " } elsif (/^\S/) { $in=0 }
-        print "  $ARGV:$.: $_" if $in && /^\s+('"$KEYS"')\s/;
+        # key name only: these lines carry api_key, chap_password and DH-CHAP secrets
+        print "  $ARGV:$.: $1\n" if $in && /^\s+('"$KEYS"')\s/;
     ' "$STORAGE_CFG"
     echo ""
 

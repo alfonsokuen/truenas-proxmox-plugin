@@ -76,7 +76,9 @@ main() {
     package_name="$(dpkg-parsechangelog -S Source)"
     local deb_version
     deb_version="$(dpkg-parsechangelog -S Version)"
-    # dpkg strips the epoch from artifact names and the plugin must not carry it either
+    # The package metadata (dpkg-deb -f Version, the .changes file) keep the epoch;
+    # artifact file names and the plugin $VERSION never carry it.
+    local deb_full_version="${deb_version}"
     deb_version="${deb_version#*:}"
     local plugin_version
     plugin_version="${deb_version%%+*}"
@@ -110,10 +112,10 @@ main() {
     deb_metadata_version="$(dpkg-deb -f "${deb_file}" Version)"
 
     [[ "${deb_package}" == "${package_name}" ]] || die "Debian package metadata mismatch: expected package ${package_name}, got ${deb_package}"
-    [[ "${deb_metadata_version}" == "${deb_version}" ]] || die "Debian package metadata mismatch: expected version ${deb_version}, got ${deb_metadata_version}"
+    [[ "${deb_metadata_version}" == "${deb_full_version}" ]] || die "Debian package metadata mismatch: expected version ${deb_full_version}, got ${deb_metadata_version}"
 
-    if ! grep -q "^Version: ${deb_version}$" "${changes_file}"; then
-        die "Changes file does not contain expected version ${deb_version}: ${changes_file}"
+    if ! grep -q "^Version: ${deb_full_version}$" "${changes_file}"; then
+        die "Changes file does not contain expected version ${deb_full_version}: ${changes_file}"
     fi
 
     TMP_DIR="$(mktemp -d)"
