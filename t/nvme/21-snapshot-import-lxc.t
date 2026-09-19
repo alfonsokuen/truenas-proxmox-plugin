@@ -11,11 +11,18 @@
 #     load_config, write_config, __snapshot_copy_config - LXC overrides none
 #     of them);
 #   - the volumes are rootfs and mpN, and only the ones classify_mountpoint()
-#     calls a 'volume' count: a bind mount (mp1=/mnt/host/data) is not a
-#     storage volume and must be IGNORED, not refused - refusing it would
-#     refuse most containers;
+#     calls a 'volume' can be snapshotted. A bind mount (mp1=/mnt/host/data)
+#     or a device (/dev/...) is FATAL, not something to skip: PVE's own
+#     has_feature('snapshot') asks PVE::Storage::volume_has_feature about
+#     every mountpoint, that returns undef for a plain path, and so PVE
+#     refuses `pct snapshot` on the container. A section imported anyway
+#     would give PVE a snapshot whose `pct rollback` dies AFTER rolling the
+#     other volumes back, and whose `pct delsnapshot` destroys the rootfs
+#     snapshot on the array and then leaves `lock: snapshot-delete` behind;
 #   - an mpN on another storage IS refused, exactly like a VM disk elsewhere:
 #     a section naming it could never be rolled back as a whole;
+#   - PVE is asked directly, through has_feature('snapshot'), before anything
+#     is written;
 #   - a CT template is refused, like a VM template;
 #   - there is never a vmstate.
 #
@@ -75,6 +82,21 @@ our $LOCKS = 0;
         my ($class, $vmid, $code, @param) = @_;
         $LOCKS++;
         return $code->(@param);
+    }
+    # PVE::LXC::Config::has_feature, verbatim in structure: it walks EVERY
+    # mountpoint - bind mounts and devices included - and a single one the
+    # storage layer cannot snapshot makes the whole answer 0.
+    sub has_feature {
+        my ($class, $feature, $conf, $storecfg, $snapname, $running) = @_;
+        my $err;
+        $class->foreach_volume($conf, sub {
+            my ($ms, $mountpoint) = @_;
+            return if $err;
+            $err = 1
+                if !main::storage_volume_has_feature($storecfg, $feature,
+                    $mountpoint->{volume});
+        });
+        return $err ? 0 : 1;
     }
     # PVE::LXC::Config::classify_mountpoint, verbatim.
     sub classify_mountpoint {
@@ -202,6 +224,17 @@ sub make_ct_conf_file {
     close($fh);
 }
 
+# PVE::Storage::volume_has_feature, in the only two shapes that matter here:
+# a plain path is undef (Storage.pm returns undef for /...), a volume asks
+# its plugin. local-lvm says no to snapshots in this test, tnnvme says yes.
+sub storage_volume_has_feature {
+    my ($storecfg, $feature, $volid) = @_;
+    return undef if !defined($volid) || $volid =~ m{^/};
+    my ($storeid) = split(/:/, $volid, 2);
+    return 0 if ($storecfg->{ids}{$storeid}{type} // '') eq 'lvmthin';
+    return 1;
+}
+
 sub base_conf {
     return {
         hostname => 'ct-importtest',
@@ -210,8 +243,6 @@ sub base_conf {
         ostype   => 'debian',
         rootfs   => 'tnnvme:vol-vm-9991-disk-0-lun0,size=8G',
         mp0      => 'tnnvme:vol-vm-9991-disk-1-lun1,mp=/data,size=16G',
-        mp1      => '/mnt/host/photos,mp=/photos',       # bind mount: ignored
-        mp2      => '/dev/sdz,mp=/dev/sdz',              # device: ignored
     };
 }
 
@@ -250,8 +281,8 @@ is_deeply($res->{partial}{'only-root'}, [ 'tnnvme:vol-vm-9991-disk-1-lun1' ],
 my $sec = $snaps->{'tn-weekly-7'};
 is($sec->{rootfs}, 'tnnvme:vol-vm-9991-disk-0-lun0,size=8G',
     'la seccion copia el rootfs tal cual');
-is($sec->{mp1}, '/mnt/host/photos,mp=/photos',
-    '  ...y tambien el bind mount, que se copia pero no se exige en la cabina');
+is($sec->{mp0}, 'tnnvme:vol-vm-9991-disk-1-lun1,mp=/data,size=16G',
+    '  ...y el mp0');
 ok(!exists $sec->{vmstate}, 'sin vmstate: un CT nunca lo tiene');
 is($sec->{parent}, 'Daily-1', 'la cadena de parents se arma por tiempo');
 is($CONF{$VMID}{parent}, 'tn-weekly-7', 'conf.parent pasa al mas nuevo importado');
@@ -263,7 +294,7 @@ is($CONF{$VMID}{parent}, 'tn-weekly-7', 'conf.parent pasa al mas nuevo importado
     my %uniq = map { $_ => 1 } @ASKED;
     is_deeply([ sort keys %uniq ],
         [ qw(pool/pve/vm-9991-disk-0 pool/pve/vm-9991-disk-1) ],
-        'solo se consultan los zvols: el bind mount y el device no son datasets');
+        'se consultan exactamente los dos zvols del contenedor');
 }
 
 # ------------------------------------------------------- 13-16. refusals ---
@@ -279,6 +310,37 @@ sub refuses {
     my ($err, $writes) = refuses(sub { $_[0]->{mp0} = 'local-lvm:vm-9991-disk-0,mp=/data' });
     like($err, qr/outside this plugin/, 'mp0 en otro storage: se rehusa');
     is($writes, 0, '  ...sin escribir nada');
+}
+
+# A bind mount is not "one volume less": PVE refuses `pct snapshot` on the
+# whole container, so a section imported here could never be rolled back or
+# deleted. It has to be a refusal, not something to skip over.
+{
+    my ($err, $writes) = refuses(sub { $_[0]->{mp1} = '/mnt/host/photos,mp=/photos' });
+    like($err, qr/bind.device mountpoints/,
+        'mp1 bind mount: se rehusa el CT entero, no se ignora');
+    like($err, qr{mp1: /mnt/host/photos}, '  ...nombrando el mountpoint');
+    is($writes, 0, '  ...sin escribir nada');
+}
+{
+    my ($err, $writes) = refuses(sub { $_[0]->{mp2} = '/dev/sdz,mp=/dev/sdz' });
+    like($err, qr/bind.device mountpoints/, 'mp2 device: se rehusa igual');
+    like($err, qr{mp2: /dev/sdz}, '  ...nombrando el mountpoint');
+    is($writes, 0, '  ...sin escribir nada');
+}
+
+# And the same question asked of PVE directly: whatever the reason, if
+# has_feature('snapshot') is false nothing is written.
+{
+    reset_world();
+    no strict 'refs';
+    no warnings 'redefine';
+    local *PVE::LXC::Config::has_feature = sub { 0 };
+    my $ok = eval { $PKG->import_foreign_snapshots($VMID, {}); 1 };
+    my $err = $ok ? '' : ($@ // '');
+    like($err, qr/cannot be snapshotted/,
+        'has_feature(snapshot) falso: se rehusa aunque los volumenes encajen');
+    is(scalar(@WRITES), 0, '  ...sin escribir nada');
 }
 {
     my ($err, $writes) = refuses(sub { $_[0]->{template} = 1 });

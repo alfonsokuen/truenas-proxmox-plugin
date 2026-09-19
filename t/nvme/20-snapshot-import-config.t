@@ -85,6 +85,14 @@ our $BEFORE_LOCK;   # runs inside lock_config, before the plugin's code
         $BEFORE_LOCK->($vmid) if $BEFORE_LOCK;
         return $code->(@param);
     }
+    # PVE's own "can this guest be snapshotted at all?". The plugin asks it
+    # before writing, so a disk on a storage without the feature never gets
+    # a section that `qm rollback` would die on.
+    our $HAS_FEATURE = 1;
+    sub has_feature {
+        my ($class, $feature, $conf, $storecfg) = @_;
+        return $HAS_FEATURE;
+    }
     # Same key set and same order as PVE::QemuServer::Drive::valid_drive_names
     # for the keys this test uses.
     sub foreach_volume {
@@ -205,6 +213,7 @@ sub reset_world {
     @api    = ();
     $LOCKS  = 0;
     $BEFORE_LOCK     = undef;
+    $PVE::QemuConfig::HAS_FEATURE = 1;
     $SNAPSHOT_ANSWER = undef;
     $CLONE_ANSWER    = undef;
 }
@@ -383,6 +392,17 @@ sub refuses {
 {
     my ($err, $writes) = refuses(sub { $_[0]->{scsi1} = 'local-lvm:vm-9990-disk-0,size=8G' });
     ok($err && !$writes, 'disco fuera del plugin: se rehusa y no escribe nada');
+}
+{
+    # Everything this plugin can see is fine, and PVE still says no - a raw
+    # device, a storage without the feature. Its answer wins.
+    reset_world();
+    $PVE::QemuConfig::HAS_FEATURE = 0;
+    my $ok = eval { $PKG->import_foreign_snapshots($VMID, {}); 1 };
+    my $err = $ok ? '' : ($@ // '');
+    like($err, qr/cannot be snapshotted/,
+        'has_feature(snapshot) falso: se rehusa');
+    is(scalar(@WRITES), 0, '  ...sin escribir nada');
 }
 {
     # A VMID with an /etc/pve/lxc/<vmid>.conf is a container, and a

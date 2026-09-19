@@ -3276,6 +3276,25 @@ sub _tn_import_check_conf($conf, $vmid, $label = 'VM') {
     }
 }
 
+# PVE's own answer to "can this guest be snapshotted?", asked before writing
+# a section that claims it can.
+#
+# has_feature() walks every volume of the guest and asks the storage behind
+# it; it is 0 when ANY of them cannot snapshot - a CT bind mount, a VM disk
+# on a storage without the feature, a raw device. The volume walk above
+# already refuses what this plugin can see, but it only knows about volumes
+# on THIS plugin, and PVE is the one that will have to run the rollback.
+# Asking it directly is the difference between a section PVE can use and a
+# section that dies half way through `qm rollback`.
+sub _tn_import_check_feature($guest, $conf, $vmid, $storecfg) {
+    my $ok = $guest->{class}->has_feature('snapshot', $conf, $storecfg);
+    die "$guest->{label} $vmid: PVE reports that this guest cannot be "
+      . "snapshotted (has_feature('snapshot') is false), so a section "
+      . "written here could never be rolled back or deleted; nothing "
+      . "imported\n"
+        if !$ok;
+}
+
 # The non-cdrom volumes of the guest, as
 # [ { key, volid, storeid, scfg, full } ], with every one of them living on
 # this plugin. A volume elsewhere is fatal: a section naming it would die half
@@ -3283,6 +3302,7 @@ sub _tn_import_check_conf($conf, $vmid, $label = 'VM') {
 sub _tn_import_volumes($class, $storecfg, $conf, $vmid, $guest) {
     my @vols;
     my @foreign;
+    my @nonvolume;
     my $label = $guest->{label};
 
     $guest->{class}->foreach_volume($conf, sub {
@@ -3290,15 +3310,24 @@ sub _tn_import_volumes($class, $storecfg, $conf, $vmid, $guest) {
 
         my $volid;
         if ($guest->{kind} eq 'lxc') {
-            # rootfs and mpN. classify_mountpoint() has already decided what
-            # each one is: a bind mount (mp1=/mnt/host/data) or a device
-            # (/dev/...) is not a storage volume at all - PVE's own
-            # get_vm_volumes() skips it, no plugin ever snapshots it, and it
-            # is as much out of scope here as a cdrom is on a VM. What it is
-            # NOT is a reason to refuse: refusing every container with a bind
-            # mount would refuse most containers, and the zvols that DO back
-            # this one are still covered in full.
-            return if ($vol->{type} // '') ne 'volume';
+            # rootfs and mpN, as classify_mountpoint() typed them. A bind
+            # mount (mp1=/mnt/host/data) or a device (/dev/...) is not a
+            # storage volume, and for a container that is FATAL, not
+            # something to skip: PVE::LXC::Config->has_feature('snapshot')
+            # walks every mountpoint and asks PVE::Storage::volume_has_feature
+            # about it, which returns undef for a plain path - so PVE itself
+            # refuses `pct snapshot` on such a container. Importing a section
+            # for it would hand PVE snapshots it cannot use: `pct rollback`
+            # dies in PVE::Storage::volume_rollback_is_possible ("rollback
+            # file/device is not possible") AFTER the other volumes were
+            # already rolled back, and `pct delsnapshot` destroys the rootfs
+            # snapshot on the array and then dies on the bind mount, leaving
+            # the container in `lock: snapshot-delete`. Both verified against
+            # PVE 9.2.4.
+            if (($vol->{type} // '') ne 'volume') {
+                push @nonvolume, "$key: " . ($vol->{volume} // '?');
+                return;
+            }
             $volid = $vol->{volume};
         } else {
             return if $vol->{media} && $vol->{media} eq 'cdrom';
@@ -3328,6 +3357,10 @@ sub _tn_import_volumes($class, $storecfg, $conf, $vmid, $guest) {
             full    => $scfg->{tn_dataset} . '/' . $zname,
         };
     });
+
+    die "$label $vmid has bind/device mountpoints (" . join('; ', @nonvolume)
+      . "); PVE does not allow snapshots of this container, nothing imported\n"
+        if @nonvolume;
 
     die "$label $vmid has disks outside this plugin, so a snapshot of it could "
       . "never be rolled back as a whole:\n  " . join("\n  ", @foreign) . "\n"
@@ -3428,6 +3461,7 @@ sub import_foreign_snapshots($class, $vmid, $opts = {}) {
     _tn_import_check_conf($conf, $vmid, $guest->{label});
 
     my $vols = $class->_tn_import_volumes($storecfg, $conf, $vmid, $guest);
+    _tn_import_check_feature($guest, $conf, $vmid, $storecfg);
     my $log_scfg = $vols->[0]{scfg};
 
     my $plan = $class->_tn_import_plan($vols, $conf, $opts);
@@ -3456,6 +3490,11 @@ sub import_foreign_snapshots($class, $vmid, $opts = {}) {
           . "being planned; nothing was written\n"
             if join(',', map { $_->{volid} } @$vols_now)
             ne join(',', map { $_->{volid} } @$vols);
+
+        # Asked again with the lock held, for the same reason everything
+        # else is: a disk can be moved to a storage without snapshots, or a
+        # bind mount added, between the plan and the write.
+        _tn_import_check_feature($guest, $conf, $vmid, $storecfg);
 
         my $fresh = $class->_tn_import_plan($vols_now, $conf, $opts);
 
