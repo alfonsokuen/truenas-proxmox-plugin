@@ -508,24 +508,33 @@ sub apt_installs {
 }
 
 # --- 11. RED: an asset entry that forges a TSV row -----------------------
-# The asset table is TAB separated; a field carrying a tab and a newline can
-# append a row of its own and point the download anywhere. Both fields are
-# poisoned here, because the two parsers read different ones: python3 takes
-# the JSON "name", the grep fallback takes the URL's last segment. Either way
-# the entry must be dropped, which leaves the release with no SHA256SUMS.
+# The asset table is TAB separated. GitHub is perfectly happy to serve an
+# asset whose name contains an escaped tab and newline, and once JSON decodes
+# them they are real control characters: the entry writes a row of its own and
+# points the SHA256SUMS download at someone else's host. Everything after that
+# is the attacker's manifest checked against the attacker's file.
+#
+# The evil SHA256SUMS here is a valid one, so the old code sails through to a
+# successful install - which is what makes this a red and not a crash.
 {
     my $evil = "$root/evil";
     make_path($evil);
-    spew("$evil/payload", "malicious
-");
+    open(my $src, '<', "$dl/SHA256SUMS") or die $!;
+    my $sums = do { local $/; <$src> };
+    close $src;
+    spew("$evil/payload", $sums);
     my $evil_url = file_url($evil);
-    my $name = 'SHA256SUMS' . "\t" . $evil_url . '/payload' . "\n" . 'x';
-    my $url  = "$dl_url/SHA256SUMS" . "\t" . $evil_url . '/payload';
+
+    # Escaped in the JSON (backslash-t, backslash-n): valid JSON, real control
+    # characters once parsed.
+    my $ET = '\\t';
+    my $EN = '\\n';
+    my $name = 'SHA256SUMS' . $ET . $evil_url . '/payload' . $EN . 'ignored';
     spew("$api/latest", qq({
   "tag_name": "v2.1.23-alpha1+idk18",
   "assets": [
 )
-        . qq(    {"name": "$name", "browser_download_url": "$url"},
+        . qq(    {"name": "$name", "browser_download_url": "$dl_url/SHA256SUMS"},
 )
         . qq(    {"name": "$DEB_SERVED", "browser_download_url": "$dl_url/$DEB_SERVED"}
   ]
@@ -533,10 +542,26 @@ sub apt_installs {
 ));
 
     my ($rc, $out, $apt) = run_installer();
-    is($rc, 4, 'a forged asset entry is dropped, leaving no SHA256SUMS');
-    like($out, qr/no SHA256SUMS asset/, 'and the run stops there');
-    is(apt_installs($apt), '', 'nothing was installed');
-    ok(!-e "$root/evil-was-downloaded", 'the forged target was never fetched');
+
+    # The two parsers read different fields: python3 takes the JSON "name",
+    # the grep fallback takes the URL's last segment. Only the first can be
+    # poisoned this way, so only there is refusing the release the right
+    # answer; on the fallback the genuine assets are still all that is seen.
+    my $has_py3 = (system('python3 -c "pass" >/dev/null 2>&1') == 0);
+    if ($has_py3) {
+        isnt($rc, 0, 'a forged asset row must not produce a successful install');
+        like($out, qr/no SHA256SUMS asset/, 'the poisoned entry is dropped entirely');
+        is(apt_installs($apt), '', 'NOTHING was installed');
+    } else {
+        is($rc, 0, 'without python3 the name field is never read; the run is normal');
+        like($out, qr/sha256 OK/, 'and the genuine package is what got verified');
+        pass('no python3 here: the name-injection path is exercised on a node');
+    }
+    unlike($out, qr/\Q$evil_url\E/, "the attacker's URL was never used");
+    # The harness rewrites download hosts through IDK_DOWNLOAD_BASE, so a
+    # redirected fetch shows up as the attacker's FILE NAME rather than their
+    # host. In production, with that variable unset, it is their host.
+    unlike($out, qr{/payload}, 'the forged download target was never resolved');
 
     spew("$api/latest", release_json());
 }
