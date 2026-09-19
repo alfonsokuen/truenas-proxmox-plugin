@@ -4,8 +4,7 @@
 # pinned here against stubbed PVE::QemuConfig / PVE::Storage primitives:
 #
 #   - it goes through lock_config + load_config + write_config, never by
-#     editing text in /etc/pve (the plugin still does that in
-#     _cleanup_vm_snapshot_config, and that is the deuda this does not repeat);
+#     editing text in /etc/pve;
 #   - it only ADDS sections: an existing one is byte-for-byte the same after;
 #   - a second run imports nothing and does not write at all - without that,
 #     a cron calling this would rewrite the config of every VM forever;
@@ -15,9 +14,10 @@
 #     config that changed under us, cancels the write;
 #   - two storages pointing at the same tn_dataset on different arrays are
 #     kept apart, or a snapshot on one of them would look present on both;
-#   - it refuses a container, a template, a locked config, a snapshot
-#     mid-flight (snapstate) and any non-cdrom disk living outside this
-#     plugin.
+#   - it refuses a template, a locked config, a snapshot mid-flight
+#     (snapstate) and any non-cdrom disk living outside this plugin;
+#   - a container is no longer refused, but it is not a VM either: it must
+#     not go through PVE::QemuConfig at all (see 21-snapshot-import-lxc.t).
 #
 # Run with:  prove -v t/nvme/20-snapshot-import-config.t
 
@@ -385,17 +385,21 @@ sub refuses {
     ok($err && !$writes, 'disco fuera del plugin: se rehusa y no escribe nada');
 }
 {
-    # A VMID that is a container: same AbstractConfig machinery, different
-    # volume keys, not covered yet.
+    # A VMID with an /etc/pve/lxc/<vmid>.conf is a container, and a
+    # container is not a VM: the QemuConfig stubs in this file must not be
+    # reached at all. What a container then DOES is the subject of
+    # 21-snapshot-import-lxc.t; here it only has to stop being a VM.
     reset_world();
     my $dir = tempdir(CLEANUP => 1);
     open(my $lxc, '>', "$dir/$VMID.conf") or die $!;
     close($lxc);
     no strict 'refs';
+    no warnings 'redefine';
     local ${"${PKG}::TN_LXC_CONF_DIR"} = $dir;
-    my $ok = eval { $PKG->import_foreign_snapshots($VMID, {}); 1 };
-    my $err = $ok ? '' : ($@ // '');
-    like($err, qr/container/i, 'vmid de contenedor: se rehusa por nombre');
+    my $qemu_loads = 0;
+    local *PVE::QemuConfig::load_config = sub { $qemu_loads++; die "not a VM\n" };
+    eval { $PKG->import_foreign_snapshots($VMID, {}) };
+    is($qemu_loads, 0, 'vmid de contenedor: no pasa por PVE::QemuConfig');
     is(scalar(@WRITES), 0, '  ...sin escribir nada');
 }
 

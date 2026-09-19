@@ -2920,14 +2920,15 @@ sub volume_snapshot_info {
 # Snapshots created on the array - a TrueNAS periodic task, a replication
 # job, someone on the TrueNAS UI - are real ZFS snapshots of our zvols, but
 # PVE cannot see them: the Snapshots tab renders $conf->{snapshots} from
-# /etc/pve/qemu-server/<vmid>.conf and never asks the storage. They are not
+# /etc/pve/qemu-server/<vmid>.conf (or /etc/pve/lxc/<vmid>.conf for a
+# container) and never asks the storage. They are not
 # inert, either. One of them being newer than a PVE snapshot makes
 # `qm rollback <that snapshot>` fail with "is not most recent snapshot", with
 # nothing in the GUI to explain or remove the blocker; and a rollback that
 # does go through destroys them, because the rollback is recursive.
 #
-# `truenas-proxmox-manage import-snapshots <vmid>` writes the missing sections
-# so PVE owns what is already on the array: the GUI lists them, `qm
+# `truenas-proxmox-manage import-snapshots <vmid>` - VM or container - writes
+# the missing sections so PVE owns what is already on the array: the GUI lists them, `qm
 # delsnapshot` removes them, and rollback stops being blocked by something
 # invisible.
 #
@@ -2956,9 +2957,26 @@ my %TN_RESERVED_SNAPNAMES = map { $_ => 1 } qw(vzdump current pending __base__);
 # would pair one disk's Monday with the other disk's Tuesday.
 my $TN_IMPORT_MAX_SKEW_S = 3600;
 
-# Where the LXC configurations live. A package variable so the refusal below
-# can be exercised offline without a container on the node.
-our $TN_LXC_CONF_DIR = '/etc/pve/lxc';
+# Where the guest configurations live. Package variables so the guest type
+# can be decided - and exercised offline - without a container or a VM on the
+# node.
+our $TN_LXC_CONF_DIR  = '/etc/pve/lxc';
+our $TN_QEMU_CONF_DIR = '/etc/pve/qemu-server';
+
+# Which config class owns $vmid, as { kind, class, label }.
+#
+# The type is decided by which configuration file exists, the same way
+# pct/qm/PVE::GuestHelpers do, because nothing in the volume names tells a
+# container's zvol apart from a VM's. Only the container case needs a
+# positive answer: with no /etc/pve/lxc/<vmid>.conf this is a VM, and if it
+# is not a VM either, PVE::QemuConfig->load_config() is the one that says so
+# ("Configuration file for '<vmid>' does not exist") - a second, differently
+# worded refusal here would only be a copy of it that can drift.
+sub _tn_guest_config($vmid) {
+    return { kind => 'lxc', class => 'PVE::LXC::Config', label => 'CT' }
+        if -e "$TN_LXC_CONF_DIR/$vmid.conf";
+    return { kind => 'qemu', class => 'PVE::QemuConfig', label => 'VM' };
+}
 
 # undef when $name may be used as a PVE snapshot name, else the reason why
 # not. pve-configid is /^[a-z][a-z0-9_-]+$/i with a 40 character maximum
@@ -3239,13 +3257,13 @@ sub _tn_snapshot_clone_blockers($scfg, $ids) {
 
 # The guest-level refusals (R3). Called before the query and again inside the
 # lock, because all three can appear between the two.
-sub _tn_import_check_conf($conf, $vmid) {
-    die "VM $vmid is a template; its snapshots are not imported\n"
+sub _tn_import_check_conf($conf, $vmid, $label = 'VM') {
+    die "$label $vmid is a template; its snapshots are not imported\n"
         if $conf->{template};
-    die "VM $vmid is locked ($conf->{lock}); refusing to touch its configuration\n"
+    die "$label $vmid is locked ($conf->{lock}); refusing to touch its configuration\n"
         if $conf->{lock};
     for my $name (sort keys %{ $conf->{snapshots} // {} }) {
-        die "VM $vmid has a snapshot operation in flight ('$name' is in state "
+        die "$label $vmid has a snapshot operation in flight ('$name' is in state "
           . "$conf->{snapshots}{$name}{snapstate}); refusing to write its configuration\n"
             if $conf->{snapshots}{$name}{snapstate};
     }
@@ -3255,15 +3273,30 @@ sub _tn_import_check_conf($conf, $vmid) {
 # [ { key, volid, storeid, scfg, full } ], with every one of them living on
 # this plugin. A volume elsewhere is fatal: a section naming it would die half
 # way through a rollback, after the other disks were already rolled back.
-sub _tn_import_volumes($class, $storecfg, $conf, $vmid) {
+sub _tn_import_volumes($class, $storecfg, $conf, $vmid, $guest) {
     my @vols;
     my @foreign;
+    my $label = $guest->{label};
 
-    PVE::QemuConfig->foreach_volume($conf, sub {
-        my ($key, $drive) = @_;
+    $guest->{class}->foreach_volume($conf, sub {
+        my ($key, $vol) = @_;
 
-        return if $drive->{media} && $drive->{media} eq 'cdrom';
-        my $volid = $drive->{file};
+        my $volid;
+        if ($guest->{kind} eq 'lxc') {
+            # rootfs and mpN. classify_mountpoint() has already decided what
+            # each one is: a bind mount (mp1=/mnt/host/data) or a device
+            # (/dev/...) is not a storage volume at all - PVE's own
+            # get_vm_volumes() skips it, no plugin ever snapshots it, and it
+            # is as much out of scope here as a cdrom is on a VM. What it is
+            # NOT is a reason to refuse: refusing every container with a bind
+            # mount would refuse most containers, and the zvols that DO back
+            # this one are still covered in full.
+            return if ($vol->{type} // '') ne 'volume';
+            $volid = $vol->{volume};
+        } else {
+            return if $vol->{media} && $vol->{media} eq 'cdrom';
+            $volid = $vol->{file};
+        }
         return if !defined($volid) || $volid eq '' || $volid eq 'none'
                || $volid eq 'cdrom';
 
@@ -3289,10 +3322,10 @@ sub _tn_import_volumes($class, $storecfg, $conf, $vmid) {
         };
     });
 
-    die "VM $vmid has disks outside this plugin, so a snapshot of it could "
+    die "$label $vmid has disks outside this plugin, so a snapshot of it could "
       . "never be rolled back as a whole:\n  " . join("\n  ", @foreign) . "\n"
         if @foreign;
-    die "VM $vmid has no disks on this plugin\n" if !@vols;
+    die "$label $vmid has no disks on this plugin\n" if !@vols;
 
     return \@vols;
 }
@@ -3354,29 +3387,37 @@ sub _tn_import_plan($class, $vols, $conf, $opts) {
 # 'only' is an allow-list: nothing outside it is imported, which is how the
 # CLI guarantees that what it writes is what the operator confirmed.
 #
+# Works for VMs and containers alike; the guest type is decided from the
+# configuration file that exists.
+#
 # Returns the plan, plus 'imported' (sections written), 'dropped' (candidates
 # that were listed but no longer qualified when the lock was held) and
 # 'dry_run'.
 sub import_foreign_snapshots($class, $vmid, $opts = {}) {
     $opts //= {};
 
-    # LXC uses the same AbstractConfig machinery through PVE::LXC::Config,
-    # but with different volume keys (rootfs/mpN) and no coverage here yet,
-    # so it is refused by name rather than half-supported (R8).
-    die "$vmid is a container; containers are not supported by "
-      . "import-snapshots yet\n"
-        if -e "$TN_LXC_CONF_DIR/$vmid.conf";
+    # VM or container. Both go through the same AbstractConfig machinery -
+    # lock_config/load_config/write_config/__snapshot_copy_config are all
+    # inherited, and LXC::Config does not override any of them - so the only
+    # differences are the class, the volume keys (rootfs/mpN instead of
+    # scsiN/virtioN) and how a volume is spelled inside a mountpoint.
+    my $guest = _tn_guest_config($vmid);
 
     # Required at run time, not compile time: this file is a storage plugin
-    # and is loaded on nodes and in tests where qemu-server is not present.
-    require PVE::QemuConfig;
+    # and is loaded on nodes and in tests where qemu-server/pve-container is
+    # not present.
     require PVE::Storage;
+    if ($guest->{kind} eq 'lxc') {
+        require PVE::LXC::Config;
+    } else {
+        require PVE::QemuConfig;
+    }
 
     my $storecfg = PVE::Storage::config();
-    my $conf = PVE::QemuConfig->load_config($vmid);
-    _tn_import_check_conf($conf, $vmid);
+    my $conf = $guest->{class}->load_config($vmid);
+    _tn_import_check_conf($conf, $vmid, $guest->{label});
 
-    my $vols = $class->_tn_import_volumes($storecfg, $conf, $vmid);
+    my $vols = $class->_tn_import_volumes($storecfg, $conf, $vmid, $guest);
     my $log_scfg = $vols->[0]{scfg};
 
     my $plan = $class->_tn_import_plan($vols, $conf, $opts);
@@ -3391,18 +3432,18 @@ sub import_foreign_snapshots($class, $vmid, $opts = {}) {
     my $stamp = POSIX::strftime('%Y-%m-%dT%H:%M:%SZ', gmtime(time()));
     my @listed = map { $_->{name} } @{ $plan->{import} };
 
-    my $written = PVE::QemuConfig->lock_config($vmid, sub {
+    my $written = $guest->{class}->lock_config($vmid, sub {
         # Everything is re-established inside the lock: the config may have
         # gained a lock, a template flag, a snapshot or a different disk, and
         # the array may have lost or cloned a candidate, between the plan
         # above and this line. Nothing from outside the lock is reused except
         # the operator's allow-list.
-        my $conf = PVE::QemuConfig->load_config($vmid);
-        _tn_import_check_conf($conf, $vmid);
+        my $conf = $guest->{class}->load_config($vmid);
+        _tn_import_check_conf($conf, $vmid, $guest->{label});
 
-        my $vols_now = $class->_tn_import_volumes($storecfg, $conf, $vmid);
-        die "VM $vmid changed its disks while the import was being planned; "
-          . "nothing was written\n"
+        my $vols_now = $class->_tn_import_volumes($storecfg, $conf, $vmid, $guest);
+        die "$guest->{label} $vmid changed its disks while the import was "
+          . "being planned; nothing was written\n"
             if join(',', map { $_->{volid} } @$vols_now)
             ne join(',', map { $_->{volid} } @$vols);
 
@@ -3418,7 +3459,7 @@ sub import_foreign_snapshots($class, $vmid, $opts = {}) {
         for my $entry (@{ $fresh->{import} }) {
             my $name = $entry->{name};
             my $snap = $conf->{snapshots}{$name} = {};
-            PVE::QemuConfig->__snapshot_copy_config($conf, $snap);
+            $guest->{class}->__snapshot_copy_config($conf, $snap);
             delete $snap->{parent};
             $snap->{parent}   = $entry->{parent} if defined $entry->{parent};
             $snap->{snaptime} = $entry->{snaptime};
@@ -3427,7 +3468,7 @@ sub import_foreign_snapshots($class, $vmid, $opts = {}) {
         }
         $conf->{parent} = $fresh->{new_parent} if defined $fresh->{new_parent};
 
-        PVE::QemuConfig->write_config($vmid, $conf);
+        $guest->{class}->write_config($vmid, $conf);
 
         return $fresh;
     });
@@ -3439,9 +3480,10 @@ sub import_foreign_snapshots($class, $vmid, $opts = {}) {
     # Level 0: writing a guest configuration is worth a line in syslog even
     # with debugging off - it is how an operator finds out later which run
     # added the sections.
-    _log($log_scfg, 0, 'info', "[TrueNAS] import-snapshots: VM $vmid adopted "
-        . "$written->{imported} snapshot(s) from the array");
-    _log($log_scfg, 0, 'warning', "[TrueNAS] import-snapshots: VM $vmid: "
+    _log($log_scfg, 0, 'info', "[TrueNAS] import-snapshots: $guest->{label} "
+        . "$vmid adopted $written->{imported} snapshot(s) from the array");
+    _log($log_scfg, 0, 'warning', "[TrueNAS] import-snapshots: "
+        . "$guest->{label} $vmid: "
         . scalar(@{ $written->{dropped} }) . " listed snapshot(s) no longer "
         . "qualified when the lock was held: "
         . join(', ', @{ $written->{dropped} }))
@@ -3506,16 +3548,16 @@ sub snapshot_import_cli(@argv) {
         printf("invalid  %-40s %s\n", $name, $plan->{invalid}{$name});
     }
     for my $name (@{ $plan->{present} }) {
-        printf("present  %-40s already in the VM configuration\n", $name);
+        printf("present  %-40s already in the guest configuration\n", $name);
     }
 
     my @confirmed = map { $_->{name} } @{ $plan->{import} };
     if (!@confirmed) {
-        print "Nothing to import for VM $vmid.\n";
+        print "Nothing to import for guest $vmid.\n";
         return 0;
     }
     if ($dry_run) {
-        printf("Dry run: %d snapshot(s) would be imported into VM %s.\n",
+        printf("Dry run: %d snapshot(s) would be imported into guest %s.\n",
             scalar(@confirmed), $vmid);
         return 0;
     }
@@ -3529,7 +3571,7 @@ sub snapshot_import_cli(@argv) {
                 . "re-run with --yes to import without asking\n";
             return 2;
         }
-        printf("Import %d snapshot(s) into the configuration of VM %s? [y/N] ",
+        printf("Import %d snapshot(s) into the configuration of guest %s? [y/N] ",
             scalar(@confirmed), $vmid);
         my $answer = <STDIN>;
         $answer = '' if !defined($answer);
@@ -3556,7 +3598,7 @@ sub snapshot_import_cli(@argv) {
         print "skipped  $name: no longer qualified when the configuration "
             . "was locked\n";
     }
-    print "Imported $res->{imported} snapshot(s) into VM $vmid.\n";
+    print "Imported $res->{imported} snapshot(s) into guest $vmid.\n";
     return 0;
 }
 

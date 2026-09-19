@@ -268,8 +268,8 @@ it will surface as a rollback failure inside PVE.
 ### Snapshots taken on TrueNAS
 
 A snapshot created on the array is invisible to PVE: the Snapshots tab
-renders `$conf->{snapshots}` from `/etc/pve/qemu-server/<vmid>.conf` and
-never asks the storage. Invisible is not inert:
+renders `$conf->{snapshots}` from `/etc/pve/qemu-server/<vmid>.conf` (or
+`/etc/pve/lxc/<vmid>.conf` for a container) and never asks the storage. Invisible is not inert:
 
 - A TrueNAS snapshot newer than a PVE one makes `qm rollback <older>`
   fail with `is not most recent snapshot`, and the GUI offers no way to
@@ -316,7 +316,11 @@ What that means afterwards, and why it is opt-in:
 - Run it on the node hosting the guest, and prefer `--dry-run` first. In
   a script pass `--yes`: without a terminal to confirm on, the command
   refuses and exits 2 rather than assuming consent.
-- Containers are not covered yet; the command refuses an LXC VMID.
+- Containers are covered: the guest type comes from the configuration
+  file that exists, and a container's `rootfs` and storage `mpN` are
+  treated exactly as a VM's disks. Bind mounts and device mountpoints are
+  ignored (they are not storage volumes); an `mpN` on another storage is
+  refused.
 
 ---
 
