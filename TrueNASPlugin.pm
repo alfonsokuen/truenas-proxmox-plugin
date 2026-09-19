@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk18';
+our $VERSION = '2.1.23~alpha1+idk19';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -2946,10 +2946,15 @@ sub _tn_guest_config($vmid) {
 # here the PVE snapshot name IS the ZFS snapshot name.
 sub _tn_snapshot_name_problem($name) {
     return 'reserved by PVE'               if $TN_RESERVED_SNAPNAMES{ lc $name };
-    return 'reserved by PVE (replication)' if $name =~ /^__replicate_/i;
+    return 'reserved by PVE (replication)' if $name =~ /\A__replicate_/i;
     return 'longer than the 40 characters PVE allows' if length($name) > 40;
+    # \A and \z, never ^ and $: with $, "Daily-1\n" passes this check and is
+    # then written into the config file as a section header plus a stray
+    # line. A ZFS snapshot name cannot normally contain a newline, but this
+    # validator is the last thing between a name the array reported and a
+    # guest configuration, and it may not depend on that.
     return 'not a valid PVE snapshot name (pve-configid)'
-        if $name !~ /^[a-z][a-z0-9_-]+$/i;
+        if $name !~ /\A[a-z][a-z0-9_-]+\z/i;
     return undef;
 }
 
@@ -3055,7 +3060,23 @@ sub _plan_snapshot_import($existing, $by_volid, $opts = {}) {
         $match = eval { qr/$opts->{match}/ };
         die "[TrueNAS] --match is not a valid regular expression: $@" if !$match;
     }
-    my $only    = $opts->{only} ? { map { $_ => 1 } @{ $opts->{only} } } : undef;
+    # The allow-list. Either plain names, or - what the CLI passes - records
+    # of { name, identity }, where identity pins the snapshot the operator
+    # actually saw: its creation time and createtxg on every disk. A name is
+    # not an identity. A periodic task can destroy `Daily-1` and create a new
+    # `Daily-1` between the listing and the confirmation, and importing THAT
+    # one writes a section describing a capture nobody approved.
+    my $only;
+    if ($opts->{only}) {
+        $only = {};
+        for my $entry (@{ $opts->{only} }) {
+            if (ref($entry) eq 'HASH') {
+                $only->{ $entry->{name} } = $entry->{identity};
+            } else {
+                $only->{$entry} = undef;
+            }
+        }
+    }
     my $blocked = $opts->{clone_blocked} // {};
 
     my %seen;   # snapname => { volid => { ts, txg } }
@@ -3067,7 +3088,7 @@ sub _plan_snapshot_import($existing, $by_volid, $opts = {}) {
     my (@present, %partial, %invalid, @candidates);
     for my $name (sort keys %seen) {
         next if defined($match) && $name !~ $match;
-        next if $only && !$only->{$name};
+        next if $only && !exists $only->{$name};
 
         # Already ours: never re-examined and never rewritten (R4).
         if (exists $existing->{$name}) {
@@ -3094,16 +3115,26 @@ sub _plan_snapshot_import($existing, $by_volid, $opts = {}) {
         # not enough: with snaptime taken from whichever disk answered, a
         # snapshot half of which the array cannot date would be imported as
         # if it were a clean capture (R5).
-        my (@times, @txgs, $undated);
+        my (@times, @txgs, $undated, $txg_missing, @identity);
         for my $volid (@volids) {
             my $entry = $seen{$name}{$volid};
             my $ts = ref($entry) eq 'HASH' ? $entry->{ts} : undef;
             if (!defined($ts)) { $undated = 1; last }
             push @times, $ts;
-            push @txgs, $entry->{txg} if defined $entry->{txg};
+            my $txg = ref($entry) eq 'HASH' ? $entry->{txg} : undef;
+            if (defined $txg) { push @txgs, $txg } else { $txg_missing = 1 }
+            push @identity, "$volid=$ts/" . ($txg // '-');
         }
         if ($undated) {
             $invalid{$name} = 'no usable creation timestamp from TrueNAS';
+            next;
+        }
+
+        # What the operator confirmed was this snapshot, not this name.
+        my $identity = join(';', @identity);
+        if ($only && defined($only->{$name}) && $only->{$name} ne $identity) {
+            $invalid{$name} = 'changed on TrueNAS since it was listed; '
+                . 'not the snapshot that was confirmed';
             next;
         }
 
@@ -3117,10 +3148,16 @@ sub _plan_snapshot_import($existing, $by_volid, $opts = {}) {
             next;
         }
 
+        # createtxg is a tiebreaker only when EVERY disk reported one. With
+        # it taken from whichever disk happened to answer, a half-dated
+        # candidate would be ordered against another snapshot as if the
+        # array had dated all of it - and an order that is a guess is the
+        # one thing this planner refuses to write.
         push @candidates, {
             name     => $name,
             snaptime => $max,
-            txg      => (@txgs ? (sort { $b <=> $a } @txgs)[0] : undef),
+            txg      => ($txg_missing || !@txgs ? undef : (sort { $b <=> $a } @txgs)[0]),
+            identity => $identity,
         };
     }
 
@@ -3157,9 +3194,18 @@ sub _plan_snapshot_import($existing, $by_volid, $opts = {}) {
     # parent follows only if an imported snapshot is the newest of all (R7).
     my @timeline = ( ( map { { %$_, imported => 0 } } @others ),
                      ( map { { %$_, imported => 1 } } @ordered ) );
+    # Deterministic to the last comparison. Two snapshots PVE already has can
+    # share a snaptime and have no createtxg at all (PVE never records one),
+    # and with the sort ending there their order came from hash order - so
+    # the same config planned twice could chain the imports differently. The
+    # final `cmp` on the name is arbitrary, but it is arbitrary the SAME way
+    # every run, which is what a parent chain needs. It only ever decides
+    # between snapshots that are already indistinguishable in time; a
+    # candidate tied with anything is refused above, never ordered by name.
     @timeline = sort {
         $a->{snaptime} <=> $b->{snaptime}
             || ($a->{txg} // 0) <=> ($b->{txg} // 0)
+            || ($a->{name} cmp $b->{name})
     } @timeline;
 
     my (@import, $prev);
@@ -3167,6 +3213,7 @@ sub _plan_snapshot_import($existing, $by_volid, $opts = {}) {
         push @import, {
             name     => $entry->{name},
             snaptime => $entry->{snaptime},
+            identity => $entry->{identity},
             parent   => $prev,
         } if $entry->{imported};
         $prev = $entry->{name};
@@ -3343,9 +3390,12 @@ sub _tn_import_plan($class, $vols, $conf, $opts) {
 
 # Import every snapshot of $vmid that exists on TrueNAS and is safe to adopt.
 #
-# $opts: { dry_run => 1, match => <regex string>, only => [ names ] }
+# $opts: { dry_run => 1, match => <regex string>,
+#          only => [ names | { name, identity } ] }
 # 'only' is an allow-list: nothing outside it is imported, which is how the
-# CLI guarantees that what it writes is what the operator confirmed.
+# CLI guarantees that what it writes is what the operator confirmed. Given
+# identities (the form the CLI uses) it also refuses a snapshot that was
+# destroyed and recreated under the same name in the meantime.
 #
 # Works for VMs and containers alike; the guest type is decided from the
 # configuration file that exists.
@@ -3511,7 +3561,11 @@ sub snapshot_import_cli(@argv) {
         printf("present  %-40s already in the guest configuration\n", $name);
     }
 
-    my @confirmed = map { $_->{name} } @{ $plan->{import} };
+    # Each entry carries the identity of the snapshot that was printed, not
+    # just its name, so the second run can tell "still there" from "a new
+    # snapshot wearing the same name".
+    my @confirmed = map { { name => $_->{name}, identity => $_->{identity} } }
+                    @{ $plan->{import} };
     if (!@confirmed) {
         print "Nothing to import for guest $vmid.\n";
         return 0;

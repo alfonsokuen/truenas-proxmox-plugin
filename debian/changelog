@@ -1,3 +1,78 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk19) unstable; urgency=medium
+
+  * `import-snapshots` ya sirve para CONTENEDORES, no solo para VMs. El
+    tipo de invitado se decide por que fichero de configuracion existe
+    (/etc/pve/lxc/<vmid>.conf o /etc/pve/qemu-server/<vmid>.conf) y los
+    contenedores pasan por PVE::LXC::Config, que hereda de AbstractConfig
+    las MISMAS primitivas (lock_config, load_config, write_config,
+    __snapshot_copy_config: LXC no sobreescribe ninguna). Cambian solo las
+    claves de volumen: rootfs y mpN. Un mpN que es bind mount
+    (mp1=/mnt/datos) o un device (/dev/...) NO es un volumen de storage -
+    PVE mismo lo salta en get_vm_volumes - asi que se ignora, igual que un
+    cdrom en una VM; rehusarlo habria rehusado casi todos los CT. Un mpN
+    en OTRO storage si se rehusa, como un disco de VM fuera del plugin:
+    una seccion que lo nombre no podria hacer rollback como un todo. Un CT
+    template se rehusa igual que una VM template. Nunca hay vmstate.
+
+  * Rollback seguro: `volume_snapshot_rollback` ya NO destruye snapshots.
+    Antes lanzaba `pool.snapshot.rollback` con recursive=1 y force=1, y en
+    TrueNAS eso borra TODOS los snapshots mas nuevos que el destino. PVE
+    pregunta antes con `volume_rollback_is_possible` - que rehusa lo que no
+    sea el mas reciente - pero entre esa pregunta y el rollback hay un
+    apagado del invitado, y ahi cabe un snapshot de una tarea periodica, de
+    una replicacion o de otro nodo: se borraba sin que nadie lo viera.
+    Ahora la pregunta se repite DENTRO de la operacion, contra la cabina y
+    con el lock del storage tomado, y si aparecio algo mas nuevo se muere
+    nombrandolo y sin lanzar el rollback. El rollback que si se lanza va
+    sin recursive y sin force.
+
+  * Eliminado `_cleanup_vm_snapshot_config`. Cubria el efecto colateral del
+    punto anterior: tras el rollback recursivo reescribia
+    /etc/pve/qemu-server/<vmid>.conf como TEXTO para quitar las secciones
+    de los snapshots que la cabina acababa de destruir - sin lock_config,
+    sin equivalente para LXC, y pisando a cualquier escritor concurrente.
+    Sin rollback recursivo no quedan secciones huerfanas que limpiar, y el
+    lado de la configuracion lo lleva
+    PVE::AbstractConfig::snapshot_rollback(), que ya invalida lo que toca
+    bajo su propio lock. Un plugin de storage no edita la config de un
+    invitado.
+
+  * El refresco posterior al rollback ejecuta `iscsiadm` solo si el
+    transporte es iSCSI. En NVMe/TCP imprimia «No session found» en cada
+    rollback: ruido que ensena a ignorar el aviso que si importa.
+
+  * Importador, correcciones de la revision de idk18:
+    - La linea de tiempo es determinista: empate de `snaptime` y de
+      `createtxg` se resuelve por nombre (`cmp`). Dos snapshots que PVE ya
+      tenia pueden compartir snaptime y no tener createtxg ninguno (PVE no
+      lo guarda), y el orden salia del orden de hash: la misma
+      configuracion planificada dos veces encadenaba distinto.
+    - `createtxg` solo desempata si esta presente en TODOS los discos del
+      candidato; con uno solo se ordenaba como si la cabina hubiera fechado
+      el conjunto.
+    - Validacion de nombres anclada con \A...\z en vez de ^...$: con `$`,
+      un nombre acabado en salto de linea pasaba pve-configid y luego
+      entraba en el fichero de configuracion como cabecera mas una linea
+      suelta.
+    - La confirmacion de la CLI va atada a la IDENTIDAD, no al nombre: la
+      segunda llamada recibe `only` como lista de {name, identity} con la
+      fecha de creacion y el createtxg por volumen, y descarta el candidato
+      si cambio. Una tarea periodica puede destruir `Daily-1` y crear otro
+      `Daily-1` entre el listado y el si.
+    - Consultas de clones: se mantiene el bucle con `=` por volumen. El
+      filtro `in` sobre `origin.parsed` lo acepta el middleware, pero en la
+      cabina no hay ningun dataset con `origin`, asi que no hay forma de
+      demostrar que ademas COINCIDE; un `in` que no casara nada se leeria
+      como «sin clones», que es justo el fallo que no se puede correr.
+
+  * Tests: t/nvme/21-snapshot-import-lxc.t (import de CT con stub de
+    PVE::LXC::Config: rootfs + mp0 en el plugin + mp1 bind + mp2 device;
+    mp0 en local-lvm y CT template rehusados) y t/nvme/22-rollback-safety.t
+    (snapshot mas nuevo entre la comprobacion y el rollback: muere y no
+    llama a la cabina; payload no recursivo; NVMe no invoca iscsiadm).
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Fri, 19 Sep 2026 10:00:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk18) unstable; urgency=medium
 
   * Snapshots hechos EN TrueNAS: nuevo subcomando

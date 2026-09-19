@@ -40,7 +40,7 @@ Note: Health check, orphan cleanup, and plugin function testing are now integrat
 truenas-proxmox-manage import-snapshots <vmid> [--dry-run] [--yes] [--match REGEX]
 ```
 
-> **Locking:** the command holds the guest's PVE config lock for the whole run (inventory, clone check and write all happen inside it), so nothing else can change the VM meanwhile. Run it when no backup, migration or other operation on that VM is in progress; a concurrent operation would report `can't lock` after 10 s, nothing is corrupted. Confirmation is by snapshot name: keep TrueNAS retention or periodic tasks from recreating a snapshot with the same name between the listing and the confirmation.
+> **Locking:** the command holds the guest's PVE config lock for the whole run (inventory, clone check and write all happen inside it), so nothing else can change the guest meanwhile. Run it when no backup, migration or other operation on that guest is in progress; a concurrent operation would report `can't lock` after 10 s, nothing is corrupted. Confirmation is tied to the snapshot's identity, not to its name: a snapshot destroyed and recreated with the same name between the listing and the confirmation is dropped and reported, not imported.
 
 Writes the snapshots that already exist on TrueNAS for a guest's zvols
 into its Proxmox configuration, so the Snapshots tab lists them and
