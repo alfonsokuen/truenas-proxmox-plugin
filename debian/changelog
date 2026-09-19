@@ -65,6 +65,43 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk19) unstable; urgency=medium
       demostrar que ademas COINCIDE; un `in` que no casara nada se leeria
       como «sin clones», que es justo el fallo que no se puede correr.
 
+  * Revision dual (Fable + Opus) sobre idk19 — correcciones:
+    - BLOQUEANTE (F2): un CT con CUALQUIER mountpoint bind o device NO se
+      puede snapshotear en PVE. `PVE::LXC::Config->has_feature('snapshot')`
+      recorre TODOS los mountpoints y `PVE::Storage::volume_has_feature`
+      devuelve undef para una ruta, asi que PVE rehusa `pct snapshot`.
+      Importar igualmente le daba a PVE secciones inservibles: `pct
+      rollback` muere en Storage.pm DESPUES de haber revertido los otros
+      volumenes, y `pct delsnapshot` destruye el snapshot ZFS del rootfs
+      en la cabina y luego muere en el bind, dejando `lock:
+      snapshot-delete`. Ahora se rehusa el contenedor entero nombrando
+      los mountpoints, y ademas se le pregunta a PVE directamente con
+      `has_feature('snapshot')` antes del plan y otra vez dentro del
+      lock — lo que cubre tambien una VM con un disco en un storage sin
+      snapshots.
+    - `_tn_snapshot_rollback` ya no acepta `force`/`recursive`: la rama que
+      reintentaba con `recursive => true` era codigo muerto que
+      reintroducia la destruccion. Y el mensaje de «existen snapshots mas
+      nuevos» dice `qm delsnapshot` / `pct delsnapshot` (borrarlos desde la
+      UI de TrueNAS deja las secciones huerfanas en la configuracion), y no
+      inventa una lista vacia cuando TrueNAS 25.10 no da los nombres.
+    - Rollback multidisco: PVE revierte disco a disco y FUERA del lock de
+      la configuracion, asi que la negativa puede caer en el segundo disco
+      con el primero ya revertido y el invitado con `lock: rollback`. No se
+      destruye nada, pero ahora se registra un aviso de nivel 0 que lo
+      explica (`qm unlock` / `pct unlock`, quitar el bloqueador y repetir) y
+      queda documentado en Best-Practices.
+    - `volume_snapshot_info` conserva `createtxg` y la consulta va filtrada
+      por dataset: antes se traia la cabina entera para un solo zvol, tres
+      veces por rollback. `volume_rollback_is_possible` ordena por creacion,
+      luego por `createtxg` y solo entonces por nombre — una tarea periodica
+      crea todos los snapshots en el mismo segundo, asi que «el mas
+      reciente» se decidia alfabeticamente.
+    - Si no existe la configuracion en este nodo se consulta
+      `PVE::Cluster::get_vmlist()` y se dice en que nodo vive el invitado,
+      en vez del «Configuration file does not exist» que parece que no
+      existe.
+
   * Tests: t/nvme/21-snapshot-import-lxc.t (import de CT con stub de
     PVE::LXC::Config: rootfs + mp0 en el plugin + mp1 bind + mp2 device;
     mp0 en local-lvm y CT template rehusados) y t/nvme/22-rollback-safety.t

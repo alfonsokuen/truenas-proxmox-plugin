@@ -281,6 +281,15 @@ renders `$conf->{snapshots}` from `/etc/pve/qemu-server/<vmid>.conf` (or
   "is this still the newest snapshot?" check is repeated against the
   array immediately before it runs, and a newer snapshot that appeared in
   between makes the rollback fail by name instead of deleting it.
+- **A guest with several disks can be left locked and half rolled back.**
+  PVE rolls a guest back one volume at a time, and not under the guest
+  config lock, so that refusal can land on the second disk while the
+  first has already been rolled back. Nothing is destroyed, but the
+  guest keeps `lock: rollback`. The plugin logs a level 0 line to syslog
+  saying so. Recover with `qm unlock <vmid>` / `pct unlock <vmid>`,
+  delete the newer snapshot (with `qm delsnapshot` / `pct delsnapshot`,
+  not from the TrueNAS UI - that leaves the sections orphaned in the
+  configuration) and run the rollback again.
 
 Adopt them into the VM configuration and both problems go away, because
 PVE can then see and delete them:

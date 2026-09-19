@@ -2388,53 +2388,45 @@ sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
 }
 
 # ---- WebSocket-only snapshot rollback (TrueNAS 25.10+) ----
-sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
-    my $FORCE     = $force_bool     ? JSON::PP::true  : JSON::PP::false;
-    my $RECURSIVE = $recursive_bool ? JSON::PP::true  : JSON::PP::false;
-
-    # WebSocket-only for snapshot rollback (requires TrueNAS 25.10+)
-    # TrueNAS 25.10+ uses: pool.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
-    my $attempt_rollback = sub {
+#
+# Always non-recursive and never forced. `recursive` makes TrueNAS destroy
+# every snapshot newer than the target, and `force` its clones; neither is
+# ever what a PVE rollback asked for, and the retry-with-recursive branch
+# that used to live here re-introduced exactly that. There is no parameter
+# for it any more, so no caller can ask for it by mistake.
+sub _tn_snapshot_rollback($scfg, $snap_full) {
+    # TrueNAS 25.10+: pool.snapshot.rollback(snapshot_name, {force, recursive})
+    eval {
         my $conn = _ws_get_persistent($scfg);
-        return _ws_rpc($conn, {
+        _ws_rpc($conn, {
             jsonrpc => "2.0", id => $conn->{next_id}++,
             method  => "pool.snapshot.rollback",
-            params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
+            params  => [ $snap_full,
+                         { force => JSON::PP::false, recursive => JSON::PP::false } ],
         });
     };
+    return 1 if !$@;
 
-    eval { $attempt_rollback->(); };
-    if ($@) {
-        my $err = $@;
-        # ZFS constraint: newer snapshots exist on the target dataset.
-        # TN < 25.10 surfaces the libzfs message:
-        #   "more recent snapshots or bookmarks exist [...] use '-r' to force deletion"
-        # TN 25.10+ wraps it via truenas_pylibzfs and surfaces a different string:
-        #   "Cannot rollback: more recent snapshots exist. Use recursive=True to destroy them."
-        # plus the underlying FileExistsError. Match either shape.
-        if ($err =~ /more recent snapshots/i || $err =~ /Failed to rollback.*File exists/i) {
-            # If force=1 but recursive=0, and newer snapshots exist, we need recursive=1
-            if ($force_bool && !$recursive_bool) {
-                # Retry with recursive=1 to delete newer snapshots
-                eval {
-                    my $conn = _ws_get_persistent($scfg);
-                    _ws_rpc($conn, {
-                        jsonrpc => "2.0", id => $conn->{next_id}++,
-                        method  => "pool.snapshot.rollback",
-                        params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
-                    });
-                };
-                return 1 if !$@;
-            }
-            # Give a more user-friendly error message
-            my ($newer_snaps) = $err =~ /use '-r' to force deletion of the following[^:]*:\s*([^\n]+)/;
-            die "Cannot rollback to snapshot: newer snapshots exist ($newer_snaps). ".
-                "Delete them first, or roll back to the newest one instead; ".
-                "this plugin never destroys them for you.\n";
-        }
-        die "TrueNAS snapshot rollback failed: $err";
+    my $err = $@;
+    # ZFS constraint: newer snapshots exist on the target dataset.
+    # TN < 25.10 surfaces the libzfs message:
+    #   "more recent snapshots or bookmarks exist [...] use '-r' to force deletion"
+    # TN 25.10+ wraps it via truenas_pylibzfs and surfaces a different string:
+    #   "Cannot rollback: more recent snapshots exist. Use recursive=True to destroy them."
+    # plus the underlying FileExistsError. Match either shape.
+    if ($err =~ /more recent snapshots/i || $err =~ /Failed to rollback.*File exists/i) {
+        # Only the older message lists the names; 25.10 does not, and
+        # inventing an empty "()" there would read like "newer snapshots
+        # exist: none".
+        my ($newer_snaps) = $err =~ /use '-r' to force deletion of the following[^:]*:\s*([^\n]+)/;
+        $newer_snaps //= 'see the TrueNAS log for which';
+        die "Cannot rollback to snapshot: newer snapshots exist ($newer_snaps). "
+          . "Remove them with `qm delsnapshot` / `pct delsnapshot` - deleting "
+          . "them from the TrueNAS UI instead leaves the sections orphaned in "
+          . "the guest configuration - or roll back to the newest one; this "
+          . "plugin never destroys them for you.\n";
     }
-    return 1;
+    die "TrueNAS snapshot rollback failed: $err";
 }
 
 # Note: vmstate handling is now done through Proxmox's standard volume allocation
@@ -2741,8 +2733,18 @@ sub volume_rollback_is_possible {
 
     $blockers //= []; # not guaranteed to be set by caller
     my $found;
+    # Ordered by creation, then by createtxg - the ZFS transaction group, and
+    # the only thing that can order two snapshots taken in the same second -
+    # and only then by name. Falling straight from the timestamp to the name
+    # made "most recent" alphabetical whenever a periodic task took two
+    # snapshots in one second, which is how they are normally taken.
     for my $snapid (
-        sort { $snapshots->{$a}{timestamp} <=> $snapshots->{$b}{timestamp} or $a cmp $b }
+        sort {
+            $snapshots->{$a}{timestamp} <=> $snapshots->{$b}{timestamp}
+                || (defined($snapshots->{$a}{txg}) && defined($snapshots->{$b}{txg})
+                    ? $snapshots->{$a}{txg} <=> $snapshots->{$b}{txg} : 0)
+                || $a cmp $b
+        }
         keys %$snapshots
     ) {
         if ($snapid eq $snap) {
@@ -2769,7 +2771,7 @@ sub volume_snapshot_rollback {
     # PVE core does not wrap volume_snapshot_rollback in cluster_lock_storage;
     # take the lock here. See the comment on volume_snapshot above.
     return $class->cluster_lock_storage($storeid, 1, undef, sub {
-        my (undef, $zname, $vmid) = $class->parse_volname($volname);
+        my (undef, $zname) = $class->parse_volname($volname);
         my $full = $scfg->{tn_dataset} . '/' . $zname;
         my $snap_full = $full . '@' . $snapname;
 
@@ -2788,11 +2790,30 @@ sub volume_snapshot_rollback {
                 $snapname, $blockers);
         };
         if (my $err = $@) {
-            die "[TrueNAS] refusing to roll back $snap_full: a newer snapshot "
-              . "appeared on the array after the rollback was approved ("
-              . join(', ', @$blockers) . "). Nothing was destroyed; delete it "
-              . "or roll back to it instead.\n"
-                if @$blockers;
+            if (@$blockers) {
+                # PVE rolls a guest back one volume at a time, and NOT under
+                # the guest config lock, so this refusal can land on the
+                # second disk with the first one already rolled back. That is
+                # still far better than destroying snapshots, but it leaves
+                # the guest half rolled back and holding `lock: rollback`,
+                # and an operator who only sees "refusing to roll back" would
+                # not know either. Level 0: it has to reach syslog even with
+                # debugging off.
+                _log($scfg, 0, 'err', "[TrueNAS] volume_snapshot_rollback: "
+                    . "refused $snap_full because a newer snapshot appeared "
+                    . "on the array (" . join(', ', @$blockers) . "). If this "
+                    . "guest has more than one disk, the earlier ones may "
+                    . "already have been rolled back and the guest is left "
+                    . "locked: clear it with `qm unlock <vmid>` / "
+                    . "`pct unlock <vmid>`, remove the newer snapshot, and "
+                    . "run the rollback again.");
+                die "[TrueNAS] refusing to roll back $snap_full: a newer "
+                  . "snapshot appeared on the array after the rollback was "
+                  . "approved (" . join(', ', @$blockers) . "). Nothing was "
+                  . "destroyed. Remove it and retry, or roll back to it "
+                  . "instead; if the guest has several disks it may be left "
+                  . "locked and half rolled back - see the syslog line above.\n";
+            }
             die $err;
         }
 
@@ -2803,20 +2824,20 @@ sub volume_snapshot_rollback {
         # in ZFSPoolPlugin), so by the time we get here there is nothing
         # newer to destroy. If the array disagrees, its error is the truth
         # and the answer is to fail, not to widen the blast radius.
-        _tn_snapshot_rollback($scfg, $snap_full, 0, 0);
+        _tn_snapshot_rollback($scfg, $snap_full);
 
         # Note: vmstate restoration is handled automatically by Proxmox.
         #
-        # Nothing rewrites the guest configuration here. The plugin used to
-        # diff the snapshot list before and after and strip the sections of
-        # whatever the recursive rollback had destroyed, by editing
-        # /etc/pve/qemu-server/<vmid>.conf as text, with no lock_config and
-        # with no equivalent for containers. With the rollback no longer
-        # destroying anything, there are no stale sections to clean: PVE's
-        # AbstractConfig::snapshot_rollback() owns the config side of a
-        # rollback (it drops the sections it invalidates itself, under
-        # lock_config), and a storage plugin editing a guest config behind
-        # its back was a corruption waiting for a concurrent writer.
+        # Nothing rewrites the guest configuration here, and nothing needs
+        # to. The plugin used to diff the snapshot list before and after and
+        # strip the sections of whatever the recursive rollback had
+        # destroyed, by editing /etc/pve/qemu-server/<vmid>.conf as text,
+        # with no lock_config and with no equivalent for containers. The
+        # rollback above destroys nothing, so no section is left describing
+        # a snapshot that is gone - there is nothing to clean up. The config
+        # side of a rollback belongs to PVE::AbstractConfig::snapshot_rollback()
+        # either way; a storage plugin editing a guest config behind its back
+        # was a corruption waiting for a concurrent writer.
 
         # Refresh the initiator view. iSCSI only: on an NVMe/TCP storage
         # there is no iSCSI session to rescan, and running iscsiadm anyway
@@ -2846,7 +2867,13 @@ sub volume_snapshot_rollback {
 }
 
 # Return a hash describing available snapshots for this volume.
-# Shape: { <snapname> => { id => <snapname>, timestamp => <epoch> }, ... }
+# Shape: { <snapname> => { id => <snapname>, timestamp => <epoch>,
+#                          txg => <createtxg|undef> }, ... }
+#
+# `txg` is not part of the PVE contract - PVE reads `id` and `timestamp` -
+# but it is the only honest way to order two snapshots taken in the same
+# second, and volume_rollback_is_possible() below uses it to decide what
+# "most recent" means. The array reports it on every snapshot record.
 sub volume_snapshot_info {
     my ($class, $scfg, $storeid, $volname) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
@@ -2854,11 +2881,22 @@ sub volume_snapshot_info {
 
     _log($scfg, 2, 'debug', "[TrueNAS] volume_snapshot_info: querying snapshots for $full");
 
-    my $list = _api_call($scfg, 'pool.snapshot.query', []) // [];
+    # Filtered server-side on the dataset. It used to pull every snapshot on
+    # the array and grep the answer, which is the whole array over the wire
+    # for one zvol - three times per rollback, once per volume_snapshot_info
+    # call. The grep below stays: a filter the middleware did not honour
+    # must not smuggle a neighbour's snapshot in.
+    my $list = _api_call($scfg, 'pool.snapshot.query',
+        [ [ [ 'dataset', '=', $full ] ],
+          { extra => { properties => ['creation'] } } ]) // [];
 
     my $snaps = {};
     for my $s (@$list) {
-        my $name = $s->{name} // next; # "pool/ds@sn"
+        my $name = $s->{name} // $s->{id}; # "pool/ds@sn"
+        if (!defined($name) && defined($s->{dataset}) && defined($s->{snapshot_name})) {
+            $name = "$s->{dataset}\@$s->{snapshot_name}";
+        }
+        next if !defined($name) || ref($name);
         next unless $name =~ /^\Q$full\E\@(.+)$/;
         my $snapname = $1;
         my $ts = 0;
@@ -2869,7 +2907,9 @@ sub volume_snapshot_info {
                 $ts = int($1);
             }
         }
-        $snaps->{$snapname} = { id => $snapname, timestamp => $ts };
+        my $txg = $s->{createtxg};
+        $txg = defined($txg) && !ref($txg) && $txg =~ /^\d+$/ ? $txg + 0 : undef;
+        $snaps->{$snapname} = { id => $snapname, timestamp => $ts, txg => $txg };
     }
 
     return $snaps;
@@ -2935,6 +2975,26 @@ our $TN_QEMU_CONF_DIR = '/etc/pve/qemu-server';
 sub _tn_guest_config($vmid) {
     return { kind => 'lxc', class => 'PVE::LXC::Config', label => 'CT' }
         if -e "$TN_LXC_CONF_DIR/$vmid.conf";
+    return { kind => 'qemu', class => 'PVE::QemuConfig', label => 'VM' }
+        if -e "$TN_QEMU_CONF_DIR/$vmid.conf";
+
+    # Neither file is here. In a cluster that usually means the guest is on
+    # another node, and the config file on THIS node is the only thing the
+    # importer can lock - so say where it lives instead of letting
+    # QemuConfig answer "Configuration file does not exist", which reads
+    # like the guest is gone. Best effort: the cluster file system may not
+    # be available (a single node, a test), and then the old error is still
+    # the right one.
+    my $entry = eval {
+        require PVE::Cluster;
+        PVE::Cluster::get_vmlist()->{ids}{$vmid};
+    };
+    if (ref($entry) eq 'HASH' && $entry->{node}) {
+        my $type = ($entry->{type} // '') eq 'lxc' ? 'container' : 'VM';
+        die "$vmid is a $type on node '$entry->{node}', not on this one; "
+          . "run import-snapshots there\n";
+    }
+
     return { kind => 'qemu', class => 'PVE::QemuConfig', label => 'VM' };
 }
 

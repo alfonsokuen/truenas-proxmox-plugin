@@ -155,6 +155,16 @@ our $QEMU_TOUCHED = 0;
 }
 $INC{'PVE/QemuConfig.pm'} = 1;
 
+# The cluster file system is consulted only to say on WHICH node a guest
+# lives when neither configuration file is here. Stubbed empty, so these
+# tests never depend on what happens to exist in /etc/pve on the machine
+# running them.
+{
+    package PVE::Cluster;
+    sub get_vmlist { return { ids => {} } }
+}
+$INC{'PVE/Cluster.pm'} = 1;
+
 our $STORECFG = {
     ids => {
         tnnvme => { type => 'truenasplugin', tn_dataset => 'pool/pve',

@@ -128,6 +128,16 @@ our $BEFORE_LOCK;   # runs inside lock_config, before the plugin's code
 }
 $INC{'PVE/QemuConfig.pm'} = 1;
 
+# The cluster file system is consulted only to say on WHICH node a guest
+# lives when neither configuration file is here. Stubbed empty, so these
+# tests never depend on what happens to exist in /etc/pve on the machine
+# running them.
+{
+    package PVE::Cluster;
+    sub get_vmlist { return { ids => {} } }
+}
+$INC{'PVE/Cluster.pm'} = 1;
+
 # ---------------------------------------------------- stub the storage cfg ---
 # tnnvme and tnother are two DIFFERENT arrays that happen to use the same
 # dataset path - the case that made a snapshot present on one look present on
