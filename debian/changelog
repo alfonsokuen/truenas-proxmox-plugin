@@ -10,25 +10,72 @@ truenas-proxmox-plugin (2.1.23~beta4) unstable; urgency=medium
     already running before this package was installed, HA-manager
     never learns the truenasplugin type exists until those two
     daemons restart -- surfacing as "storage provided by plugin is
-    unsupported" in HA resource config, exactly the workaround the
-    community found independently in the issue thread (restart
-    pve-ha-crm/pve-ha-lrm).
+    unsupported" in HA resource config. debian/postinst now restarts
+    pve-ha-crm/pve-ha-lrm alongside pvedaemon/pveproxy/pvestatd, still
+    gated by the existing TRUENAS_PLUGIN_NO_RESTART opt-out. Verified
+    live that a bare service restart never triggers a real HA
+    freeze/migrate/fence action, because PVE::HA::LRM only queues
+    those on a pending shutdown.target/reboot.target job -- which a
+    systemctl restart does not create.
 
-    Verified live on a 3-node test cluster that a plain service
-    restart does not disrupt HA-tracked resources: PVE::HA::LRM's
-    shutdown_request() only queues stop/freeze/migrate actions when
-    PVE::HA::Env::PVE2::is_node_shutdown() reports a pending
-    shutdown.target/reboot.target job, which a `systemctl restart`
-    never queues. Ran the modified restart_proxmox_services() against
-    the live pve-ha-crm/pve-ha-lrm on a node carrying two HA-tracked
-    VMs (disarmed/ignore mode): both daemons restarted with fresh
-    PIDs, ha-manager status showed the same services on the same
-    nodes before and after, no migration, freeze, or fencing action
-    triggered. Also verified TRUENAS_PLUGIN_NO_RESTART=1 still skips
-    all four daemons (now including the two HA ones) and prints the
-    updated manual restart command.
+  * Plugin runtime: status() capacity cache now survives across
+    processes via a /run/truenas-plugin/status-<key> stamp (issue
+    #106).
 
- -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 11 Sep 2026 22:00:00 -0400
+    status()'s STATUS_CAPACITY_TTL_S=10s cache lived in the in-process
+    %API_CACHE. Every `pvesm status` is a fresh Perl interpreter so
+    that cache was always cold in exactly the path PVE hits from
+    PVE::API2::Storage::Status::upload -- that handler runs
+    `ssh peer pvesm status --storage local` synchronously and
+    pveproxy closes the connection at 5s idle. Reporter measured
+    8-11s per pvesm status on a 501-dataset pool; roughly two of
+    three Cluster-API VM uploads failed with "curl: (52) Empty
+    reply from server". status() now first checks the in-process
+    cache (unchanged), then falls through to an on-disk JSON stamp
+    that any process can read within STATUS_CAPACITY_STAMP_TTL_S,
+    and only then hits pool.dataset.get_instance. Cache is
+    invalidated on any mutation the plugin already invalidates for.
+    Stamp I/O is best-effort (bumps a counter but never dies).
+
+    Stamp TTL initially set to 60s, verified by inspection then
+    lowered to 15s after disk_discard.pl fill/observe on the test
+    cluster came back as "writing data grew the storage allocation:
+    +0.00 GiB". 60s TTL was long enough that the after-fill
+    pvesm status hit the stamp written before the ~30s in-guest
+    fill and returned the pre-fill value. 15s is short enough that
+    a ~30s write completes past the TTL, so the follow-up status()
+    reflects the fresh 'used' number, while still coalescing the
+    burst of back-to-back cross-node upload probes that motivated
+    the fix.
+
+  * Plugin runtime + broker: FQDN handling on PVE 9 / Perl 5.40
+    (issue #102). Two independent FQDN failures reported against
+    a 7-node PVE 9.2 cluster on TrueNAS SCALE 25.10.7:
+
+    - _host_ipv4 called Socket::gethostbyname($host). Perl 5.40
+      (Debian Trixie, ships with PVE 9) removed the AUTOLOAD path
+      that used to resolve that name to the core builtin; the call
+      now dies with "Undefined subroutine Socket::AUTOLOAD" and the
+      storage never comes up when tn_api_host is an FQDN. Switched
+      both TrueNASPlugin.pm and tools/truenas-plugin-broker to
+      Socket::inet_aton, which is the proper Socket export for an
+      A-record lookup and works on every supported Perl.
+
+    - _portal_connected compared the configured portal against
+      iscsiadm session output as a literal string. iscsiadm always
+      reports the resolved IPv4 (e.g. 192.0.2.10:3260), storage.cfg
+      often holds the FQDN (e.g. storage.example.com:3260); the two
+      never match, so _iscsi_login_all retried login on every
+      activate_volume, and open-iscsi answered "1 session
+      requested, but 1 already present". Task still completed
+      TASK OK but the log noise was on every VM start.
+      _portal_connected now precomputes the IP-resolved form of the
+      configured portal (via the newly-reliable _host_ipv4) and
+      matches session lines against both the original form and the
+      IP form. Falls back to the literal path when DNS resolution
+      fails; IP literals stay a no-op.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Thu, 18 Sep 2026 23:15:00 -0400
 
 truenas-proxmox-plugin (2.1.23~beta3) unstable; urgency=medium
 
