@@ -274,9 +274,13 @@ renders `$conf->{snapshots}` from `/etc/pve/qemu-server/<vmid>.conf` (or
 - A TrueNAS snapshot newer than a PVE one makes `qm rollback <older>`
   fail with `is not most recent snapshot`, and the GUI offers no way to
   remove the blocker.
-- A rollback that does go through **destroys** every snapshot taken after
-  the target, this plugin's and the array's alike — ZFS rollback is
-  recursive.
+- A rollback that does go through used to **destroy** every snapshot
+  taken after the target, this plugin's and the array's alike, because
+  the plugin asked ZFS for a recursive rollback. As of
+  `2.1.23~alpha1+idk19` it does not: the rollback is non-recursive, the
+  "is this still the newest snapshot?" check is repeated against the
+  array immediately before it runs, and a newer snapshot that appeared in
+  between makes the rollback fail by name instead of deleting it.
 
 Adopt them into the VM configuration and both problems go away, because
 PVE can then see and delete them:

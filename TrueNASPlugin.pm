@@ -2429,7 +2429,8 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
             # Give a more user-friendly error message
             my ($newer_snaps) = $err =~ /use '-r' to force deletion of the following[^:]*:\s*([^\n]+)/;
             die "Cannot rollback to snapshot: newer snapshots exist ($newer_snaps). ".
-                "Delete newer snapshots first or enable recursive rollback.\n";
+                "Delete them first, or roll back to the newest one instead; ".
+                "this plugin never destroys them for you.\n";
         }
         die "TrueNAS snapshot rollback failed: $err";
     }
@@ -2439,55 +2440,6 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
 # Note: vmstate handling is now done through Proxmox's standard volume allocation
 # When vmstate_storage is 'shared', Proxmox automatically creates vmstate volumes on this storage
 # When vmstate_storage is 'local', Proxmox stores vmstate on local filesystem (better performance)
-
-# Helper function to clean up stale snapshot entries from VM config
-sub _cleanup_vm_snapshot_config {
-    my ($vmid, $deleted_snaps) = @_;
-    return unless $vmid && $deleted_snaps && @$deleted_snaps;
-
-    my $config_file = "/etc/pve/qemu-server/$vmid.conf";
-    return unless -f $config_file;
-
-    # Read the current config
-    open my $fh, '<', $config_file or die "Cannot read $config_file: $!";
-    my @lines = <$fh>;
-    close $fh;
-
-    # Filter out stale snapshot sections
-    my @new_lines = ();
-    my $in_stale_section = 0;
-    my $current_section = '';
-
-    for my $line (@lines) {
-        chomp $line;
-
-        # Check if this line starts a snapshot section
-        if ($line =~ /^\[([^\]]+)\]$/) {
-            $current_section = $1;
-            $in_stale_section = grep { $_ eq $current_section } @$deleted_snaps;
-        }
-
-        # Skip lines that are part of a stale snapshot section
-        unless ($in_stale_section) {
-            push @new_lines, $line;
-        }
-
-        # Reset section tracking on blank lines
-        if ($line eq '') {
-            $in_stale_section = 0;
-            $current_section = '';
-        }
-    }
-
-    # Write the cleaned config back
-    open $fh, '>', $config_file or die "Cannot write $config_file: $!";
-    for my $line (@new_lines) {
-        print $fh "$line\n";
-    }
-    close $fh;
-
-    # Note: pve-cluster restart removed as it's not necessary for snapshot cleanup to work
-}
 
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
@@ -2815,9 +2767,7 @@ sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
 
     # PVE core does not wrap volume_snapshot_rollback in cluster_lock_storage;
-    # take the lock here. See the comment on volume_snapshot above. Rollback
-    # is especially sensitive to concurrent execution because it destroys
-    # newer snapshots as a side effect (recursive=1 below).
+    # take the lock here. See the comment on volume_snapshot above.
     return $class->cluster_lock_storage($storeid, 1, undef, sub {
         my (undef, $zname, $vmid) = $class->parse_volname($volname);
         my $full = $scfg->{tn_dataset} . '/' . $zname;
@@ -2825,62 +2775,72 @@ sub volume_snapshot_rollback {
 
         _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_rollback: rolling back to $snap_full");
 
-    # Get list of snapshots that exist BEFORE rollback
-    my $pre_rollback_snaps = {};
-    if ($vmid) {
+        # volume_rollback_is_possible() already refused anything that is not
+        # the newest snapshot - but PVE calls it BEFORE it stops the guest and
+        # before this lock is taken, and a periodic task on the array, a
+        # replication job or another node can create a snapshot in between.
+        # Asked again here, with the storage lock held and against the array
+        # rather than against the earlier answer, so the window is the array
+        # round trip and not the whole rollback job.
+        my $blockers = [];
         eval {
-            my $snap_list = $class->volume_snapshot_info($scfg, $storeid, $volname);
-            $pre_rollback_snaps = { %$snap_list };
+            $class->volume_rollback_is_possible($scfg, $storeid, $volname,
+                $snapname, $blockers);
         };
-    }
-
-    # PVE's snapshot-rollback contract: revert to the target snapshot's state.
-    # Anything taken AFTER the target is conceptually undone, so any newer
-    # snapshots on the same dataset must be destroyed. Pass recursive=1 so TN's
-    # rollback removes intermediate snapshots; otherwise TN 25.10 errors with
-    # "Cannot rollback: more recent snapshots exist. Use recursive=True to
-    # destroy them." and the rollback fails. Verified against TN 25.10
-    # snapshot_rollback_impl.py: recursive=True triggers
-    # _destroy_newer_snapshots() on the target dataset and does NOT touch
-    # clones (controlled by recursive_clones) or child datasets (controlled
-    # by recursive_rollback).
-    _tn_snapshot_rollback($scfg, $snap_full, 1, 1);
-
-    # Note: vmstate restoration is handled automatically by Proxmox
-
-    # Clean up stale Proxmox VM config entries for deleted snapshots
-    if ($vmid && %$pre_rollback_snaps) {
-        eval {
-            # Get current snapshots from TrueNAS after rollback
-            my $post_rollback_snaps = $class->volume_snapshot_info($scfg, $storeid, $volname);
-
-            # Find snapshots that were deleted by the rollback
-            my @deleted_snaps = grep { !exists $post_rollback_snaps->{$_} } keys %$pre_rollback_snaps;
-
-            if (@deleted_snaps) {
-                # Clean up VM config file by removing stale snapshot entries
-                _cleanup_vm_snapshot_config($vmid, \@deleted_snaps);
-            }
-        };
-        warn "Failed to clean up stale snapshot entries: $@" if $@;
-    }
-
-    # Refresh initiator view — rescan only this storage's target to avoid disrupting
-    # other active iSCSI sessions on unrelated volumes during the rollback
-    my $rollback_iqn = $scfg->{tn_target_iqn};
-    eval {
-        if ($rollback_iqn) {
-            PVE::Tools::run_command(['iscsiadm','-m','node','-T',$rollback_iqn,'-R'], outfunc=>sub{});
-        } else {
-            PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{});
+        if (my $err = $@) {
+            die "[TrueNAS] refusing to roll back $snap_full: a newer snapshot "
+              . "appeared on the array after the rollback was approved ("
+              . join(', ', @$blockers) . "). Nothing was destroyed; delete it "
+              . "or roll back to it instead.\n"
+                if @$blockers;
+            die $err;
         }
-    };
-    if ($scfg->{tn_use_multipath}) {
-        eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
-    }
-    eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
 
-    _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_rollback: rolled back to $snap_full");
+        # NOT recursive and NOT forced. A recursive rollback destroys every
+        # snapshot newer than the target, which is data loss the operator
+        # never asked for: PVE's contract is that rollback is refused when
+        # the target is not the newest (volume_rollback_is_possible above and
+        # in ZFSPoolPlugin), so by the time we get here there is nothing
+        # newer to destroy. If the array disagrees, its error is the truth
+        # and the answer is to fail, not to widen the blast radius.
+        _tn_snapshot_rollback($scfg, $snap_full, 0, 0);
+
+        # Note: vmstate restoration is handled automatically by Proxmox.
+        #
+        # Nothing rewrites the guest configuration here. The plugin used to
+        # diff the snapshot list before and after and strip the sections of
+        # whatever the recursive rollback had destroyed, by editing
+        # /etc/pve/qemu-server/<vmid>.conf as text, with no lock_config and
+        # with no equivalent for containers. With the rollback no longer
+        # destroying anything, there are no stale sections to clean: PVE's
+        # AbstractConfig::snapshot_rollback() owns the config side of a
+        # rollback (it drops the sections it invalidates itself, under
+        # lock_config), and a storage plugin editing a guest config behind
+        # its back was a corruption waiting for a concurrent writer.
+
+        # Refresh the initiator view. iSCSI only: on an NVMe/TCP storage
+        # there is no iSCSI session to rescan, and running iscsiadm anyway
+        # printed "No session found" on every rollback - noise that trains an
+        # operator to ignore the one time it means something.
+        my $mode = $scfg->{tn_transport_mode} // 'iscsi';
+        if ($mode eq 'iscsi') {
+            # Rescan only this storage's target, to avoid disrupting other
+            # active iSCSI sessions on unrelated volumes during the rollback.
+            my $rollback_iqn = $scfg->{tn_target_iqn};
+            eval {
+                if ($rollback_iqn) {
+                    PVE::Tools::run_command(['iscsiadm','-m','node','-T',$rollback_iqn,'-R'], outfunc=>sub{});
+                } else {
+                    PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{});
+                }
+            };
+            if ($scfg->{tn_use_multipath}) {
+                eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
+            }
+        }
+        eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
+
+        _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_rollback: rolled back to $snap_full");
         return undef;
     });
 }
