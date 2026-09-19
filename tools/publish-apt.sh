@@ -33,9 +33,11 @@
 #
 # THE SIGNING KEY
 #   Lives only in the SOPS vault. It is streamed to the container over ssh's
-#   stdin and imported into a GNUPGHOME on tmpfs: it is never written to the
-#   Docker host's disk. The remote working directory is removed on exit,
-#   including on failure and including with --keep.
+#   stdin and imported into a GNUPGHOME on tmpfs, so it is never written to a
+#   filesystem on the Docker host - tmpfs pages can still be swapped out by
+#   that host's kernel, which is the residual exposure. The remote working
+#   directory is removed on exit, including on failure and including with
+#   --keep.
 #
 # Usage:
 #   IDK_DOCKER_HOST=root@<host> IDK_VAULT=/path/to/vault.sops.yaml \
@@ -132,6 +134,15 @@ fi
 [ -n "$repo_slug" ] ||
     die 2 'cannot tell which GitHub repo to publish; set IDK_GH_REPO=owner/repo'
 pages_url="${IDK_PAGES_URL:-https://${repo_slug%%/*}.github.io/${repo_slug#*/}/apt}"
+
+push_url="$(git -C "$repo_root" remote get-url github)"
+# Read the tip we intend to replace NOW, not after the build: the lease has to
+# cover the whole run, or a gh-pages published while this one was building gets
+# discarded by a lease that was taken after it landed.
+expected_tip="$(git -C "$repo_root" ls-remote "$push_url" gh-pages | awk '{ print $1; exit }' || true)"
+if [ -n "$expected_tip" ]; then
+    log "gh-pages is at $expected_tip; that is the tip this run will replace"
+fi
 
 ssh -o ConnectTimeout=15 "$docker_host" 'docker --version >/dev/null' ||
     die 2 "cannot reach docker on $docker_host"
@@ -282,11 +293,7 @@ if [ "$opt_push" -eq 0 ]; then
 fi
 
 # --- 5. publish to the orphan gh-pages branch ---------------------------
-push_url="$(git -C "$repo_root" remote get-url github)"
-# Read the tip we are replacing, and hand it to --force-with-lease: a plain
-# --force would silently discard a gh-pages someone else published while this
-# run was building.
-expected_tip="$(git -C "$repo_root" ls-remote "$push_url" gh-pages | awk '{ print $1; exit }')"
+# The lease was taken at the start of the run, on purpose.
 if [ -n "$expected_tip" ]; then
     log "replacing gh-pages $expected_tip"
     lease_arg="--force-with-lease=gh-pages:$expected_tip"
@@ -334,3 +341,20 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 log "published: $pages_url"
 log 'GitHub Pages can take a minute to rebuild.'
+
+# --- 6. the installer itself, as a release asset -------------------------
+# raw.githubusercontent.com serves a cached copy of a branch file for a long
+# while - long enough that a node ran the previous revision of this installer
+# without anyone noticing. Release assets are not behind that cache, so the
+# documented one-line install points at
+# .../releases/latest/download/install-idk.sh and this is what keeps it
+# current.
+newest_rev="$(printf '%s' "$revisions" | tr ' ' '\n' | grep -v '^$' | tail -n1)"
+newest_tag="v${BASE_VERSION}+${newest_rev}"
+if gh release upload "$newest_tag" "$repo_root/install-idk.sh" -R "$repo_slug" --clobber; then
+    log "install-idk.sh uploaded to $newest_tag"
+    log "one-line install: https://github.com/$repo_slug/releases/latest/download/install-idk.sh"
+else
+    warn "could not attach install-idk.sh to $newest_tag; the one-line install"
+    warn 'URL will keep serving the previous revision until it is uploaded.'
+fi

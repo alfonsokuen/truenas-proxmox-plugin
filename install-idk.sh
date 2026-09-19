@@ -3,7 +3,12 @@
 # install-idk.sh - one-line installer for the IDKMANAGER fork of
 # truenas-proxmox-plugin (github.com/alfonsokuen/truenas-proxmox-plugin).
 #
-#   curl -sSL https://raw.githubusercontent.com/alfonsokuen/truenas-proxmox-plugin/idk-fork/install-idk.sh | bash
+#   curl -sSL https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/latest/download/install-idk.sh | bash
+#
+# Use the releases URL, not raw.githubusercontent.com: the raw endpoint
+# serves a cached copy of a branch file long enough to run a stale
+# installer without noticing. That is why this script announces its own
+# INSTALLER_VERSION on the first line.
 #   bash install-idk.sh [--apt] [--version idkNN] [--wizard] [--dry-run]
 #
 # Two install paths:
@@ -35,6 +40,10 @@
 #
 set -euo pipefail
 
+# Bump on every change that is meant to reach a node. raw.githubusercontent
+# caches aggressively, so the only way to know which script is running is
+# for the script to say so.
+INSTALLER_VERSION='idk19.3'
 PKG_NAME='truenas-proxmox-plugin'
 BASE_VERSION='2.1.23-alpha1'
 GH_API_BASE="${IDK_GH_API_BASE:-https://api.github.com}"
@@ -234,7 +243,7 @@ parse_assets() {
     rm -f "$workdir/py.status"
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$workdir/release.json" "$workdir/assets.tsv" "$workdir/py.status" <<'PY' || true
-import json, sys
+import json, re, sys
 
 src, dest, status = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
@@ -246,12 +255,22 @@ except Exception as exc:
     with open(status, 'w') as fh:
         fh.write('bad: %s\n' % exc)
     raise SystemExit(0)
+# The asset name and URL end up as the two fields of a TAB-separated
+# file. A name carrying a tab or a newline would forge extra rows there,
+# and one row is all it takes to point the download somewhere else. Keep
+# only what this project can actually publish; drop the rest silently,
+# the caller already fails when nothing usable is left.
+NAME_RE = re.compile(r'^[A-Za-z0-9._~+-]+$')
+URL_RE = re.compile(r'^(https|file)://[A-Za-z0-9./_~+%:@-]+$')
 with open(dest, 'w') as out:
     for asset in data.get('assets') or []:
         name = asset.get('name')
         url = asset.get('browser_download_url')
-        if name and url:
-            out.write('%s\t%s\n' % (name, url))
+        if not isinstance(name, str) or not isinstance(url, str):
+            continue
+        if not NAME_RE.match(name) or not URL_RE.match(url):
+            continue
+        out.write('%s\t%s\n' % (name, url))
 with open(status, 'w') as fh:
     fh.write('ok\n')
 PY
@@ -266,7 +285,14 @@ PY
         tr ',' '\n' <"$workdir/release.json" |
             sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
             while IFS= read -r url; do
-                printf '%s\t%s\n' "${url##*/}" "$url"
+                # Same filter as the python path: a URL or a name with a
+                # tab, a newline or whitespace would forge TSV rows. The
+                # name here is the URL's last segment, which GitHub
+                # percent-encodes, so '%' is allowed too.
+                printf '%s' "$url" | grep -qE '^(https|file)://[A-Za-z0-9./_~+%:@-]+$' || continue
+                name="${url##*/}"
+                printf '%s' "$name" | grep -qE '^[A-Za-z0-9._~%+-]+$' || continue
+                printf '%s\t%s\n' "$name" "$url"
             done >"$workdir/assets.tsv" || true
     fi
 
@@ -375,7 +401,6 @@ apt_suite() {
 
 fetch_and_verify_key() {
     # $1 = destination file for the dearmored key
-    local fprs
     http_get "${APT_BASE_URL}/KEY.gpg" "$1" ||
         die 4 "could not download the repository key from ${APT_BASE_URL}/KEY.gpg"
     [ -s "$1" ] || die 3 'the downloaded repository key is empty'
@@ -387,11 +412,25 @@ fetch_and_verify_key() {
     # throwaway home keeps this out of root's real keyring.
     mkdir -p "$workdir/gnupg"
     chmod 700 "$workdir/gnupg"
-    fprs="$(GNUPGHOME="$workdir/gnupg" gpg --show-keys --with-colons "$1" 2>/dev/null |
-        awk -F: '$1 == "fpr" { print $10 }' || true)"
-    if ! printf '%s\n' "$fprs" | grep -qx "$APT_KEY_FPR"; then
+    local colons pub_count primary
+    colons="$(GNUPGHOME="$workdir/gnupg" gpg --show-keys --with-colons "$1" 2>/dev/null || true)"
+    [ -n "$colons" ] || die 3 'the downloaded repository key is not an OpenPGP key'
+
+    # `Signed-By` trusts the WHOLE file, not the fingerprint we checked. A
+    # keyring that carries our key plus a second one would pass a "does it
+    # contain our fingerprint" test and hand apt an extra signer. So: exactly
+    # one public key, and it has to be ours.
+    pub_count="$(printf '%s\n' "$colons" | awk -F: '$1 == "pub" { n++ } END { print n + 0 }')"
+    primary="$(printf '%s\n' "$colons" |
+        awk -F: '$1 == "pub" { seen = 1; next } seen && $1 == "fpr" { print $10; exit }')"
+    if [ "$pub_count" -ne 1 ]; then
+        warn "the key file carries $pub_count public keys; exactly 1 is allowed"
+        warn 'apt would trust every key in the file, not just the expected one'
+        die 3 'the repository key file carries more than one key'
+    fi
+    if [ "$primary" != "$APT_KEY_FPR" ]; then
         warn "expected fingerprint $APT_KEY_FPR"
-        warn "key file offers: ${fprs:-<none: not an OpenPGP key>}"
+        warn "key file offers: ${primary:-<none: not an OpenPGP key>}"
         die 3 'the repository key does not match the fingerprint this installer pins'
     fi
     log "repository key fingerprint verified: $APT_KEY_FPR"
@@ -434,18 +473,31 @@ candidate_version() {
         sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p' | head -n1
 }
 
-candidate_origins() {
-    # Prints the origin of each entry under the candidate version block.
+candidate_origin_hosts() {
+    # Prints the HOST of each entry under the candidate version block.
+    #
+    # Matching the expected host as a substring of the whole origin URL is not
+    # a check: https://untrusted.example/alfonsokuen.github.io/apt contains it.
+    # Take the authority component, drop any userinfo (https://ours@evil/ is
+    # served by evil), and compare the result for equality.
     local cand="$1"
     shift
     LC_ALL=C apt-cache "$@" policy "$PKG_NAME" 2>/dev/null | awk -v cand="$cand" '
+        function host(u,   a) {
+            if (u !~ /:\/\//) return ""
+            sub(/^[^:]*:\/\//, "", u)
+            sub(/\/.*$/, "", u)
+            a = index(u, "@")
+            if (a > 0) u = substr(u, a + 1)
+            return u
+        }
         {
             line = $0
             sub(/^[ \t]*/, "", line)
             sub(/^\*\*\*[ \t]*/, "", line)
             n = split(line, f, /[ \t]+/)
             if (n >= 2 && f[2] ~ /^(https?:|ftp:|file:|\/)/) {
-                if (inblock) print f[2]
+                if (inblock) print host(f[2])
                 next
             }
             inblock = (n >= 2 && f[1] == cand && f[2] ~ /^[0-9]+$/)
@@ -465,19 +517,16 @@ assert_candidate_is_ours() {
         warn "package, and narrow it to upstream's origin (truenas.github.io)."
         die 5 'the repository is configured but the package is pinned out'
     fi
-    origins="$(candidate_origins "$cand" "$@")"
-    if ! printf '%s\n' "$origins" | grep -qF "$host"; then
-        warn "candidate $cand comes from: ${origins:-<unknown>}"
-        warn "expected an origin on $host"
+    if ! printf '%s' "$cand" | grep -qE '^1:[0-9][A-Za-z0-9.~+:-]*$'; then
+        warn "candidate $cand is not a fork build (expected an epoch '1:' version)"
+        die 5 "the candidate does not look like a fork build"
+    fi
+    origins="$(candidate_origin_hosts "$cand" "$@")"
+    if ! printf '%s\n' "$origins" | grep -qx -- "$host"; then
+        warn "candidate $cand is served by: ${origins:-<unknown>}"
+        warn "expected exactly the host $host"
         die 5 "the installation candidate is NOT the fork's package; refusing to install"
     fi
-    case "$cand" in
-        1:*) : ;;
-        *)
-            warn "candidate $cand carries no epoch"
-            die 5 "the candidate does not look like a fork build (epoch '1:' missing)"
-            ;;
-    esac
     log "repository candidate: $cand (from $host)"
 }
 
@@ -495,12 +544,29 @@ apt_dry_run() {
         "$suite" "$sandbox/KEY.gpg"
 
     log '--dry-run: refreshing the fork repository into a temporary APT state'
+    # What this sandbox DOES isolate: the source list, the downloaded
+    # indices and the package cache all live under $workdir and are deleted
+    # with it, and the update runs no inherited apt hook.
+    #
+    # What it deliberately does NOT isolate: /etc/apt/preferences.d. The pins
+    # there are exactly what decides whether this node could install the
+    # package at all, so a dry run that ignored them would report a candidate
+    # the real install never gets - the failure this check exists to catch.
+    #
+    # What it cannot isolate: the network, and anything a hook already ran
+    # before this process started.
     local opts
     opts=(-o "Dir::Etc::sourcelist=/dev/null"
           -o "Dir::Etc::sourceparts=$sandbox/sources.list.d"
           -o "Dir::State::lists=$sandbox/lists"
           -o "Dir::Cache::archives=$sandbox/archives"
           -o "APT::Get::List-Cleanup=0"
+          # A node can carry Pre/Post-Invoke hooks from any package. A dry run
+          # must not fire them: assigning the list as a scalar replaces it.
+          -o "APT::Update::Pre-Invoke="
+          -o "APT::Update::Post-Invoke="
+          -o "APT::Update::Post-Invoke-Success="
+          -o "DPkg::Post-Invoke="
           # the sandbox lives in a root-only tmpdir that _apt cannot read;
           # dropping privileges there only produces a warning about itself.
           -o "APT::Sandbox::User=root")
@@ -624,6 +690,7 @@ install_from_release() {
 main() {
     parse_args "$@"
     check_option_combination
+    log "install-idk.sh $INSTALLER_VERSION"
     require_root
     require_proxmox
     require_tools

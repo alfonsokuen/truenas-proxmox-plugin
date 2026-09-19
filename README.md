@@ -74,11 +74,15 @@
 **IDK fork, option 1 (recommended): one line**
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/alfonsokuen/truenas-proxmox-plugin/idk-fork/install-idk.sh | bash -s -- --apt
+curl -sSL https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/latest/download/install-idk.sh | bash -s -- --apt
 ```
 
-(That URL goes live once `install-idk.sh` is merged into `idk-fork`; before
-that, take the script from the working branch.)
+That URL is a **release asset**, on purpose. `raw.githubusercontent.com` keeps
+serving a cached copy of a branch file for a long while - long enough that a
+node here ran the previous revision of the installer without anyone noticing,
+`Cache-Control: no-cache` included. Release assets are not behind that cache.
+The installer prints its own version on the first line, so you can always see
+which one ran.
 
 `install-idk.sh --apt` configures the fork's signed APT repository
 (`https://alfonsokuen.github.io/truenas-proxmox-plugin/apt`, suite `bookworm`
@@ -88,10 +92,11 @@ arrive with a plain `apt-get upgrade`. Drop `--apt` to install the release
 idkNN` to pin a revision, or `--wizard` to run `truenas-proxmox-manage` at the
 end.
 
-It refuses to run off a Proxmox node, pins the repository key by fingerprint,
-compares the package's SHA256 against the exact line `SHA256SUMS` gives for it,
-and refuses to install when the APT candidate is not the fork's package. A
-failed check installs nothing.
+It refuses to run off a Proxmox node; requires the repository keyring to hold
+exactly one key and that key to be the fingerprint it pins; compares the
+package's SHA256 against the exact line `SHA256SUMS` gives for it; and refuses
+to install unless the APT candidate carries the epoch `1:` and is served by
+exactly the host it configured. A failed check installs nothing.
 
 The fork's package carries the epoch `1:`, so it outranks upstream's package on
 a node that has both APT sources configured. Nothing has to be removed. A node

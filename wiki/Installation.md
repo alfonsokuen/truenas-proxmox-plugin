@@ -19,11 +19,20 @@ IDK fork ships its own installer and its own signed APT repository; use these.
 ### One line
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/alfonsokuen/truenas-proxmox-plugin/idk-fork/install-idk.sh | bash -s -- --apt
+curl -sSL https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/latest/download/install-idk.sh | bash -s -- --apt
 ```
 
-That URL goes live once the installer is merged into `idk-fork`. Until then,
-fetch the script from the working branch, or `scp` it to the node and run it.
+**Why the releases URL and not `raw.githubusercontent.com`.** The raw endpoint
+serves a cached copy of a branch file for a long while - measured here, a node
+ran the previous revision of this installer minutes after the fix was pushed,
+with `Cache-Control: no-cache` on the request. Release assets are served from a
+different path and are not affected. `tools/publish-apt.sh` attaches the
+current `install-idk.sh` to the newest release on every publish, so
+`releases/latest/download/install-idk.sh` is the current one.
+
+The installer prints its own version as its first line
+(`[install-idk] install-idk.sh idkNN.N`). When something behaves like an older
+revision, read that line before anything else.
 
 `install-idk.sh` can also be downloaded and run by hand:
 
@@ -34,6 +43,21 @@ fetch the script from the working branch, or `scp` it to the node and run it.
 | `--version idkNN` | Pin a revision (default: the latest release). Not valid with `--apt`, which can only offer what the repository serves. |
 | `--allow-downgrade` | Required to install a revision older than the one on the node. |
 | `--dry-run` | Do every check and download, install nothing. With `--apt` it builds a throwaway APT state, verifies the repository signature and prints the candidate, without touching `/etc/apt`. |
+
+What `--apt --dry-run` isolates, and what it does not:
+
+- **Isolated**: the source list, the downloaded indices and the package cache
+  live under a temporary directory and go away with it; inherited
+  `APT::Update::Pre-Invoke` / `Post-Invoke` and `DPkg::Post-Invoke` hooks are
+  cleared, so a dry run fires none of them.
+- **Deliberately not isolated**: `/etc/apt/preferences.d`. The pins there decide
+  whether this node could install the package at all, so a dry run that ignored
+  them would report a candidate the real install never gets - which is the
+  failure this check exists to catch. On a node pinned with `Pin: release *` at
+  -1, `--apt --dry-run` exits 5 and names the pin. That is the correct answer,
+  not a bug.
+- **Cannot be isolated**: the network, and anything a hook ran before the
+  installer started.
 | `--wizard` | Run `truenas-proxmox-manage` when the install finishes. |
 
 Exit codes: `0` ok, `1` usage, `2` precondition (not root, not a Proxmox node,
@@ -155,7 +179,9 @@ It pulls every fork release with `gh`, verifies each `.deb` against its
 validating that name, and comparing the digest explicitly), then runs
 `reprepro` and GnuPG in a throwaway `debian:12` container on the Docker host.
 The private key is streamed to that container over ssh's stdin into a
-GNUPGHOME on **tmpfs** — it never reaches the Docker host's disk — and the
+GNUPGHOME on **tmpfs**, so it never reaches a filesystem on the Docker host
+(tmpfs pages can still be swapped by that host's kernel; that is the residual
+exposure). The
 remote working directory is deleted on exit, on failure and even with
 `--keep`; if that delete fails the script says so and names the path instead of
 staying quiet. The result is pushed to the orphan `gh-pages` branch with
@@ -165,6 +191,11 @@ concurrent publish is refused rather than silently discarded.
 Note that Debian's `reprepro` 5.3.1 (bookworm *and* trixie) has no `Limit`
 field, so each suite holds exactly one version: the newest. Older revisions
 stay installable with `install-idk.sh --version idkNN`.
+
+Every publish also attaches the current `install-idk.sh` to the newest release,
+which is what makes `releases/latest/download/install-idk.sh` a URL worth
+documenting. Bump `INSTALLER_VERSION` in the script whenever a change is meant
+to reach a node.
 
 ## Automated Installation (Recommended)
 

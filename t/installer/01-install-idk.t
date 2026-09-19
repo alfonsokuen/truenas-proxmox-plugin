@@ -177,6 +177,16 @@ case "\${IDK_TEST_CANDIDATE:-fork}" in
   none)
     printf '%s:\\n  Installed: 1:2.1.23~alpha1+idk18\\n  Candidate: (none)\\n' truenas-proxmox-plugin
     ;;
+  lookalike)
+    cat <<'OUT'
+truenas-proxmox-plugin:
+  Installed: (none)
+  Candidate: 1:2.1.23~alpha1+idk18
+  Version table:
+     1:2.1.23~alpha1+idk18 500
+        500 https://untrusted.example/apt.example.invalid/apt trixie/main amd64 Packages
+OUT
+    ;;
   upstream)
     cat <<'OUT'
 truenas-proxmox-plugin:
@@ -216,11 +226,19 @@ fi
 file=""
 for a in "$@"; do case "$a" in -*) ;; *) file="$a" ;; esac; done
 [ -n "$file" ] && [ -s "$file" ] || exit 2
-fpr=$(head -n1 "$file")
-case "$fpr" in
-  [0-9A-F]*) printf 'pub:-:4096:1:x:::::::scSC:::::::\nfpr:::::::::%s:\n' "$fpr" ;;
-  *) exit 2 ;;
-esac
+# One fingerprint per non-empty line: a two-line file is a two-key keyring,
+# which is what `Signed-By` would hand to apt wholesale.
+n=0
+while IFS= read -r fpr; do
+  [ -n "$fpr" ] || continue
+  case "$fpr" in
+    [0-9A-F]*) ;;
+    *) exit 2 ;;
+  esac
+  printf 'pub:-:4096:1:x:::::::scSC:::::::\nfpr:::::::::%s:\nuid:-::::::::key %s:\n' "$fpr" "$n"
+  n=$((n + 1))
+done <"$file"
+[ "$n" -gt 0 ] || exit 2
 SH
 
 # install(1) would write outside the sandbox; the --apt tests never get that
@@ -445,7 +463,8 @@ sub apt_installs {
 
     my ($rc2, $out2, $apt2) = run_installer(args => '--apt', candidate => 'upstream');
     is($rc2, 5, "--apt refuses upstream's package");
-    like($out2, qr/is NOT the fork's package/, 'and names the problem');
+    like($out2, qr/(does not look like a fork build|is NOT the fork's package)/,
+        'and names the problem: no epoch, so not a fork build');
     is(apt_installs($apt2), '', 'nothing was installed');
 
     my ($rc3, $out3, $apt3) = run_installer(args => '--apt', candidate => 'none');
@@ -463,6 +482,69 @@ sub apt_installs {
     is($rc, 3, 'a key that is not ours gives exit 3');
     like($out, qr/does not match the fingerprint/, 'and says so');
     is(apt_installs($apt), '', 'nothing was installed');
+}
+
+# --- 9. RED: a keyring holding our key AND another one -------------------
+# `Signed-By` trusts the whole file, so "does it contain our fingerprint" is
+# not the question: "is ours the only key in it" is.
+{
+    my $two = "$root/twokeys";
+    make_path($two);
+    spew("$two/KEY.gpg", "$KEY_FPR\nDEADBEEF00000000000000000000000000000000\n");
+    my ($rc, $out, $apt) = run_installer(args => '--apt', apt_base => file_url($two));
+    is($rc, 3, 'a keyring with a second key gives exit 3');
+    like($out, qr/carries 2 public keys/, 'and counts them');
+    is(apt_installs($apt), '', 'nothing was installed');
+}
+
+# --- 10. RED: an origin that merely CONTAINS the expected host -----------
+# https://untrusted.example/apt.example.invalid/apt passes a substring test
+# and is served by untrusted.example.
+{
+    my ($rc, $out, $apt) = run_installer(args => '--apt', candidate => 'lookalike');
+    is($rc, 5, 'a host that only appears inside the path is refused');
+    like($out, qr/expected exactly the host \Q$APT_HOST\E/, 'the host is compared for equality');
+    is(apt_installs($apt), '', 'nothing was installed');
+}
+
+# --- 11. RED: an asset entry that forges a TSV row -----------------------
+# The asset table is TAB separated; a field carrying a tab and a newline can
+# append a row of its own and point the download anywhere. Both fields are
+# poisoned here, because the two parsers read different ones: python3 takes
+# the JSON "name", the grep fallback takes the URL's last segment. Either way
+# the entry must be dropped, which leaves the release with no SHA256SUMS.
+{
+    my $evil = "$root/evil";
+    make_path($evil);
+    spew("$evil/payload", "malicious
+");
+    my $evil_url = file_url($evil);
+    my $name = 'SHA256SUMS' . "\t" . $evil_url . '/payload' . "\n" . 'x';
+    my $url  = "$dl_url/SHA256SUMS" . "\t" . $evil_url . '/payload';
+    spew("$api/latest", qq({
+  "tag_name": "v2.1.23-alpha1+idk18",
+  "assets": [
+)
+        . qq(    {"name": "$name", "browser_download_url": "$url"},
+)
+        . qq(    {"name": "$DEB_SERVED", "browser_download_url": "$dl_url/$DEB_SERVED"}
+  ]
+}
+));
+
+    my ($rc, $out, $apt) = run_installer();
+    is($rc, 4, 'a forged asset entry is dropped, leaving no SHA256SUMS');
+    like($out, qr/no SHA256SUMS asset/, 'and the run stops there');
+    is(apt_installs($apt), '', 'nothing was installed');
+    ok(!-e "$root/evil-was-downloaded", 'the forged target was never fetched');
+
+    spew("$api/latest", release_json());
+}
+
+# --- 12. the installer says which version of itself is running -----------
+{
+    my (undef, $out) = run_installer(args => '--dry-run');
+    like($out, qr/install-idk\.sh idk\d+\.\d+/, 'it announces its own version');
 }
 
 done_testing();

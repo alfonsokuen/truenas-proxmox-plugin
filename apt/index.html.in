@@ -29,7 +29,7 @@ for Proxmox VE. Suites: <code>bookworm</code> (PVE 8) and <code>trixie</code> (P
 Signing key: <code>@FINGERPRINT@</code>.</p>
 
 <h2>One-line install (recommended)</h2>
-<pre><code>curl -sSL https://raw.githubusercontent.com/@REPO_SLUG@/idk-fork/install-idk.sh | bash -s -- --apt</code></pre>
+<pre><code>curl -sSL https://github.com/@REPO_SLUG@/releases/latest/download/install-idk.sh | bash -s -- --apt</code></pre>
 
 <h2>Manual setup</h2>
 <pre><code>curl -fsSL @PAGES_URL@/KEY.gpg -o /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
