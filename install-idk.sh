@@ -219,7 +219,7 @@ apt_suite() {
 }
 
 install_from_apt() {
-    local suite installed
+    local suite installed candidate
     suite="$(apt_suite)"
     log "APT mode: suite ${suite}, base ${APT_BASE_URL}"
 
@@ -250,6 +250,21 @@ EOF
     log "APT source written to $APT_SOURCES_FILE"
 
     apt-get update || die 5 'apt-get update failed'
+
+    # A negative pin makes apt report "has no installation candidate", which
+    # says nothing about why. Nodes running this fork often carry exactly such
+    # a pin, put there to stop a routine upgrade from pulling upstream's build.
+    if command -v apt-cache >/dev/null 2>&1; then
+        candidate="$(apt-cache policy "$PKG_NAME" 2>/dev/null | sed -n 's/^ *Candidate: *//p')"
+        if [ -z "$candidate" ] || [ "$candidate" = '(none)' ]; then
+            warn "APT has no installation candidate for $PKG_NAME."
+            warn 'A negative pin is the usual cause: look in /etc/apt/preferences.d/'
+            warn "for a 'Pin: release *' entry with Pin-Priority below 0 on this"
+            warn "package, and narrow it to upstream's origin (truenas.github.io)."
+            die 5 'the repository is configured but the package is pinned out'
+        fi
+        log "repository candidate: $candidate"
+    fi
 
     installed="$(installed_version)"
     if [ -n "$installed" ]; then
