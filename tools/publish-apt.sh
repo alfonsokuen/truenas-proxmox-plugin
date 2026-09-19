@@ -73,6 +73,47 @@ usage() {
     sed -n '3,50p' "$0"
 }
 
+resolve_host() {
+    # Some workstations answer every getaddrinfo() in git with "thread failed
+    # to start". Resolving out of band and pinning the address through curl's
+    # resolver gets around it without weakening TLS. getent is absent on
+    # MSYS, and python3 there can be a stub that is not python at all, so try
+    # several and accept the first that prints an address.
+    local host="$1" ip='' candidate
+    ip="$(getent hosts "$host" 2>/dev/null | awk '{ print $1; exit }' || true)"
+    if [ -z "$ip" ]; then
+        for candidate in python3 python; do
+            command -v "$candidate" >/dev/null 2>&1 || continue
+            ip="$("$candidate" -c "import socket,sys
+try:
+    sys.stdout.write(socket.gethostbyname('$host'))
+except Exception:
+    pass" 2>/dev/null || true)"
+            [ -n "$ip" ] && break
+        done
+    fi
+    printf '%s\n' "$ip"
+}
+
+git_remote() {
+    # git against $push_url, retrying once with a pinned address. Output and
+    # exit status are the caller's to inspect; a failure is never swallowed.
+    local host ip
+    if git "$@"; then
+        return 0
+    fi
+    host="${push_url#*://}"
+    host="${host%%/*}"
+    host="${host##*@}"
+    ip="$(resolve_host "$host")"
+    if [ -z "$ip" ]; then
+        warn "git failed and $host could not be resolved locally"
+        return 1
+    fi
+    warn "git failed, retrying via $ip"
+    git -c "http.curloptResolve=${host}:443:${ip}" "$@"
+}
+
 wipe_remote() {
     # Unconditional: the container's working directory holds the built
     # repository and, briefly, a GNUPGHOME. --keep is about the LOCAL tree, it
@@ -139,9 +180,23 @@ push_url="$(git -C "$repo_root" remote get-url github)"
 # Read the tip we intend to replace NOW, not after the build: the lease has to
 # cover the whole run, or a gh-pages published while this one was building gets
 # discarded by a lease that was taken after it landed.
-expected_tip="$(git -C "$repo_root" ls-remote "$push_url" gh-pages | awk '{ print $1; exit }' || true)"
+#
+# An ls-remote that FAILED and one that found nothing look the same in a
+# variable, and treating the first as "the branch does not exist yet" drops
+# the lease and turns the publish into an unguarded push. So check the status.
+set +e
+remote_refs="$(git_remote -C "$repo_root" ls-remote "$push_url" gh-pages 2>&1)"
+ls_rc=$?
+set -e
+if [ "$ls_rc" -ne 0 ]; then
+    printf '%s\n' "$remote_refs" >&2
+    die 2 'could not read gh-pages from the remote; refusing to publish without a lease'
+fi
+expected_tip="$(printf '%s\n' "$remote_refs" | awk '{ print $1; exit }')"
 if [ -n "$expected_tip" ]; then
     log "gh-pages is at $expected_tip; that is the tip this run will replace"
+else
+    log 'gh-pages does not exist on the remote yet'
 fi
 
 ssh -o ConnectTimeout=15 "$docker_host" 'docker --version >/dev/null' ||
@@ -298,15 +353,8 @@ if [ -n "$expected_tip" ]; then
     log "replacing gh-pages $expected_tip"
     lease_arg="--force-with-lease=gh-pages:$expected_tip"
 else
-    log 'gh-pages does not exist yet; creating it'
+    log 'creating gh-pages'
     lease_arg=''
-fi
-
-github_ip="$(getent hosts github.com 2>/dev/null | awk '{ print $1; exit }' || true)"
-if [ -z "$github_ip" ] && command -v python3 >/dev/null 2>&1; then
-    github_ip="$(python3 -c 'import socket,sys
-try: sys.stdout.write(socket.gethostbyname("github.com"))
-except Exception: pass' 2>/dev/null || true)"
 fi
 
 (
@@ -326,17 +374,7 @@ Built by tools/publish-apt.sh.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
-    # `git push` on some workstations dies with "getaddrinfo() thread failed
-    # to start"; pinning the address through curl's resolver sidesteps the
-    # thread-starved resolver without disabling TLS verification. The address
-    # is resolved at run time, never hardcoded.
-    if ! git push -q ${lease_arg:+"$lease_arg"} "$push_url" gh-pages:gh-pages; then
-        [ -n "$github_ip" ] ||
-            { echo 'push failed and github.com could not be resolved locally' >&2; exit 1; }
-        echo "[publish-apt] WARNING: plain push failed, retrying via $github_ip" >&2
-        git -c "http.curloptResolve=github.com:443:$github_ip" \
-            push -q ${lease_arg:+"$lease_arg"} "$push_url" gh-pages:gh-pages
-    fi
+    git_remote push -q ${lease_arg:+"$lease_arg"} "$push_url" gh-pages:gh-pages
 ) || die 6 'could not push gh-pages'
 
 log "published: $pages_url"
