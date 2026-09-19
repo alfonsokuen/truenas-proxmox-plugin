@@ -206,6 +206,13 @@ SH
 # gpg --show-keys: reports whatever fingerprint the key file names on its
 # first line, so a test can serve a key that is not ours.
 stub('gpg', <<'SH');
+# Real gpg is Fatal when GNUPGHOME points at a directory that does not
+# exist, which is how the first version of this check failed on a live node
+# while the stub happily answered. Reproduce that.
+if [ -n "${GNUPGHOME:-}" ] && [ ! -d "$GNUPGHOME" ]; then
+  echo "gpg: Fatal: $GNUPGHOME: directory does not exist!" >&2
+  exit 2
+fi
 file=""
 for a in "$@"; do case "$a" in -*) ;; *) file="$a" ;; esac; done
 [ -n "$file" ] && [ -s "$file" ] || exit 2

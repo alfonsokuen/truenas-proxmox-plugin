@@ -383,6 +383,10 @@ fetch_and_verify_key() {
     # "Not empty" is not a check. Anything that can replace the key file can
     # also make it non-empty, and apt would then trust whatever signed the
     # indices. Pin the fingerprint this script was shipped with.
+    # gpg refuses to start when GNUPGHOME does not exist, so create it: a
+    # throwaway home keeps this out of root's real keyring.
+    mkdir -p "$workdir/gnupg"
+    chmod 700 "$workdir/gnupg"
     fprs="$(GNUPGHOME="$workdir/gnupg" gpg --show-keys --with-colons "$1" 2>/dev/null |
         awk -F: '$1 == "fpr" { print $10 }' || true)"
     if ! printf '%s\n' "$fprs" | grep -qx "$APT_KEY_FPR"; then
@@ -496,7 +500,10 @@ apt_dry_run() {
           -o "Dir::Etc::sourceparts=$sandbox/sources.list.d"
           -o "Dir::State::lists=$sandbox/lists"
           -o "Dir::Cache::archives=$sandbox/archives"
-          -o "APT::Get::List-Cleanup=0")
+          -o "APT::Get::List-Cleanup=0"
+          # the sandbox lives in a root-only tmpdir that _apt cannot read;
+          # dropping privileges there only produces a warning about itself.
+          -o "APT::Sandbox::User=root")
     apt_update_strict "${opts[@]}"
     assert_candidate_is_ours -o "Dir::State::lists=$sandbox/lists" \
         -o "Dir::Etc::sourcelist=/dev/null" \
