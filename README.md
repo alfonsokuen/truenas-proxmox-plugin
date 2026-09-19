@@ -90,6 +90,11 @@ apt install "./truenas-proxmox-plugin_${V}_all.deb"
 If the same version is already installed, `apt install` is a no-op: use
 `apt reinstall ./<file>.deb` or `dpkg -i`. The options below are upstream's.
 
+**No GUI dialog:** Datacenter > Storage > Add does not list TrueNAS — those
+forms live in `pve-manager` and an out-of-tree plugin cannot add one. Create the
+storage with `pvesm add truenasplugin <id> --tn_api_host ... --tn_api_key ...
+--tn_dataset ... --tn_target_iqn ...`, or with the wizard below.
+
 **Storage wizard:** run `truenas-proxmox-manage` (the installer shipped in this
 package). Do not pipe upstream's `main` `install.sh` from the options below over
 this package: that script still uses the pre-2.1.23 `api_host`/`api_key` field

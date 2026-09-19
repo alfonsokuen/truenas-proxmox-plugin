@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk17';
+our $VERSION = '2.1.23~alpha1+idk18';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -2913,6 +2913,499 @@ sub volume_snapshot_info {
     }
 
     return $snaps;
+}
+
+# ======== Importing snapshots taken outside PVE ========
+#
+# Snapshots created on the array - a TrueNAS periodic task, a replication
+# job, someone on the TrueNAS UI - are real ZFS snapshots of our zvols, but
+# PVE cannot see them: the Snapshots tab renders $conf->{snapshots} from
+# /etc/pve/qemu-server/<vmid>.conf and never asks the storage. They are not
+# inert, either. One of them being newer than a PVE snapshot makes
+# `qm rollback <that snapshot>` fail with "is not most recent snapshot", with
+# nothing in the GUI to explain or remove the blocker; and a rollback that
+# does go through destroys them, because the rollback is recursive.
+#
+# `truenas-proxmox-manage import-snapshots <vmid>` writes the missing sections
+# so PVE owns what is already on the array: the GUI lists them, `qm
+# delsnapshot` removes them, and rollback stops being blocked by something
+# invisible.
+#
+# The rules are deliberately fail-closed, because a bad section is worse than
+# no section: one that does not cover every disk pushes the uncovered ones to
+# unusedN on rollback, and a name PVE cannot parse breaks every later write of
+# that config file. What the importer cannot vouch for, it lists and refuses.
+
+# Names PVE reserves for itself. 'vzdump' is the temporary snapshot of a
+# backup (AbstractConfig), 'current' and 'pending' are API/config keywords -
+# write_vm_config dies on a snapshot called 'pending' - '__base__' is the
+# template snapshot of a linked clone, and '__replicate_*' belongs to pvesr.
+my %TN_RESERVED_SNAPNAMES = map { $_ => 1 } qw(vzdump current pending __base__);
+
+# undef when $name may be used as a PVE snapshot name, else the reason why
+# not. pve-configid is /^[a-z][a-z0-9_-]+$/i with a 40 character maximum
+# (PVE::JSONSchema); this plugin can never rename around a bad name, because
+# here the PVE snapshot name IS the ZFS snapshot name.
+sub _tn_snapshot_name_problem($name) {
+    return 'reserved by PVE'                       if $TN_RESERVED_SNAPNAMES{$name};
+    return 'reserved by PVE (replication)'         if $name =~ /^__replicate_/;
+    return 'longer than the 40 characters PVE allows' if length($name) > 40;
+    return 'not a valid PVE snapshot name (pve-configid)'
+        if $name !~ /^[a-z][a-z0-9_-]+$/i;
+    return undef;
+}
+
+# Snapshots of the given datasets, as { <dataset> => { <snapname> => <epoch> } }.
+#
+# Unlike volume_snapshot_info() this filters server-side, so importing does not
+# pull every snapshot on the array across the wire. An answer that is not the
+# array of records the API promises is an ERROR: reporting "no snapshots" for
+# a query that never ran would tell an operator their array is clean when it
+# is not, and is the same shape of bug as list_images answering "empty" when
+# it could not ask.
+sub _tn_snapshot_query_datasets($scfg, $fulls) {
+    my $res = {};
+    return $res if !$fulls || !@$fulls;
+
+    my %wanted = map { $_ => 1 } @$fulls;
+    $res->{$_} = {} for @$fulls;
+
+    my $list = _api_call($scfg, 'pool.snapshot.query',
+        [ [ [ 'dataset', 'in', [ @$fulls ] ] ],
+          { extra => { properties => ['creation'] } } ]);
+
+    die "[TrueNAS] pool.snapshot.query did not return a list of snapshots; "
+      . "refusing to treat that as 'no snapshots'\n"
+        if !defined($list) || ref($list) ne 'ARRAY';
+
+    for my $s (@$list) {
+        die "[TrueNAS] pool.snapshot.query returned a record that is not an "
+          . "object; refusing to guess what it meant\n"
+            if ref($s) ne 'HASH';
+
+        my ($ds, $name) = ($s->{dataset}, $s->{snapshot_name});
+        if (!defined($ds) || !defined($name)) {
+            my $id = $s->{name} // $s->{id};
+            die "[TrueNAS] pool.snapshot.query returned a record without a "
+              . "snapshot name; refusing to guess what it meant\n"
+                if !defined($id) || $id !~ /^(.+)\@(.+)$/;
+            ($ds, $name) = ($1, $2);
+        }
+
+        # A filter the middleware did not honour must not smuggle a
+        # neighbour's snapshot into this guest's plan.
+        next if !$wanted{$ds};
+
+        my $ts = 0;
+        my $props = $s->{properties};
+        if (ref($props) eq 'HASH') {
+            my $creation = $props->{creation};
+            if (ref($creation) eq 'HASH') {
+                $ts = int($creation->{rawvalue} // 0);
+            } elsif (defined($creation) && !ref($creation)
+                     && $creation =~ /(\d{10})/) {
+                $ts = int($1);
+            }
+        }
+        $res->{$ds}{$name} = $ts;
+    }
+
+    return $res;
+}
+
+# Decide what may be imported. Pure: no I/O, no PVE, no TrueNAS - which is why
+# every rule below is testable offline in t/nvme/19-snapshot-import-plan.t.
+#
+#   $existing    - $conf->{snapshots}
+#   $by_volid    - { <volid> => { <snapname> => <epoch> } } from the array
+#   $conf_parent - $conf->{parent}
+#   $opts        - { match => <regex string>, clone_blocked => { name => 1 } }
+#
+# Returns { import => [ { name, snaptime, parent } ] oldest first,
+#           partial => { name => [ volids missing ] },
+#           invalid => { name => reason },
+#           present => [ names already in the config ],
+#           new_parent => <name> | undef }
+sub _plan_snapshot_import($existing, $by_volid, $conf_parent, $opts = {}) {
+    $existing //= {};
+    $opts     //= {};
+
+    my @volids = sort keys %$by_volid;
+    die "[TrueNAS] nothing to plan: no volumes\n" if !@volids;
+
+    my $match;
+    if (defined($opts->{match}) && $opts->{match} ne '') {
+        $match = eval { qr/$opts->{match}/ };
+        die "[TrueNAS] --match is not a valid regular expression: $@" if !$match;
+    }
+    my $blocked = $opts->{clone_blocked} // {};
+
+    my %seen;   # snapname => { volid => epoch }
+    for my $volid (@volids) {
+        my $snaps = $by_volid->{$volid} // {};
+        $seen{$_}{$volid} = $snaps->{$_} for keys %$snaps;
+    }
+
+    my (@present, %partial, %invalid, @candidates);
+    for my $name (sort keys %seen) {
+        next if defined($match) && $name !~ $match;
+
+        # Already ours: never re-examined and never rewritten (R4).
+        if (exists $existing->{$name}) {
+            push @present, $name;
+            next;
+        }
+        if (my $why = _tn_snapshot_name_problem($name)) {
+            $invalid{$name} = $why;
+            next;
+        }
+        # Every non-cdrom volume of the guest must carry this snapshot, or the
+        # section would be a partial picture of the VM (R2).
+        my @missing = grep { !exists $seen{$name}{$_} } @volids;
+        if (@missing) {
+            $partial{$name} = [ @missing ];
+            next;
+        }
+        if ($blocked->{$name}) {
+            $invalid{$name} = 'has a dependent clone on TrueNAS (could not be deleted from PVE)';
+            next;
+        }
+        # The capture is only finished when the last zvol was snapshotted, so
+        # the newest creation time is the honest one. A missing one is not
+        # invented: snaptime 0 shows as 1970 and breaks every ordering (R5).
+        my $ts = 0;
+        for my $volid (@volids) {
+            my $t = $seen{$name}{$volid} // 0;
+            $ts = $t if $t > $ts;
+        }
+        if (!$ts) {
+            $invalid{$name} = 'no creation timestamp from TrueNAS';
+            next;
+        }
+        push @candidates, { name => $name, snaptime => $ts };
+    }
+
+    # Chain by time: each imported snapshot hangs off the newest snapshot
+    # older than itself, existing ones included, and the guest's parent
+    # follows only if an imported snapshot is the newest of all (R7).
+    my @timeline = map {
+        { name => $_, snaptime => int($existing->{$_}{snaptime} // 0), imported => 0 }
+    } keys %$existing;
+    push @timeline, { %$_, imported => 1 } for @candidates;
+    @timeline = sort {
+        $a->{snaptime} <=> $b->{snaptime} || $a->{name} cmp $b->{name}
+    } @timeline;
+
+    my (@import, $prev);
+    for my $entry (@timeline) {
+        push @import, {
+            name     => $entry->{name},
+            snaptime => $entry->{snaptime},
+            parent   => $prev,
+        } if $entry->{imported};
+        $prev = $entry->{name};
+    }
+
+    my $new_parent;
+    $new_parent = $timeline[-1]{name} if @timeline && $timeline[-1]{imported};
+    # Already pointing there: report no change rather than a no-op write.
+    $new_parent = undef
+        if defined($new_parent) && defined($conf_parent) && $conf_parent eq $new_parent;
+
+    return {
+        import     => \@import,
+        partial    => \%partial,
+        invalid    => \%invalid,
+        present    => [ sort @present ],
+        new_parent => $new_parent,
+    };
+}
+
+# Which of these ZFS snapshots something else is cloned from. A snapshot with
+# a dependent clone cannot be destroyed, so importing it would hand PVE a
+# snapshot whose `qm delsnapshot` is guaranteed to fail.
+#
+# pool.snapshot.query does not surface the `clones` property in the releases
+# this plugin targets (see free_image), so the question is asked from the
+# dataset side with the same origin.parsed filter used there - one query per
+# candidate snapshot, on the handful that survived planning. A lookup that
+# fails is an error: "no clones" may only be said when it is known.
+sub _tn_snapshot_clone_blockers($scfg, $ids) {
+    my %blocked;
+    for my $id (@$ids) {
+        my $rows = eval {
+            _api_call($scfg, 'pool.dataset.query',
+                [ [ [ 'origin.parsed', '=', $id ] ], { select => [ 'id' ] } ]);
+        };
+        my $err = $@;
+        die "[TrueNAS] could not establish whether $id has dependent clones: "
+          . ($err || "pool.dataset.query answered with something that is not a list") . "\n"
+            if $err || ref($rows) ne 'ARRAY';
+        $blocked{$id} = 1 if @$rows;
+    }
+    return \%blocked;
+}
+
+# The guest-level refusals (R3). Called before the query and again inside the
+# lock, because all three can appear between the two.
+sub _tn_import_check_conf($conf, $vmid) {
+    die "VM $vmid is a template; its snapshots are not imported\n"
+        if $conf->{template};
+    die "VM $vmid is locked ($conf->{lock}); refusing to touch its configuration\n"
+        if $conf->{lock};
+    for my $name (sort keys %{ $conf->{snapshots} // {} }) {
+        die "VM $vmid has a snapshot operation in flight ('$name' is in state "
+          . "$conf->{snapshots}{$name}{snapstate}); refusing to write its configuration\n"
+            if $conf->{snapshots}{$name}{snapstate};
+    }
+}
+
+# The non-cdrom volumes of the guest, as
+# [ { key, volid, storeid, scfg, full } ], with every one of them living on
+# this plugin. A volume elsewhere is fatal: a section naming it would die half
+# way through a rollback, after the other disks were already rolled back.
+sub _tn_import_volumes($class, $storecfg, $conf, $vmid) {
+    my @vols;
+    my @foreign;
+
+    PVE::QemuConfig->foreach_volume($conf, sub {
+        my ($key, $drive) = @_;
+
+        return if $drive->{media} && $drive->{media} eq 'cdrom';
+        my $volid = $drive->{file};
+        return if !defined($volid) || $volid eq '' || $volid eq 'none'
+               || $volid eq 'cdrom';
+
+        if ($volid =~ m{^/}) {
+            push @foreign, "$key ($volid): a host device, not a storage volume";
+            return;
+        }
+        my ($storeid, $volname) = split(/:/, $volid, 2);
+        my $scfg = $storecfg->{ids}{$storeid};
+        if (!$scfg || ($scfg->{type} // '') ne 'truenasplugin') {
+            push @foreign, "$key ($volid): storage '$storeid' is "
+                . ($scfg ? "of type $scfg->{type}" : 'not configured here');
+            return;
+        }
+
+        my (undef, $zname) = $class->parse_volname($volname);
+        push @vols, {
+            key     => $key,
+            volid   => $volid,
+            storeid => $storeid,
+            scfg    => $scfg,
+            full    => $scfg->{tn_dataset} . '/' . $zname,
+        };
+    });
+
+    die "VM $vmid has disks outside this plugin, so a snapshot of it could "
+      . "never be rolled back as a whole:\n  " . join("\n  ", @foreign) . "\n"
+        if @foreign;
+    die "VM $vmid has no disks on this plugin\n" if !@vols;
+
+    return \@vols;
+}
+
+# Import every snapshot of $vmid that exists on TrueNAS and is safe to adopt.
+#
+# $opts: { dry_run => 1, match => <regex string> }
+# Returns the plan, plus 'imported' (sections actually written) and 'dry_run'.
+sub import_foreign_snapshots($class, $vmid, $opts = {}) {
+    $opts //= {};
+
+    # Required at run time, not compile time: this file is a storage plugin
+    # and is loaded on nodes and in tests where qemu-server is not present.
+    require PVE::QemuConfig;
+    require PVE::Storage;
+
+    my $storecfg = PVE::Storage::config();
+    my $conf = PVE::QemuConfig->load_config($vmid);
+    _tn_import_check_conf($conf, $vmid);
+
+    my $vols = $class->_tn_import_volumes($storecfg, $conf, $vmid);
+    my $log_scfg = $vols->[0]{scfg};
+
+    # One query per storage, filtered to this guest's datasets.
+    my %fulls_by_store;
+    for my $vol (@$vols) {
+        push @{ $fulls_by_store{ $vol->{storeid} } }, $vol->{full};
+    }
+    my %by_ds;
+    for my $storeid (sort keys %fulls_by_store) {
+        my ($scfg) = map { $_->{scfg} } grep { $_->{storeid} eq $storeid } @$vols;
+        my $found = _tn_snapshot_query_datasets($scfg, $fulls_by_store{$storeid});
+        $by_ds{$_} = $found->{$_} for keys %$found;
+    }
+    my %by_volid = map { $_->{volid} => ($by_ds{ $_->{full} } // {}) } @$vols;
+
+    # Plan once to find the candidates, ask the array about clones for those
+    # few, then plan again with the answer.
+    my $plan = _plan_snapshot_import($conf->{snapshots}, \%by_volid,
+        $conf->{parent}, { match => $opts->{match} });
+
+    my %blocked;
+    if (@{ $plan->{import} }) {
+        for my $vol (@$vols) {
+            my @ids = map { "$vol->{full}\@$_->{name}" } @{ $plan->{import} };
+            my $hits = _tn_snapshot_clone_blockers($vol->{scfg}, \@ids);
+            for my $id (keys %$hits) {
+                my ($name) = $id =~ /\@(.+)$/;
+                $blocked{$name} = 1;
+            }
+        }
+        $plan = _plan_snapshot_import($conf->{snapshots}, \%by_volid,
+            $conf->{parent}, { match => $opts->{match}, clone_blocked => \%blocked })
+            if %blocked;
+    }
+
+    $plan->{imported} = 0;
+    $plan->{dry_run}  = $opts->{dry_run} ? 1 : 0;
+
+    return $plan if $opts->{dry_run};
+    return $plan if !@{ $plan->{import} };
+
+    my $origin_ds = $vols->[0]{full};
+    my $stamp = POSIX::strftime('%Y-%m-%dT%H:%M:%SZ', gmtime(time()));
+
+    my $written = PVE::QemuConfig->lock_config($vmid, sub {
+        # Everything is re-established inside the lock: the config may have
+        # gained a lock, a template flag, a snapshot or a different disk
+        # between the query above and this line.
+        my $conf = PVE::QemuConfig->load_config($vmid);
+        _tn_import_check_conf($conf, $vmid);
+
+        my $vols_now = $class->_tn_import_volumes($storecfg, $conf, $vmid);
+        die "VM $vmid changed its disks while the import was being planned; "
+          . "nothing was written\n"
+            if join(',', map { $_->{volid} } @$vols_now)
+            ne join(',', map { $_->{volid} } @$vols);
+
+        my $fresh = _plan_snapshot_import($conf->{snapshots}, \%by_volid,
+            $conf->{parent},
+            { match => $opts->{match}, clone_blocked => \%blocked });
+
+        # Nothing left to do - the idempotent case. Writing here would rewrite
+        # an unchanged config on every run.
+        return $fresh if !@{ $fresh->{import} };
+
+        for my $entry (@{ $fresh->{import} }) {
+            my $name = $entry->{name};
+            my $snap = $conf->{snapshots}{$name} = {};
+            PVE::QemuConfig->__snapshot_copy_config($conf, $snap);
+            delete $snap->{parent};
+            $snap->{parent}   = $entry->{parent} if defined $entry->{parent};
+            $snap->{snaptime} = $entry->{snaptime};
+            $snap->{description} = "Imported from TrueNAS $origin_ds\@$name on "
+                . "$stamp - config as of import, no RAM";
+        }
+        $conf->{parent} = $fresh->{new_parent} if defined $fresh->{new_parent};
+
+        PVE::QemuConfig->write_config($vmid, $conf);
+
+        return $fresh;
+    });
+
+    $written->{imported} = scalar @{ $written->{import} };
+    $written->{dry_run}  = 0;
+
+    # Level 0: writing a guest configuration is worth a line in syslog even
+    # with debugging off - it is how an operator finds out later which run
+    # added the sections.
+    _log($log_scfg, 0, 'info', "[TrueNAS] import-snapshots: VM $vmid adopted "
+        . "$written->{imported} snapshot(s) from the array");
+
+    return $written;
+}
+
+# `truenas-proxmox-manage import-snapshots <vmid> [--dry-run] [--yes] [--match REGEX]`
+# Returns the process exit code.
+sub snapshot_import_cli(@argv) {
+    my ($vmid, $dry_run, $yes, $match);
+
+    while (@argv) {
+        my $arg = shift @argv;
+        if    ($arg eq '--dry-run' || $arg eq '-n') { $dry_run = 1 }
+        elsif ($arg eq '--yes'     || $arg eq '-y') { $yes = 1 }
+        elsif ($arg eq '--match') {
+            $match = shift @argv;
+            if (!defined($match) || $match eq '') {
+                print STDERR "--match needs a regular expression\n";
+                return 1;
+            }
+        }
+        elsif ($arg =~ /^--match=(.*)$/) { $match = $1 }
+        elsif ($arg eq '--help' || $arg eq '-h') {
+            print "Usage: truenas-proxmox-manage import-snapshots <vmid> "
+                . "[--dry-run] [--yes] [--match REGEX]\n";
+            return 0;
+        }
+        elsif ($arg =~ /^(\d+)$/ && !defined($vmid)) { $vmid = $1 }
+        else {
+            print STDERR "unexpected argument '$arg'\n";
+            return 1;
+        }
+    }
+
+    if (!defined($vmid)) {
+        print STDERR "Usage: truenas-proxmox-manage import-snapshots <vmid> "
+            . "[--dry-run] [--yes] [--match REGEX]\n";
+        return 1;
+    }
+
+    my $plan = eval {
+        __PACKAGE__->import_foreign_snapshots($vmid, { dry_run => 1, match => $match });
+    };
+    if (my $err = $@) {
+        print STDERR "import-snapshots: $err";
+        return 1;
+    }
+
+    for my $entry (@{ $plan->{import} }) {
+        printf("import   %-40s %s\n", $entry->{name},
+            POSIX::strftime('%Y-%m-%d %H:%M:%S', localtime($entry->{snaptime})));
+    }
+    for my $name (sort keys %{ $plan->{partial} }) {
+        printf("partial  %-40s missing on: %s\n", $name,
+            join(', ', @{ $plan->{partial}{$name} }));
+    }
+    for my $name (sort keys %{ $plan->{invalid} }) {
+        printf("invalid  %-40s %s\n", $name, $plan->{invalid}{$name});
+    }
+    for my $name (@{ $plan->{present} }) {
+        printf("present  %-40s already in the VM configuration\n", $name);
+    }
+
+    my $count = scalar @{ $plan->{import} };
+    if (!$count) {
+        print "Nothing to import for VM $vmid.\n";
+        return 0;
+    }
+    if ($dry_run) {
+        print "Dry run: $count snapshot(s) would be imported into VM $vmid.\n";
+        return 0;
+    }
+
+    if (!$yes) {
+        print "Import $count snapshot(s) into the configuration of VM $vmid? [y/N] ";
+        my $answer = <STDIN>;
+        $answer = '' if !defined($answer);
+        chomp($answer);
+        if ($answer !~ /^y(es)?$/i) {
+            print "Aborted; nothing was written.\n";
+            return 0;
+        }
+    }
+
+    my $res = eval {
+        __PACKAGE__->import_foreign_snapshots($vmid, { match => $match });
+    };
+    if (my $err = $@) {
+        print STDERR "import-snapshots: $err";
+        return 1;
+    }
+
+    print "Imported $res->{imported} snapshot(s) into VM $vmid.\n";
+    return 0;
 }
 
 # List TrueNAS iSCSI targets (array of hashes; each has at least {id, name, ...}).

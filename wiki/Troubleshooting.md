@@ -51,6 +51,8 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - [Slow VM Disk Performance](#slow-vm-disk-performance)
   - [Slow Multipath Read Performance](#slow-multipath-read-performance)
   - [Slow VM Cloning](#slow-vm-cloning)
+  - [Clone fails once, works on retry](#clone-fails-once-works-on-retry)
+  - [Snapshots taken on TrueNAS are not listed](#snapshots-taken-on-truenas-are-not-listed)
 - [Cluster-Specific Issues](#cluster-specific-issues)
   - [Storage Not Shared Across Nodes](#storage-not-shared-across-nodes)
   - [VM Migration Fails](#vm-migration-fails)
@@ -1899,6 +1901,53 @@ See [Known Limitations - Multipath Read Performance](Known-Limitations.md#multip
 # Enable sparse volumes
 tn_sparse 1
 ```
+
+### Clone fails once, works on retry
+
+**Symptom**: a clone fails with an error, the same clone succeeds
+immediately afterwards with no change to the configuration.
+
+This is not the "no fast clone" limitation: that one is slow, not
+failing. A clone that fails and then works is transient - most often the
+new volume's device had not appeared on the node yet, or one API call ran
+into a busy array.
+
+It is worth reporting, because a transient failure that repeats has a
+cause. Open an issue with the task log from the failed clone and:
+
+```bash
+journalctl -S -10min | grep '\[TrueNAS\]'
+```
+
+Set `tn_debug 1` on the storage before reproducing it if the window has
+already passed; the log lines above are what identify which step gave up.
+
+### Snapshots taken on TrueNAS are not listed
+
+**Symptom**: a snapshot exists on the array (periodic task, replication,
+TrueNAS UI) but the VM's Snapshots tab does not show it. Rollback to an
+older PVE snapshot then fails with `... is not most recent snapshot` and
+there is nothing in the GUI to remove.
+
+**Explanation**: the Snapshots tab renders what is in
+`/etc/pve/qemu-server/<vmid>.conf`; it never asks the storage. A ZFS
+snapshot PVE does not know about is still on the zvol, and ZFS refuses a
+rollback that would skip over it.
+
+**Solution**: adopt them, then use the GUI as usual.
+
+```bash
+# Show what could be imported, write nothing
+truenas-proxmox-manage import-snapshots 100 --dry-run
+
+# Import them
+truenas-proxmox-manage import-snapshots 100 --yes
+```
+
+Only snapshots that exist on **every** disk of the VM, with a name PVE
+accepts and no dependent clone, are imported; the rest are listed with
+the reason. See
+[Best Practices](Best-Practices.md#snapshots-taken-on-truenas).
 
 ## Cluster-Specific Issues
 

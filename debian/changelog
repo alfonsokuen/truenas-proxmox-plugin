@@ -1,3 +1,47 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk18) unstable; urgency=medium
+
+  * Snapshots hechos EN TrueNAS: nuevo subcomando
+    `truenas-proxmox-manage import-snapshots <vmid> [--dry-run] [--yes]
+    [--match REGEX]` que los da de alta en la configuracion del invitado.
+    Hasta ahora eran invisibles para PVE (la pestana Snapshots solo lee
+    /etc/pve/qemu-server/<vmid>.conf, nunca pregunta al storage) pero no
+    inocuos: uno mas nuevo que un snapshot de PVE hace fallar
+    `qm rollback` con «is not most recent snapshot» sin nada en la GUI
+    para quitarlo, y un rollback que si pasa los DESTRUYE (el rollback de
+    ZFS es recursivo). Importados, la GUI los lista y `qm delsnapshot`
+    los borra.
+
+  * El importador es fail-closed y solo ANADE: exige el mismo snapshot en
+    TODOS los discos no-cdrom de la VM (uno parcial dejaria discos en
+    unusedN al hacer rollback), nombre valido de PVE (pve-configid, sin
+    renombrar nunca: aqui el nombre PVE ES el nombre ZFS) y no reservado
+    (vzdump/current/pending/__base__/__replicate_*), sin clones
+    dependientes (pool.dataset.query por origin.parsed), y con snaptime =
+    creation de la cabina — si la cabina no la da, se rechaza en vez de
+    inventarla. Sin vmstate. Rehusa template, config con lock, snapshot a
+    medias (snapstate) y discos fuera de este plugin. Escribe bajo
+    `PVE::QemuConfig->lock_config` con las primitivas de PVE, no
+    editando texto en /etc/pve, y replanifica dentro del lock: la segunda
+    pasada importa 0 y NO reescribe la configuracion. `--dry-run` ni
+    siquiera toma el lock.
+
+  * `pool.snapshot.query` para esto va filtrada por dataset (no se trae
+    la cabina entera) y una respuesta nula o malformada es ERROR, nunca
+    «no hay snapshots». Tests t/nvme/19-snapshot-import-plan.t (planner
+    puro, 5 positivos y 8 negativos sobre un fixture con la forma real de
+    la API) y t/nvme/20-snapshot-import-config.t (escritura de la conf
+    con PVE::QemuConfig stubbeado).
+
+  * Documentacion: no hay dialogo de la GUI para anadir el storage
+    (Configuration/Installation/README), contenido de bloque
+    images+rootdir con ISO/backups/snippets en un share NFS o SMB de la
+    misma cabina, clone ZFS si se usa en linked clone (lo lento es el
+    full clone que copia PVE) y «Clone fails once, works on retry» en
+    Troubleshooting, mover VMs entre clusters sobre la misma cabina, y
+    los hechos de los snapshots ajenos en Best-Practices y Tools.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Fri, 18 Sep 2026 21:40:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk17) unstable; urgency=medium
 
   * Resolucion de nombres (de upstream PR #103, issue #102): el plugin y el

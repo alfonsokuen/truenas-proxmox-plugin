@@ -117,6 +117,12 @@ Main Menu:
 Choose an option:
 ```
 
+**Note**: there is no TrueNAS entry in Datacenter > Storage > Add. The
+GUI's storage dialogs live in `pve-manager` and cannot be extended by an
+out-of-tree plugin, so storages are created with `pvesm add truenasplugin
+...` or with this wizard. See
+[Configuration](Configuration.md#no-add-storage-dialog-in-the-gui).
+
 #### Available Operations
 
 **Installation & Updates**

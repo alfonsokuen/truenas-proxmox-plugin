@@ -13,6 +13,7 @@ for the underlying option definitions.
   - [Broker daemon is required](#broker-daemon-is-required)
 - [Storage Layout](#storage-layout)
   - [Dedicated dataset per PVE cluster](#dedicated-dataset-per-pve-cluster)
+  - [Moving VMs between clusters on the same array](#moving-vms-between-clusters-on-the-same-array)
   - [Pool sizing](#pool-sizing)
   - [ZFS tunables](#zfs-tunables)
 - [Transport Choice](#transport-choice)
@@ -25,6 +26,7 @@ for the underlying option definitions.
   - [iSCSI HA failover tuning](#iscsi-ha-failover-tuning)
   - [NVMe/TCP HA failover](#nvmetcp-ha-failover)
   - [Snapshot coexistence with TrueNAS auto-snapshots](#snapshot-coexistence-with-truenas-auto-snapshots)
+  - [Snapshots taken on TrueNAS](#snapshots-taken-on-truenas)
 - [Provisioning Workflow](#provisioning-workflow)
   - [Templates and linked clones](#templates-and-linked-clones)
   - [What is offloaded, what is not](#what-is-offloaded-what-is-not)
@@ -105,6 +107,21 @@ tank/proxmox/backup-target     -> optional; Proxmox Backup Server target
 The plugin only enumerates volumes under the `tn_dataset` prefix it was
 configured with, so an accidental cross-list between clusters is
 prevented at the plugin level.
+
+### Moving VMs between clusters on the same array
+
+Two PVE clusters can use the same TrueNAS, and a VM can be moved from one
+to the other by sharing the storage rather than copying data. What makes
+it work is that nothing collides:
+
+- Give each cluster its **own `tn_dataset`**, or keep VMIDs unique across
+  clusters. Two clusters both creating VM 100 produce two
+  `vm-100-disk-0` in one dataset.
+- With a shared dataset, the second cluster sees the first cluster's
+  zvols as volumes of *its* VM 100 — and reconciliation reads them as
+  orphans of a VM it cannot find.
+- The two clusters do not share locks. Only one of them may have the
+  guest defined and running at a time; move the `.conf`, do not copy it.
 
 ### Pool sizing
 
@@ -247,6 +264,42 @@ Suggested convention:
 
 Do not let TrueNAS retention delete a snapshot that PVE thinks it owns —
 it will surface as a rollback failure inside PVE.
+
+### Snapshots taken on TrueNAS
+
+A snapshot created on the array is invisible to PVE: the Snapshots tab
+renders `$conf->{snapshots}` from `/etc/pve/qemu-server/<vmid>.conf` and
+never asks the storage. Invisible is not inert:
+
+- A TrueNAS snapshot newer than a PVE one makes `qm rollback <older>`
+  fail with `is not most recent snapshot`, and the GUI offers no way to
+  remove the blocker.
+- A rollback that does go through **destroys** every snapshot taken after
+  the target, this plugin's and the array's alike — ZFS rollback is
+  recursive.
+
+Adopt them into the VM configuration and both problems go away, because
+PVE can then see and delete them:
+
+```bash
+truenas-proxmox-manage import-snapshots 100 --dry-run   # list, write nothing
+truenas-proxmox-manage import-snapshots 100 --yes       # adopt
+```
+
+What that means afterwards, and why it is opt-in:
+
+- PVE now owns those snapshots. `qm delsnapshot` destroys them **on the
+  array**; if TrueNAS retention removes one first, the PVE side needs
+  `--force`.
+- A section records the configuration as of the import, not as of the
+  snapshot: rolling back to one restores the disks of that moment with
+  today's configuration, and without RAM (the VM starts cold).
+- Only snapshots present on every disk of the VM, with a name PVE accepts
+  (`pve-configid`: `[a-z][a-z0-9_-]*`, 40 characters, not `vzdump` /
+  `current` / `pending` / `__base__` / `__replicate_*`) and with no
+  dependent clone, are imported. The rest are listed with the reason,
+  which is also the tool's answer to "why is this one not in the list".
+- Run it on the node hosting the guest, and prefer `--dry-run` first.
 
 ---
 

@@ -11,7 +11,7 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
   - [No Volume Shrinking](#no-volume-shrinking)
   - [Resize Headroom Limit](#resize-headroom-limit)
 - [Content Type Limitations](#content-type-limitations)
-  - [Images Only](#images-only)
+  - [Block Content Only](#block-content-only)
 - [Snapshot Limitations](#snapshot-limitations)
   - [No Backup Integration](#no-backup-integration)
   - [Snapshots Don't Enable Fast Clones](#snapshots-dont-enable-fast-clones)
@@ -188,6 +188,13 @@ qm snapshot 100 template-state
 
 **Note**: This is a Proxmox architectural limitation, not a plugin bug. Proxmox categorizes storage plugins that return block device paths as "external" storage and bypasses plugin clone methods.
 
+**ZFS clones are not unavailable, they are unused here**: the plugin does
+create a ZFS clone for a linked clone of a template (`create_base` plus
+`clone_image`). What goes over the network is the *full* clone of a
+running or standalone VM, which PVE copies itself. A full clone that
+fails once and succeeds on retry is not this limitation - see
+[Clone fails once, works on retry](Troubleshooting.md#clone-fails-once-works-on-retry).
+
 ### No Volume Shrinking
 
 **Limitation**: Cannot reduce volume size, only grow
@@ -239,42 +246,44 @@ Safety margin: 20GB (for ZFS metadata, snapshots, etc.)
 
 ## Content Type Limitations
 
-### Images Only
+### Block Content Only
 
-**Limitation**: Only `content images` (VM disk images) is supported
+**Limitation**: only `images` (VM disks) and `rootdir` (LXC root disks)
+are supported
 
 **Not Supported**:
-- LXC containers (`rootdir`, `vztmpl`)
 - ISO images (`iso`)
 - Container templates (`vztmpl`)
 - Backups (`backup`)
 - Snippets (`snippets`)
 
+This plugin hands PVE a block device per volume. `iso`, `vztmpl`,
+`backup` and `snippets` are file content: PVE expects a directory it can
+write files into, which a zvol is not. Export a dataset from the same
+TrueNAS over NFS or SMB and add it as a separate `nfs`/`cifs` storage for
+those - the same array, a different storage entry.
+
 **Explanation**:
-- Plugin provides iSCSI block storage (perfect for VMs)
-- LXC containers need filesystem-based storage (NFS, directory, etc.)
-- ISOs and templates are file-based, not block devices
+- The plugin provides block storage (iSCSI or NVMe/TCP): one device per volume
+- A VM disk and an LXC root disk are block devices, so both are supported
+- ISOs, container templates, backups and snippets are files, and PVE
+  writes them into a directory it can mount
 
 **Workaround**:
 ```bash
-# Use separate storage for other content types:
-# - Local storage for ISO images
-# - NFS/CIFS for LXC containers
+# Use separate storage for the file-based content types:
+# - NFS/SMB share from the SAME TrueNAS for ISOs, templates, snippets
 # - PBS (Proxmox Backup Server) for backups
 
 # Example /etc/pve/storage.cfg:
 truenasplugin: truenas-vms
     # ... config ...
-    content images
+    content images,rootdir
 
-dir: local
-    path /var/lib/vz
-    content iso,vztmpl,backup
-
-nfs: truenas-lxc
+nfs: truenas-files
     server 192.168.1.100
-    export /mnt/tank/lxc
-    content rootdir,vztmpl
+    export /mnt/tank/pve-files
+    content iso,vztmpl,backup,snippets
 ```
 
 ## Snapshot Limitations
