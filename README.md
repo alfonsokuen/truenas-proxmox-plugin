@@ -71,7 +71,29 @@
 
 ### Installation
 
-**IDK fork: prebuilt .deb from GitHub Releases**
+**IDK fork, option 1 (recommended): one line**
+
+```bash
+curl -sSL https://raw.githubusercontent.com/alfonsokuen/truenas-proxmox-plugin/idk-fork/install-idk.sh | bash -s -- --apt
+```
+
+`install-idk.sh --apt` configures the fork's signed APT repository
+(`https://alfonsokuen.github.io/truenas-proxmox-plugin/apt`, suite `bookworm`
+for PVE 8 and `trixie` for PVE 9) and installs from it, so later revisions
+arrive with a plain `apt-get upgrade`. Drop `--apt` to install the release
+`.deb` directly instead; add `--dry-run` to see what it would do, `--version
+idkNN` to pin a revision, or `--wizard` to run `truenas-proxmox-manage` at the
+end. The script refuses to run off a Proxmox node, verifies every download
+against the release `SHA256SUMS` and installs nothing if that check fails.
+
+The fork's package carries the epoch `1:`, so it outranks upstream's package on
+a node that has both APT sources configured. Nothing has to be removed.
+
+Manual repository setup, and the signing key
+(`1B44 8824 62A1 200E FFCF AEFC 79E6 7ECF B42E E1CC`), are in the
+[Installation Guide](wiki/Installation.md).
+
+**IDK fork, option 2: prebuilt .deb from GitHub Releases**
 
 This fork publishes its builds as release assets on
 `github.com/alfonsokuen/truenas-proxmox-plugin`. GitHub rewrites `~` in asset

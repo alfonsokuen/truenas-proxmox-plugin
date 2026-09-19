@@ -75,3 +75,22 @@ fue bump PROPIO (la alpha upstream mas nueva es 2.1.23-alpha34) — estas capas 
 - PR #97 (OPEN): resiliencia con budget opt-in — port de idk7 piezas 1/3/5/6 + prerrequisitos
   (motor budget behavior-neutral + marker). Piezas 2 y 4 fuera de alcance (dependen de las capas
   self-heal y whitelist; candidatas a PRs futuros propios).
+
+## Distribucion propia del fork (idk19, 2026-09-18) — instalador y repo APT firmado
+Upstream se instala con `install.sh` de su `main` o desde `truenas.github.io/.../apt`; ninguno de
+los dos sirve al fork (el `install.sh` de upstream usa los nombres de campo pre-2.1.23
+`api_host`/`api_key` y deja el wizard roto sobre este paquete, y su repo APT sirve 2.1.17).
+
+- `install-idk.sh` (raiz): instalador de una linea. Descubre la release por la API de GitHub,
+  resuelve el nombre REAL del asset desde `SHA256SUMS` (GitHub reescribe `~` a `.`), verifica el
+  hash y **no instala nada si falla** (exit 3). `--apt` configura el repo firmado del fork,
+  `--version idkNN` fija revision, `--dry-run` no instala, `--wizard` lanza el asistente.
+  Tests offline en `t/installer/01-install-idk.t` (API y descargas sustituidas por `file://`,
+  `apt-get` stubeado para poder AFIRMAR que no se instalo nada en los casos rojos).
+- `tools/publish-apt.sh` + `apt/`: repo APT firmado publicado en la rama huerfana `gh-pages`
+  (GitHub Pages) en `https://alfonsokuen.github.io/truenas-proxmox-plugin/apt`. Esa rama era una
+  copia del `gh-pages` de upstream (2.1.17 con la firma de upstream) y se reemplazo entera.
+  Clave de firma `1B44882462A1200EFFCFAEFC79E67ECFB42EE1CC` (RSA 4096, caduca 2031-09-18), privada
+  solo en la boveda SOPS bajo `apt_signing_truenas_plugin`.
+- Limite conocido: `reprepro` 5.3.1 (bookworm Y trixie) no tiene campo `Limit`, asi que cada suite
+  sirve UNA version, la mas nueva. Las anteriores siguen instalables con `--version idkNN`.

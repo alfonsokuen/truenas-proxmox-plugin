@@ -3,6 +3,7 @@
 Complete installation instructions for the TrueNAS Proxmox VE Storage Plugin.
 
 ## Table of Contents
+- [Installing the IDK fork](#installing-the-idk-fork)
 - [Automated Installation (Recommended)](#automated-installation-recommended)
 - [Manual Installation](#manual-installation)
 - [Requirements](#requirements)
@@ -10,7 +11,87 @@ Complete installation instructions for the TrueNAS Proxmox VE Storage Plugin.
 - [Post-Installation Verification](#post-installation-verification)
 - [Troubleshooting Installation](#troubleshooting-installation)
 
+## Installing the IDK fork
+
+Everything below this section describes *upstream's* distribution channels. The
+IDK fork ships its own installer and its own signed APT repository; use these.
+
+### One line
+
+```bash
+curl -sSL https://raw.githubusercontent.com/alfonsokuen/truenas-proxmox-plugin/idk-fork/install-idk.sh | bash -s -- --apt
+```
+
+`install-idk.sh` can also be downloaded and run by hand:
+
+| Flag | Effect |
+|---|---|
+| `--apt` | Configure the fork's APT repository and install from it. Recommended: later revisions arrive with `apt-get upgrade`. |
+| *(no flag)* | Download the release `.deb` from GitHub, verify it against `SHA256SUMS`, install it. |
+| `--version idkNN` | Pin a revision (default: the latest release). |
+| `--dry-run` | Do every check and download, install nothing. |
+| `--wizard` | Run `truenas-proxmox-manage` when the install finishes. |
+
+Exit codes: `0` ok, `1` usage, `2` precondition (not root, not a Proxmox node,
+missing tool), `3` checksum verification failed — **nothing was installed**,
+`4` download failure, `5` install failure.
+
+The installer refuses to run as a non-root user or on a host without
+`pve-manager`. If it finds upstream's APT source it says so and continues: the
+fork's package carries the epoch `1:` and wins the version comparison, so the
+two sources coexist without either being removed.
+
+### Manual deb822 repository setup
+
+Repository URL: `https://alfonsokuen.github.io/truenas-proxmox-plugin/apt/`
+Key URL: `https://alfonsokuen.github.io/truenas-proxmox-plugin/apt/KEY.gpg`
+Signing key: `1B44 8824 62A1 200E FFCF AEFC 79E6 7ECF B42E E1CC`
+(`IDKMANAGER truenas-proxmox-plugin fork <gerencia@idkmanager.com>`, RSA 4096,
+expires 2031-09-18).
+
+```bash
+curl -fsSL https://alfonsokuen.github.io/truenas-proxmox-plugin/apt/KEY.gpg \
+  -o /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
+
+cat >/etc/apt/sources.list.d/truenas-proxmox-plugin-idk.sources <<'EOF'
+Types: deb
+URIs: https://alfonsokuen.github.io/truenas-proxmox-plugin/apt/
+Suites: trixie
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
+EOF
+
+apt-get update
+apt-get install -y truenas-proxmox-plugin
+```
+
+Suite mapping: Proxmox VE 8 -> `bookworm`, Proxmox VE 9 -> `trixie`. The
+package is `Architecture: all`; it is indexed under `binary-amd64`, which is
+where APT looks on a Proxmox node.
+
+`Signed-By` is not decoration: point it at a file that does not hold this key
+and `apt-get update` fails the repository with `NO_PUBKEY`, as it should.
+
+### Publishing the repository (maintainers)
+
+`tools/publish-apt.sh` rebuilds and publishes it. It runs on the workstation,
+pulls every fork release with `gh`, verifies each `.deb` against its
+`SHA256SUMS` (renaming the GitHub-rewritten asset back to its original name),
+and orchestrates a throwaway `debian:12` container on the Docker host for the
+`reprepro` + GnuPG step. The private key lives only in the SOPS vault under
+`apt_signing_truenas_plugin`, is decrypted into the container at the start of
+the run, and the working directory is wiped on exit — including on failure.
+The result is force-pushed to the orphan `gh-pages` branch, which GitHub Pages
+serves.
+
+Note that Debian's `reprepro` 5.3.1 (bookworm *and* trixie) has no `Limit`
+field, so each suite holds exactly one version: the newest. Older revisions
+stay installable with `install-idk.sh --version idkNN`.
+
 ## Automated Installation (Recommended)
+
+> Upstream's channels. On the IDK fork, prefer the section above.
 
 The TrueNAS plugin includes a comprehensive automated installer that handles installation, updates, configuration, and management through an interactive menu system.
 
