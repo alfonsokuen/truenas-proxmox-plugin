@@ -1,3 +1,22 @@
+## IDK MANAGER fork: downloads, installation and verification
+
+Looking for the **IDK MANAGER TrueNAS storage plugin for Proxmox VE**? The maintained IDK development branch and installable builds are published in the maintainer repository:
+
+- **Source and current documentation:** https://github.com/alfonsokuen/truenas-proxmox-plugin/tree/idk-fork
+- **Versioned package and installation instructions (idk18):** https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/tag/v2.1.23-alpha1%2Bidk18
+- **Latest published release:** https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/latest
+- **Technical case study:** https://idkmanager.com/blog/plugin-truenas-proxmox-nvme-tcp-chap-iscsi/
+
+**This main-branch checkout is not the current IDK release.** Use the IDK links above; the upstream installation commands retained below install the upstream project, not the IDK build. Do not mix installation instructions between branches.
+
+The idk18 release includes a Debian package and SHA256SUMS. Download under the original filename specified in its release instructions, verify the checksum, then install on the intended Proxmox node. Its published verification report records installation on a three-node PVE 9.2.4 cluster, an import-snapshots dry run on each node, and a two-disk NVMe/TCP disposable-VM test covering import, rollback/data recovery and deletion. These are the maintainer's reported tests for that release, not independent certification or a guarantee for every environment.
+
+The snapshot-import feature currently supports QEMU guests, not LXC. Imported snapshots contain no RAM state and carry the guest configuration as of import; partial multi-disk snapshots are refused. Read the release limitations before using it.
+
+This is an independent fork maintained by **Alfonso Kuen Arroyo / IDK MANAGER**, based on the work of the TrueNAS plugin authors. It is not an official TrueNAS or Proxmox release. CHAP and API-outage-resilience contributions are proposed upstream in [PR #95](https://github.com/truenas/truenas-proxmox-plugin/pull/95) and [PR #97](https://github.com/truenas/truenas-proxmox-plugin/pull/97); a proposal is not upstream acceptance. Report IDK-specific issues in the maintainer repository.
+
+---
+
 <h1 align="center">TrueNAS Proxmox VE Storage Plugin</h1>
 
 <p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI or NVMe/TCP, featuring live snapshots, LXC container storage, ZFS integration, and cluster compatibility.</p>
