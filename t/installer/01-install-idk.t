@@ -177,6 +177,38 @@ case "\${IDK_TEST_CANDIDATE:-fork}" in
   none)
     printf '%s:\\n  Installed: 1:2.1.23~alpha1+idk18\\n  Candidate: (none)\\n' truenas-proxmox-plugin
     ;;
+  regexmatch)
+    # apt.example.invalid read as a REGEX matches apt-example-invalid: the
+    # dots are wildcards. A literal comparison rejects it.
+    cat <<'OUT'
+truenas-proxmox-plugin:
+  Installed: (none)
+  Candidate: 1:2.1.23~alpha1+idk18
+  Version table:
+     1:2.1.23~alpha1+idk18 500
+        500 https://aptXexampleXinvalid/truenas-proxmox-plugin/apt trixie/main amd64 Packages
+OUT
+    ;;
+  withport)
+    cat <<'OUT'
+truenas-proxmox-plugin:
+  Installed: (none)
+  Candidate: 1:2.1.23~alpha1+idk18
+  Version table:
+     1:2.1.23~alpha1+idk18 500
+        500 https://APT.Example.Invalid:443/truenas-proxmox-plugin/apt trixie/main amd64 Packages
+OUT
+    ;;
+  withuser)
+    cat <<'OUT'
+truenas-proxmox-plugin:
+  Installed: (none)
+  Candidate: 1:2.1.23~alpha1+idk18
+  Version table:
+     1:2.1.23~alpha1+idk18 500
+        500 https://user:pass\@apt.example.invalid/truenas-proxmox-plugin/apt trixie/main amd64 Packages
+OUT
+    ;;
   lookalike)
     cat <<'OUT'
 truenas-proxmox-plugin:
@@ -570,6 +602,45 @@ sub apt_installs {
 {
     my (undef, $out) = run_installer(args => '--dry-run');
     like($out, qr/install-idk\.sh idk\d+\.\d+/, 'it announces its own version');
+}
+
+# --- 13. the origin host is compared literally and normalised ------------
+{
+    my ($rc, $out, $apt) = run_installer(args => '--apt', candidate => 'regexmatch');
+    is($rc, 5, 'a host that only matches as a REGEX is refused');
+    like($out, qr/is NOT the fork's package/, 'the comparison is literal');
+    is(apt_installs($apt), '', 'nothing was installed');
+
+    my ($rc2, $out2) = run_installer(args => '--apt', candidate => 'withport');
+    is($rc2, 0, 'an explicit :443 and a different case are the same host');
+    like($out2, qr/\Qrepository candidate: 1:2.1.23~alpha1+idk18 (from $APT_HOST)\E/,
+        'and it is reported normalised');
+
+    my ($rc3, undef) = run_installer(args => '--apt', candidate => 'withuser');
+    is($rc3, 0, 'userinfo in the origin does not change the host');
+}
+
+# --- 14. RED: a name whose only flaw is a trailing newline ---------------
+# Python's re.match anchors the start; '$' then happily matches BEFORE a
+# trailing newline, so "SHA256SUMS" + a newline passed the filter and still
+# forged a row. fullmatch is the difference.
+{
+    my $evil = "$root/evil2";
+    make_path($evil);
+    spew("$evil/payload", "0" x 64 . "  nothing.deb\n");
+    my $evil_url = file_url($evil);
+    my $name = 'SHA256SUMS' . '\\n';
+    spew("$api/latest", qq({\n  "tag_name": "v2.1.23-alpha1+idk18",\n  "assets": [\n)
+        . qq(    {"name": "$name", "browser_download_url": "$evil_url/payload"},\n)
+        . qq(    {"name": "SHA256SUMS", "browser_download_url": "$dl_url/SHA256SUMS"},\n)
+        . qq(    {"name": "$DEB_SERVED", "browser_download_url": "$dl_url/$DEB_SERVED"}\n  ]\n}\n));
+
+    my ($rc, $out, $apt) = run_installer();
+    is($rc, 0, 'the trailing-newline entry is dropped and the genuine one used');
+    like($out, qr/sha256 OK/, 'and the genuine package verified');
+    unlike($out, qr{/payload}, 'the forged entry never became the manifest');
+
+    spew("$api/latest", release_json());
 }
 
 done_testing();

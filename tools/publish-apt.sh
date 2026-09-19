@@ -184,15 +184,30 @@ push_url="$(git -C "$repo_root" remote get-url github)"
 # An ls-remote that FAILED and one that found nothing look the same in a
 # variable, and treating the first as "the branch does not exist yet" drops
 # the lease and turns the publish into an unguarded push. So check the status.
+ls_err="$(mktemp)"
 set +e
-remote_refs="$(git_remote -C "$repo_root" ls-remote "$push_url" gh-pages 2>&1)"
+remote_refs="$(git_remote -C "$repo_root" ls-remote "$push_url" gh-pages 2>"$ls_err")"
 ls_rc=$?
 set -e
 if [ "$ls_rc" -ne 0 ]; then
-    printf '%s\n' "$remote_refs" >&2
+    cat "$ls_err" >&2
+    rm -f "$ls_err"
     die 2 'could not read gh-pages from the remote; refusing to publish without a lease'
 fi
-expected_tip="$(printf '%s\n' "$remote_refs" | awk '{ print $1; exit }')"
+rm -f "$ls_err"
+
+# Stderr is kept out of the capture on purpose: git's progress and warnings
+# would otherwise end up parsed as a ref. An empty answer means the branch
+# does not exist; anything else has to be exactly one ref line.
+expected_tip=''
+if [ -n "$remote_refs" ]; then
+    if ! printf '%s\n' "$remote_refs" |
+            grep -qE '^[0-9a-f]{40}[[:space:]]+refs/heads/gh-pages$'; then
+        printf '%s\n' "$remote_refs" >&2
+        die 2 'unexpected ls-remote output for gh-pages; refusing to publish'
+    fi
+    expected_tip="$(printf '%s\n' "$remote_refs" | awk '{ print $1; exit }')"
+fi
 if [ -n "$expected_tip" ]; then
     log "gh-pages is at $expected_tip; that is the tip this run will replace"
 else

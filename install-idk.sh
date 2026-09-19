@@ -191,20 +191,39 @@ http_get() {
     curl -fsSL --retry 2 --connect-timeout 20 -o "$2" -- "$1"
 }
 
+normalise_host() {
+    # Authority -> comparable host: drop userinfo, drop the port, unwrap an
+    # IPv6 literal, lowercase. Both sides of the comparison go through this,
+    # or https://host:443/ and https://HOST/ read as different hosts and the
+    # check fails on a repository that is in fact the right one.
+    printf '%s' "$1" | awk '{
+        u = $0
+        a = index(u, "@")
+        if (a > 0) u = substr(u, a + 1)
+        if (substr(u, 1, 1) == "[") {
+            c = index(u, "]")
+            if (c > 0) u = substr(u, 2, c - 2)
+        } else {
+            sub(/:[0-9]*$/, "", u)
+        }
+        print tolower(u)
+    }'
+}
+
 apt_host() {
     # The host apt will report as the origin of the candidate. An empty
     # value would turn the origin check into a no-op that happily accepts
     # upstream's package, so refuse rather than guess.
     local h
     if [ -n "${IDK_APT_EXPECTED_HOST:-}" ]; then
-        printf '%s\n' "$IDK_APT_EXPECTED_HOST"
+        normalise_host "$IDK_APT_EXPECTED_HOST"
         return 0
     fi
     h="${APT_BASE_URL#*://}"
     h="${h%%/*}"
     [ -n "$h" ] ||
         die 2 'IDK_APT_BASE_URL carries no host; set IDK_APT_EXPECTED_HOST to the origin apt will report'
-    printf '%s\n' "$h"
+    normalise_host "$h"
 }
 
 # --- release metadata ----------------------------------------------------
@@ -268,7 +287,7 @@ with open(dest, 'w') as out:
         url = asset.get('browser_download_url')
         if not isinstance(name, str) or not isinstance(url, str):
             continue
-        if not NAME_RE.match(name) or not URL_RE.match(url):
+        if not NAME_RE.fullmatch(name) or not URL_RE.fullmatch(url):
             continue
         out.write('%s\t%s\n' % (name, url))
 with open(status, 'w') as fh:
@@ -462,8 +481,8 @@ apt_update_strict() {
     local rc=${PIPESTATUS[0]}
     set -e
     [ "$rc" -eq 0 ] || die 5 'apt-get update failed'
-    if grep -qE "^(Err|E):.*${host}" "$log_file"; then
-        grep -E "^(Err|E|W):.*${host}" "$log_file" >&2 || true
+    if grep -E '^(Err|E):' "$log_file" | grep -Fq -- "$host"; then
+        grep -E '^(Err|E|W):' "$log_file" | grep -F -- "$host" >&2 || true
         die 5 "apt-get update could not use the fork repository at ${host}"
     fi
 }
@@ -483,13 +502,19 @@ candidate_origin_hosts() {
     local cand="$1"
     shift
     LC_ALL=C apt-cache "$@" policy "$PKG_NAME" 2>/dev/null | awk -v cand="$cand" '
-        function host(u,   a) {
+        function host(u,   a, c) {
             if (u !~ /:\/\//) return ""
             sub(/^[^:]*:\/\//, "", u)
             sub(/\/.*$/, "", u)
             a = index(u, "@")
             if (a > 0) u = substr(u, a + 1)
-            return u
+            if (substr(u, 1, 1) == "[") {
+                c = index(u, "]")
+                if (c > 0) u = substr(u, 2, c - 2)
+            } else {
+                sub(/:[0-9]*$/, "", u)
+            }
+            return tolower(u)
         }
         {
             line = $0
@@ -522,7 +547,9 @@ assert_candidate_is_ours() {
         die 5 "the candidate does not look like a fork build"
     fi
     origins="$(candidate_origin_hosts "$cand" "$@")"
-    if ! printf '%s\n' "$origins" | grep -qx -- "$host"; then
+    # -F, not a regex: without it a host is a pattern, and the dots in
+    # example.github.io match any character - evil-github-io would pass.
+    if ! printf '%s\n' "$origins" | grep -Fqx -- "$host"; then
         warn "candidate $cand is served by: ${origins:-<unknown>}"
         warn "expected exactly the host $host"
         die 5 "the installation candidate is NOT the fork's package; refusing to install"
@@ -537,7 +564,8 @@ apt_dry_run() {
     local suite sandbox
     suite="$1"
     sandbox="$workdir/apt-sandbox"
-    mkdir -p "$sandbox/sources.list.d" "$sandbox/lists/partial" "$sandbox/archives/partial"
+    mkdir -p "$sandbox/sources.list.d" "$sandbox/lists/partial" \
+        "$sandbox/archives/partial" "$sandbox/apt.conf.d"
 
     fetch_and_verify_key "$sandbox/KEY.gpg"
     write_sources_file "$sandbox/sources.list.d/truenas-proxmox-plugin-idk.sources" \
@@ -561,19 +589,23 @@ apt_dry_run() {
           -o "Dir::State::lists=$sandbox/lists"
           -o "Dir::Cache::archives=$sandbox/archives"
           -o "APT::Get::List-Cleanup=0"
-          # A node can carry Pre/Post-Invoke hooks from any package. A dry run
-          # must not fire them: assigning the list as a scalar replaces it.
-          -o "APT::Update::Pre-Invoke="
-          -o "APT::Update::Post-Invoke="
-          -o "APT::Update::Post-Invoke-Success="
-          -o "DPkg::Post-Invoke="
+          # A node can carry Pre/Post-Invoke hooks from any package, and
+          # `-o APT::Update::Pre-Invoke=` does NOT empty a list that
+          # /etc/apt/apt.conf.d already filled. The only way not to inherit
+          # them is not to read that directory: point apt at an empty one.
+          # Configuration is what is dropped here, not policy - the pins in
+          # preferences.d are read as usual, on purpose.
+          -o "Dir::Etc::main=/dev/null"
+          -o "Dir::Etc::parts=$sandbox/apt.conf.d"
           # the sandbox lives in a root-only tmpdir that _apt cannot read;
           # dropping privileges there only produces a warning about itself.
           -o "APT::Sandbox::User=root")
     apt_update_strict "${opts[@]}"
     assert_candidate_is_ours -o "Dir::State::lists=$sandbox/lists" \
         -o "Dir::Etc::sourcelist=/dev/null" \
-        -o "Dir::Etc::sourceparts=$sandbox/sources.list.d"
+        -o "Dir::Etc::sourceparts=$sandbox/sources.list.d" \
+        -o "Dir::Etc::main=/dev/null" \
+        -o "Dir::Etc::parts=$sandbox/apt.conf.d"
 
     log "--dry-run: would write $APT_KEYRING_FILE and $APT_SOURCES_FILE"
     log '--dry-run: would install the candidate above; nothing was changed'
