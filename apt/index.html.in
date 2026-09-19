@@ -29,7 +29,7 @@ for Proxmox VE. Suites: <code>bookworm</code> (PVE 8) and <code>trixie</code> (P
 Signing key: <code>@FINGERPRINT@</code>.</p>
 
 <h2>One-line install (recommended)</h2>
-<pre><code>curl -sSL https://raw.githubusercontent.com/alfonsokuen/truenas-proxmox-plugin/idk-fork/install-idk.sh | bash -s -- --apt</code></pre>
+<pre><code>curl -sSL https://raw.githubusercontent.com/@REPO_SLUG@/idk-fork/install-idk.sh | bash -s -- --apt</code></pre>
 
 <h2>Manual setup</h2>
 <pre><code>curl -fsSL @PAGES_URL@/KEY.gpg -o /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
@@ -52,7 +52,7 @@ apt-get install -y truenas-proxmox-plugin</code></pre>
 package on a node that has both sources configured. Nothing needs to be removed.</p>
 
 <hr>
-<p>Source: <a href="https://github.com/alfonsokuen/truenas-proxmox-plugin">github.com/alfonsokuen/truenas-proxmox-plugin</a>
+<p>Source: <a href="https://github.com/@REPO_SLUG@">github.com/@REPO_SLUG@</a>
 &middot; this branch replaces the upstream <code>gh-pages</code> copy that used to live here.</p>
 </main>
 </body>

@@ -77,17 +77,26 @@
 curl -sSL https://raw.githubusercontent.com/alfonsokuen/truenas-proxmox-plugin/idk-fork/install-idk.sh | bash -s -- --apt
 ```
 
+(That URL goes live once `install-idk.sh` is merged into `idk-fork`; before
+that, take the script from the working branch.)
+
 `install-idk.sh --apt` configures the fork's signed APT repository
 (`https://alfonsokuen.github.io/truenas-proxmox-plugin/apt`, suite `bookworm`
 for PVE 8 and `trixie` for PVE 9) and installs from it, so later revisions
 arrive with a plain `apt-get upgrade`. Drop `--apt` to install the release
 `.deb` directly instead; add `--dry-run` to see what it would do, `--version
 idkNN` to pin a revision, or `--wizard` to run `truenas-proxmox-manage` at the
-end. The script refuses to run off a Proxmox node, verifies every download
-against the release `SHA256SUMS` and installs nothing if that check fails.
+end.
+
+It refuses to run off a Proxmox node, pins the repository key by fingerprint,
+compares the package's SHA256 against the exact line `SHA256SUMS` gives for it,
+and refuses to install when the APT candidate is not the fork's package. A
+failed check installs nothing.
 
 The fork's package carries the epoch `1:`, so it outranks upstream's package on
-a node that has both APT sources configured. Nothing has to be removed.
+a node that has both APT sources configured. Nothing has to be removed. A node
+carrying `Pin: release *` at priority -1 blocks the fork's repository too - see
+the pinning policy in the [Installation Guide](wiki/Installation.md).
 
 Manual repository setup, and the signing key
 (`1B44 8824 62A1 200E FFCF AEFC 79E6 7ECF B42E E1CC`), are in the

@@ -22,24 +22,76 @@ IDK fork ships its own installer and its own signed APT repository; use these.
 curl -sSL https://raw.githubusercontent.com/alfonsokuen/truenas-proxmox-plugin/idk-fork/install-idk.sh | bash -s -- --apt
 ```
 
+That URL goes live once the installer is merged into `idk-fork`. Until then,
+fetch the script from the working branch, or `scp` it to the node and run it.
+
 `install-idk.sh` can also be downloaded and run by hand:
 
 | Flag | Effect |
 |---|---|
-| `--apt` | Configure the fork's APT repository and install from it. Recommended: later revisions arrive with `apt-get upgrade`. |
+| `--apt` | Configure the fork's APT repository and install from it. Recommended: later revisions arrive with `apt-get upgrade`. Always the newest revision. |
 | *(no flag)* | Download the release `.deb` from GitHub, verify it against `SHA256SUMS`, install it. |
-| `--version idkNN` | Pin a revision (default: the latest release). |
-| `--dry-run` | Do every check and download, install nothing. |
+| `--version idkNN` | Pin a revision (default: the latest release). Not valid with `--apt`, which can only offer what the repository serves. |
+| `--allow-downgrade` | Required to install a revision older than the one on the node. |
+| `--dry-run` | Do every check and download, install nothing. With `--apt` it builds a throwaway APT state, verifies the repository signature and prints the candidate, without touching `/etc/apt`. |
 | `--wizard` | Run `truenas-proxmox-manage` when the install finishes. |
 
 Exit codes: `0` ok, `1` usage, `2` precondition (not root, not a Proxmox node,
-missing tool), `3` checksum verification failed — **nothing was installed**,
-`4` download failure, `5` install failure.
+missing tool), `3` verification failed — checksum, package name or repository
+key; **nothing was installed** — `4` download failure, `5` install failure or a
+repository that does not offer the fork's package, `130`/`143` interrupted.
 
-The installer refuses to run as a non-root user or on a host without
-`pve-manager`. If it finds upstream's APT source it says so and continues: the
-fork's package carries the epoch `1:` and wins the version comparison, so the
-two sources coexist without either being removed.
+What it refuses to do:
+
+- run as a non-root user, or on a host without `pve-manager`;
+- install a package whose SHA256 does not match the digest `SHA256SUMS` gives
+  for that exact file name. The comparison is explicit — `sha256sum -c
+  --ignore-missing` is not used, because it exits 0 when the manifest does not
+  cover the downloaded file, and treats a malformed digest line as a warning;
+- write a file whose name came out of `SHA256SUMS` and is not
+  `truenas-proxmox-plugin_<version>_all.deb`. That name is downloaded input to
+  a path used as root;
+- install from the APT repository when the candidate is not the fork's package
+  (wrong origin, or no epoch `1:`), or when `apt-get update` could not refresh
+  the fork's source;
+- trust a repository key whose fingerprint is not the one the script pins.
+
+If it finds upstream's APT source it says so and continues: the fork's package
+carries the epoch `1:` and wins the version comparison, so the two sources
+coexist without either being removed.
+
+### Pinning policy on a node that runs the fork
+
+A node that had only the release `.deb` often carries this, to stop a routine
+upgrade from replacing the local build with upstream's package:
+
+```
+Package: truenas-proxmox-plugin
+Pin: release *
+Pin-Priority: -1
+```
+
+`Pin: release *` matches **every** origin, the fork's own repository included,
+so `--apt` configures the source correctly and then finds no installation
+candidate. The installer says so and stops (exit 5) rather than leaving you
+with apt's "no installation candidate". Two ways out, pick one deliberately:
+
+- **Track the fork, block upstream** — narrow the pin to upstream's origin.
+  `apt-get upgrade` then brings new fork revisions:
+
+  ```
+  Package: truenas-proxmox-plugin
+  Pin: origin truenas.github.io
+  Pin-Priority: -1
+  ```
+
+- **Upgrade only when you say so** — drop the pin and use `apt-mark hold
+  truenas-proxmox-plugin`. `apt-get upgrade` leaves the package alone;
+  `apt-mark unhold` plus an explicit install is the deliberate act. This is the
+  safer choice for a node whose storage is in use.
+
+Whichever you choose, apply it per node and say why in the file: a pin nobody
+can explain is a pin someone will delete.
 
 ### Manual deb822 repository setup
 
@@ -52,6 +104,8 @@ expires 2031-09-18).
 ```bash
 curl -fsSL https://alfonsokuen.github.io/truenas-proxmox-plugin/apt/KEY.gpg \
   -o /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
+gpg --show-keys --with-colons /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg |
+  grep '^fpr:' | grep 1B44882462A1200EFFCFAEFC79E67ECFB42EE1CC
 
 cat >/etc/apt/sources.list.d/truenas-proxmox-plugin-idk.sources <<'EOF'
 Types: deb
@@ -63,27 +117,50 @@ Signed-By: /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
 EOF
 
 apt-get update
+apt-cache policy truenas-proxmox-plugin   # the candidate must be the 1: one
 apt-get install -y truenas-proxmox-plugin
 ```
+
+Check the fingerprint before trusting the key: downloading it over TLS says
+only that the site served it, and anything that can replace that file can also
+make it non-empty.
 
 Suite mapping: Proxmox VE 8 -> `bookworm`, Proxmox VE 9 -> `trixie`. The
 package is `Architecture: all`; it is indexed under `binary-amd64`, which is
 where APT looks on a Proxmox node.
 
 `Signed-By` is not decoration: point it at a file that does not hold this key
-and `apt-get update` fails the repository with `NO_PUBKEY`, as it should.
+and `apt-get update` fails the repository with a missing-key error, as it
+should.
 
 ### Publishing the repository (maintainers)
 
-`tools/publish-apt.sh` rebuilds and publishes it. It runs on the workstation,
-pulls every fork release with `gh`, verifies each `.deb` against its
-`SHA256SUMS` (renaming the GitHub-rewritten asset back to its original name),
-and orchestrates a throwaway `debian:12` container on the Docker host for the
-`reprepro` + GnuPG step. The private key lives only in the SOPS vault under
-`apt_signing_truenas_plugin`, is decrypted into the container at the start of
-the run, and the working directory is wiped on exit — including on failure.
-The result is force-pushed to the orphan `gh-pages` branch, which GitHub Pages
-serves.
+`tools/publish-apt.sh` rebuilds and publishes it. Nothing about the
+infrastructure is baked into the script; it reads:
+
+| Variable | Meaning |
+|---|---|
+| `IDK_DOCKER_HOST` | ssh destination of the Docker host that runs `reprepro` (required) |
+| `IDK_VAULT` | path to the SOPS vault holding `apt_signing_truenas_plugin` (required) |
+| `IDK_GH_REPO` | `owner/repo`; defaults to whatever the `github` remote points at |
+| `IDK_PAGES_URL` | public URL of the repository; defaults to the GitHub Pages URL of that repo |
+
+```bash
+IDK_DOCKER_HOST=root@<docker-host> IDK_VAULT=/path/to/credentials.sops.yaml \
+  tools/publish-apt.sh
+```
+
+It pulls every fork release with `gh`, verifies each `.deb` against its
+`SHA256SUMS` (renaming the GitHub-rewritten asset back to its original name,
+validating that name, and comparing the digest explicitly), then runs
+`reprepro` and GnuPG in a throwaway `debian:12` container on the Docker host.
+The private key is streamed to that container over ssh's stdin into a
+GNUPGHOME on **tmpfs** — it never reaches the Docker host's disk — and the
+remote working directory is deleted on exit, on failure and even with
+`--keep`; if that delete fails the script says so and names the path instead of
+staying quiet. The result is pushed to the orphan `gh-pages` branch with
+`--force-with-lease` against the tip read at the start of the run, so a
+concurrent publish is refused rather than silently discarded.
 
 Note that Debian's `reprepro` 5.3.1 (bookworm *and* trixie) has no `Limit`
 field, so each suite holds exactly one version: the newest. Older revisions

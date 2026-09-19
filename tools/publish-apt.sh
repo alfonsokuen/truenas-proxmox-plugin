@@ -2,14 +2,20 @@
 #
 # publish-apt.sh - build and publish the signed APT repository of the IDKMANAGER
 # fork of truenas-proxmox-plugin to the `gh-pages` branch of the GitHub fork,
-# served by GitHub Pages at https://alfonsokuen.github.io/truenas-proxmox-plugin/apt
+# served by GitHub Pages.
 #
 # WHERE IT RUNS
 #   On the workstation (Git Bash on Windows, or any Linux box). It needs `gh`,
 #   `sops`, `git`, `ssh` and `scp` locally, and orchestrates a throwaway
-#   `debian:12` container on the Docker host (default IAS03) for the one step
-#   that has no Windows equivalent: `reprepro` signing the indices with GnuPG.
-#   Nothing persistent is left on that host.
+#   `debian:12` container on a Docker host for the one step that has no Windows
+#   equivalent: `reprepro` signing the indices with GnuPG.
+#
+# REQUIRED ENVIRONMENT (no host, path or address is baked into this file)
+#   IDK_DOCKER_HOST   ssh destination of the Docker host, e.g. root@docker-host.example
+#   IDK_VAULT         path to the SOPS vault holding the signing key
+#   IDK_GH_REPO       owner/repo (default: taken from the `github` git remote)
+#   IDK_PAGES_URL     public URL of the published repository
+#                     (default: https://<owner>.github.io/<repo>/apt)
 #
 # WHY A FULL REBUILD EVERY RUN
 #   The reprepro database is not carried across runs, so the repository is
@@ -26,85 +32,121 @@
 #   `Limit: -1` to the generated conf/distributions to keep them all.
 #
 # THE SIGNING KEY
-#   Lives only in the SOPS vault under `apt_signing_truenas_plugin`. It is
-#   decrypted into the container's GNUPGHOME at the start of the run and the
-#   whole working directory is wiped on exit (including on failure).
+#   Lives only in the SOPS vault. It is streamed to the container over ssh's
+#   stdin and imported into a GNUPGHOME on tmpfs: it is never written to the
+#   Docker host's disk. The remote working directory is removed on exit,
+#   including on failure and including with --keep.
 #
 # Usage:
-#   tools/publish-apt.sh [--no-push] [--tags "idk15 idk16"] [--host root@IP]
-#                        [--vault PATH] [--keep]
+#   IDK_DOCKER_HOST=root@<host> IDK_VAULT=/path/to/vault.sops.yaml \
+#     tools/publish-apt.sh [--no-push] [--tags "idk15 idk16"] [--keep]
 #
-# Exit codes: 0 ok, 1 usage, 2 missing tool / unreachable host, 3 checksum
-# verification failed, 4 release download failure, 5 reprepro failure,
-# 6 publish (git push) failure.
+# Exit codes: 0 ok, 1 usage, 2 missing tool / missing configuration /
+# unreachable host, 3 verification failed, 4 release download failure,
+# 5 reprepro failure, 6 publish (git push) failure, 130/143 interrupted.
 #
-# The remote commands below interpolate $REMOTE_BASE on purpose: the path is
-# ours, not the remote shell's, and it must be fixed before ssh sees it.
+# The remote commands below interpolate paths on purpose: they are ours, not
+# the remote shell's, and must be fixed before ssh sees them.
 # shellcheck disable=SC2029
 set -euo pipefail
 
-REPO_SLUG="${IDK_GH_REPO:-alfonsokuen/truenas-proxmox-plugin}"
-PAGES_URL='https://alfonsokuen.github.io/truenas-proxmox-plugin/apt'
-VAULT_DEFAULT="${IDK_VAULT:-$HOME/Nextcloud/Documentos/Claude.md/credentials/credentials.sops.yaml}"
+BASE_VERSION='2.1.23-alpha1'
 VAULT_KEY='apt_signing_truenas_plugin'
-DOCKER_HOST_SSH="${IDK_DOCKER_HOST:-root@190.160.10.143}"
-REMOTE_BASE='/root/idk-plugin-apt'
 MIN_REVISION=15          # idk15 is the first revision worth serving
 SUITES='bookworm trixie'
+DEB_NAME_RE='^truenas-proxmox-plugin_[A-Za-z0-9.~+]+_all\.deb$'
 
 opt_push=1
 opt_keep=0
 opt_tags=''
-vault="$VAULT_DEFAULT"
 workdir=''
+remote_dir=''
+docker_host=''
 
 log()  { printf '[publish-apt] %s\n' "$*"; }
 warn() { printf '[publish-apt] WARNING: %s\n' "$*" >&2; }
 die()  { printf '[publish-apt] ERROR: %s\n' "$2" >&2; exit "$1"; }
 
 usage() {
-    sed -n '3,30p' "$0"
+    sed -n '3,50p' "$0"
+}
+
+wipe_remote() {
+    # Unconditional: the container's working directory holds the built
+    # repository and, briefly, a GNUPGHOME. --keep is about the LOCAL tree, it
+    # is never a reason to leave ours on someone else's disk. A failure here
+    # is reported, never swallowed.
+    [ -n "$remote_dir" ] || return 0
+    [ -n "$docker_host" ] || return 0
+    if ssh -o ConnectTimeout=15 "$docker_host" "rm -rf -- '$remote_dir'" >/dev/null 2>&1; then
+        remote_dir=''
+        return 0
+    fi
+    warn "COULD NOT REMOVE the remote working directory."
+    warn "Delete it by hand: ssh $docker_host rm -rf $remote_dir"
+    return 1
 }
 
 cleanup() {
+    wipe_remote || true
     if [ "$opt_keep" -eq 1 ]; then
         [ -n "$workdir" ] && log "--keep: leaving $workdir in place"
         return 0
     fi
     [ -n "$workdir" ] && [ -d "$workdir" ] && rm -rf -- "$workdir"
-    # The remote side holds a decrypted private key: wipe it even on failure.
-    ssh "$DOCKER_HOST_SSH" "rm -rf -- '$REMOTE_BASE/build'" >/dev/null 2>&1 || true
+    workdir=''
+    return 0
 }
+on_int()  { cleanup; exit 130; }
+on_term() { cleanup; exit 143; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-push) opt_push=0 ;;
         --keep)    opt_keep=1 ;;
         --tags)    [ $# -ge 2 ] || die 1 '--tags needs an argument'; opt_tags="$2"; shift ;;
-        --host)    [ $# -ge 2 ] || die 1 '--host needs an argument'; DOCKER_HOST_SSH="$2"; shift ;;
-        --vault)   [ $# -ge 2 ] || die 1 '--vault needs an argument'; vault="$2"; shift ;;
         -h|--help) usage; exit 0 ;;
         *)         usage >&2; die 1 "unknown option: $1" ;;
     esac
     shift
 done
 
-for tool in gh sops git ssh scp sha256sum; do
+for tool in gh sops git ssh scp sha256sum awk; do
     command -v "$tool" >/dev/null 2>&1 || die 2 "required tool not found: $tool"
 done
+
+docker_host="${IDK_DOCKER_HOST:-}"
+vault="${IDK_VAULT:-}"
+[ -n "$docker_host" ] ||
+    die 2 'IDK_DOCKER_HOST is not set (example: IDK_DOCKER_HOST=root@docker.internal.example)'
+[ -n "$vault" ] ||
+    die 2 "IDK_VAULT is not set (example: IDK_VAULT=/path/to/credentials.sops.yaml)"
 [ -f "$vault" ] || die 2 "SOPS vault not found: $vault"
-ssh -o ConnectTimeout=15 "$DOCKER_HOST_SSH" 'docker --version >/dev/null' ||
-    die 2 "cannot reach docker on $DOCKER_HOST_SSH"
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+repo_slug="${IDK_GH_REPO:-}"
+if [ -z "$repo_slug" ]; then
+    repo_slug="$(git -C "$repo_root" remote get-url github 2>/dev/null |
+        sed -n 's#.*github[.]com[:/]##p' | sed -e 's#[.]git$##' -e 's#/$##')"
+fi
+[ -n "$repo_slug" ] ||
+    die 2 'cannot tell which GitHub repo to publish; set IDK_GH_REPO=owner/repo'
+pages_url="${IDK_PAGES_URL:-https://${repo_slug%%/*}.github.io/${repo_slug#*/}/apt}"
+
+ssh -o ConnectTimeout=15 "$docker_host" 'docker --version >/dev/null' ||
+    die 2 "cannot reach docker on $docker_host"
 
 workdir="$(mktemp -d)"
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap on_int INT
+trap on_term TERM
 mkdir -p "$workdir/debs" "$workdir/pages"
 
 # --- 1. which releases to publish ---------------------------------------
 if [ -n "$opt_tags" ]; then
     revisions="$opt_tags"
 else
-    revisions="$(gh release list -R "$REPO_SLUG" --limit 100 --json tagName -q '.[].tagName' |
+    revisions="$(gh release list -R "$repo_slug" --limit 100 --json tagName -q '.[].tagName' |
         sed -n 's/.*+\(idk[0-9]\{1,\}\)$/\1/p' |
         awk -v min="$MIN_REVISION" '{ n = $0; sub(/^idk/, "", n); if (n + 0 >= min) print }' |
         sort -t k -k2 -n)"
@@ -113,31 +155,50 @@ fi
 log "publishing revisions: $(echo "$revisions" | tr '\n' ' ')"
 
 # --- 2. download every .deb and verify it against its SHA256SUMS ---------
+# The name and the digest both come out of a downloaded manifest, so both are
+# untrusted: the name is validated before it is used as a path, and the digest
+# is compared explicitly. `sha256sum -c --ignore-missing` is not used - it
+# exits 0 when the manifest happens not to cover the file, and a malformed
+# digest line is only a warning there.
 for rev in $revisions; do
-    tag="v2.1.23-alpha1+${rev}"
+    tag="v${BASE_VERSION}+${rev}"
     dir="$workdir/rel/$rev"
     mkdir -p "$dir"
     log "downloading $tag"
-    gh release download "$tag" -R "$REPO_SLUG" -D "$dir" --clobber ||
+    gh release download "$tag" -R "$repo_slug" -D "$dir" --clobber ||
         die 4 "could not download release $tag"
     [ -f "$dir/SHA256SUMS" ] || die 4 "$tag has no SHA256SUMS"
 
-    # GitHub rewrites '~' to '.' in asset names; SHA256SUMS holds the real one.
     original="$(awk 'NF >= 2 && $2 ~ /\.deb$/ { print $2; exit }' "$dir/SHA256SUMS")"
     [ -n "$original" ] || die 4 "$tag: SHA256SUMS lists no .deb"
+    printf '%s' "$original" | grep -qE "$DEB_NAME_RE" ||
+        die 3 "$tag: SHA256SUMS names a file this script will not handle: '$original'"
+
+    expected="$(awk -v want="$original" 'NF >= 2 && $2 == want { print $1; exit }' "$dir/SHA256SUMS")"
+    printf '%s' "$expected" | grep -qE '^[0-9a-f]{64}$' ||
+        die 3 "$tag: SHA256SUMS holds no usable digest for $original"
+
+    # GitHub rewrites '~' to '.' in asset names.
     served="$(printf '%s' "$original" | tr '~' '.')"
     if [ ! -f "$dir/$original" ] && [ -f "$dir/$served" ]; then
         mv -- "$dir/$served" "$dir/$original"
     fi
-    ( cd "$dir" && sha256sum -c --ignore-missing SHA256SUMS ) ||
-        die 3 "$tag: checksum verification FAILED"
+    [ -f "$dir/$original" ] || die 4 "$tag: the release did not carry $served"
+
+    actual="$(sha256sum "$dir/$original" | awk '{ print $1 }')"
+    if [ "$actual" != "$expected" ]; then
+        warn "expected $expected"
+        warn "computed $actual"
+        die 3 "$tag: checksum verification FAILED for $original"
+    fi
     cp -- "$dir/$original" "$workdir/debs/$original"
     log "  verified $original"
 done
 
 # --- 3. reprepro, in a throwaway debian:12 container ---------------------
 fingerprint="$(sops -d --extract "[\"$VAULT_KEY\"][\"fingerprint\"]" "$vault")"
-[ -n "$fingerprint" ] || die 2 "no fingerprint under $VAULT_KEY in the vault"
+printf '%s' "$fingerprint" | grep -qE '^[0-9A-F]{40}$' ||
+    die 2 "no usable fingerprint under $VAULT_KEY in the vault"
 log "signing with $fingerprint"
 
 mkdir -p "$workdir/conf"
@@ -158,58 +219,59 @@ EOF
 } >"$workdir/conf/distributions"
 printf 'verbose\n' >"$workdir/conf/options"
 
+# The key arrives on stdin and stays in the container's memory. GNUPGHOME is a
+# tmpfs, not a bind mount, so nothing of it can reach the host's filesystem.
 cat >"$workdir/build.sh" <<EOF
 set -e
+key="\$(cat)"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq >/dev/null
-apt-get install -y -qq gnupg reprepro >/dev/null
-export GNUPGHOME=/build/gnupg
-mkdir -p "\$GNUPGHOME"
+apt-get update -qq >/dev/null </dev/null
+apt-get install -y -qq gnupg reprepro >/dev/null </dev/null
+export GNUPGHOME=/gnupg
 chmod 700 "\$GNUPGHOME"
-gpg --batch --quiet --import /build/signing.asc
+printf '%s\n' "\$key" | gpg --batch --quiet --import
+key=''
 printf '%s:6:\n' '$fingerprint' | gpg --batch --import-ownertrust >/dev/null 2>&1
+gpg --list-secret-keys --with-colons | grep -q '^fpr:*$fingerprint:' ||
+    { echo "the signing key did not import" >&2; exit 1; }
 mkdir -p /build/repo/conf
 cp /build/conf/distributions /build/conf/options /build/repo/conf/
 for suite in $SUITES; do
     for deb in /build/debs/*.deb; do
-        reprepro -b /build/repo --ignore=wrongdistribution includedeb "\$suite" "\$deb"
+        reprepro -b /build/repo --ignore=wrongdistribution includedeb "\$suite" "\$deb" </dev/null
     done
 done
 rm -rf /build/repo/db /build/repo/conf
 chmod -R a+rX /build/repo
 EOF
 
-# The private key never touches disk outside the working directory, and the
-# working directory is wiped by the EXIT trap.
-sops -d --extract "[\"$VAULT_KEY\"][\"private_key_asc\"]" "$vault" >"$workdir/signing.asc"
-chmod 600 "$workdir/signing.asc"
+remote_dir="$(ssh "$docker_host" 'mktemp -d /tmp/idk-apt-XXXXXXXX')"
+[ -n "$remote_dir" ] || die 2 'could not create a working directory on the Docker host'
+log "shipping the build to $docker_host:$remote_dir"
+scp -q -r "$workdir/debs" "$workdir/conf" "$workdir/build.sh" "$docker_host:$remote_dir/"
 
-log "shipping the build to $DOCKER_HOST_SSH"
-ssh "$DOCKER_HOST_SSH" "rm -rf -- '$REMOTE_BASE/build' && mkdir -p '$REMOTE_BASE/build'"
-scp -q -r "$workdir/debs" "$workdir/conf" "$workdir/build.sh" "$workdir/signing.asc" \
-    "$DOCKER_HOST_SSH:$REMOTE_BASE/build/"
-rm -f "$workdir/signing.asc"
-
-ssh "$DOCKER_HOST_SSH" \
-    "docker run --rm -v '$REMOTE_BASE/build':/build -w /build debian:12 bash /build/build.sh" ||
-    die 5 'reprepro failed'
-ssh "$DOCKER_HOST_SSH" "rm -f -- '$REMOTE_BASE/build/signing.asc'"
+set +e
+sops -d --extract "[\"$VAULT_KEY\"][\"private_key_asc\"]" "$vault" |
+    ssh "$docker_host" \
+        "docker run --rm -i --tmpfs /gnupg:rw,mode=700,size=32m -v '$remote_dir':/build -w /build debian:12 bash /build/build.sh"
+build_rc=("${PIPESTATUS[@]}")
+set -e
+[ "${build_rc[0]}" -eq 0 ] || die 2 'could not read the signing key from the vault'
+[ "${build_rc[1]}" -eq 0 ] || die 5 'reprepro failed'
 
 log 'fetching the built repository'
-scp -q -r "$DOCKER_HOST_SSH:$REMOTE_BASE/build/repo/dists" "$workdir/pages/" ||
-    die 5 'could not fetch dists/'
-scp -q -r "$DOCKER_HOST_SSH:$REMOTE_BASE/build/repo/pool" "$workdir/pages/" ||
-    die 5 'could not fetch pool/'
-ssh "$DOCKER_HOST_SSH" "rm -rf -- '$REMOTE_BASE/build'"
+scp -q -r "$docker_host:$remote_dir/repo/dists" "$workdir/pages/" || die 5 'could not fetch dists/'
+scp -q -r "$docker_host:$remote_dir/repo/pool" "$workdir/pages/" || die 5 'could not fetch pool/'
+wipe_remote || die 5 'the remote working directory could not be removed'
 
 # --- 4. assemble the gh-pages tree --------------------------------------
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 site="$workdir/site"
 mkdir -p "$site/apt"
 cp -r "$workdir/pages/dists" "$workdir/pages/pool" "$site/apt/"
 cp "$repo_root/apt/KEY.gpg" "$repo_root/apt/KEY.asc" "$site/apt/"
 : >"$site/.nojekyll"
-sed -e "s|@PAGES_URL@|$PAGES_URL|g" -e "s|@FINGERPRINT@|$fingerprint|g" \
+sed -e "s|@PAGES_URL@|$pages_url|g" -e "s|@FINGERPRINT@|$fingerprint|g" \
+    -e "s|@REPO_SLUG@|$repo_slug|g" \
     "$repo_root/apt/index.html.in" >"$site/index.html"
 cp "$site/index.html" "$site/apt/index.html"
 
@@ -221,11 +283,30 @@ fi
 
 # --- 5. publish to the orphan gh-pages branch ---------------------------
 push_url="$(git -C "$repo_root" remote get-url github)"
+# Read the tip we are replacing, and hand it to --force-with-lease: a plain
+# --force would silently discard a gh-pages someone else published while this
+# run was building.
+expected_tip="$(git -C "$repo_root" ls-remote "$push_url" gh-pages | awk '{ print $1; exit }')"
+if [ -n "$expected_tip" ]; then
+    log "replacing gh-pages $expected_tip"
+    lease_arg="--force-with-lease=gh-pages:$expected_tip"
+else
+    log 'gh-pages does not exist yet; creating it'
+    lease_arg=''
+fi
+
+github_ip="$(getent hosts github.com 2>/dev/null | awk '{ print $1; exit }' || true)"
+if [ -z "$github_ip" ] && command -v python3 >/dev/null 2>&1; then
+    github_ip="$(python3 -c 'import socket,sys
+try: sys.stdout.write(socket.gethostbyname("github.com"))
+except Exception: pass' 2>/dev/null || true)"
+fi
+
 (
     cd "$site"
     git init -q -b gh-pages
     git add -A
-    git -c user.name='Alfonso Kuen' -c user.email='gerencia@idkmanager.com' commit -q -m \
+    git -c user.name='IDKMANAGER release bot' -c user.email='gerencia@idkmanager.com' commit -q -m \
 "apt: publish the IDK fork repository, replacing upstream's gh-pages copy
 
 This branch used to be a copy of upstream's GitHub Pages site, serving
@@ -237,15 +318,19 @@ with the IDKMANAGER key $fingerprint.
 Built by tools/publish-apt.sh.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
-    # `git push` on this workstation sometimes dies with "getaddrinfo() thread
-    # failed to start"; pinning the address through curl's resolver sidesteps
-    # the thread-starved resolver without disabling TLS verification.
-    if ! git push -q --force "$push_url" gh-pages:gh-pages; then
-        warn 'plain push failed, retrying with a pinned resolver'
-        git -c http.curloptResolve=github.com:443:140.82.114.4 \
-            push -q --force "$push_url" gh-pages:gh-pages
+
+    # `git push` on some workstations dies with "getaddrinfo() thread failed
+    # to start"; pinning the address through curl's resolver sidesteps the
+    # thread-starved resolver without disabling TLS verification. The address
+    # is resolved at run time, never hardcoded.
+    if ! git push -q ${lease_arg:+"$lease_arg"} "$push_url" gh-pages:gh-pages; then
+        [ -n "$github_ip" ] ||
+            { echo 'push failed and github.com could not be resolved locally' >&2; exit 1; }
+        echo "[publish-apt] WARNING: plain push failed, retrying via $github_ip" >&2
+        git -c "http.curloptResolve=github.com:443:$github_ip" \
+            push -q ${lease_arg:+"$lease_arg"} "$push_url" gh-pages:gh-pages
     fi
 ) || die 6 'could not push gh-pages'
 
-log "published: $PAGES_URL"
+log "published: $pages_url"
 log 'GitHub Pages can take a minute to rebuild.'
