@@ -40,7 +40,27 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk18) unstable; urgency=medium
     Troubleshooting, mover VMs entre clusters sobre la misma cabina, y
     los hechos de los snapshots ajenos en Best-Practices y Tools.
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Fri, 18 Sep 2026 21:40:00 -0500
+  * Revision dual del importador (tres modelos) — correcciones antes de
+    publicar: los nombres reservados se comparan SIN distinguir mayusculas
+    (`Pending` pasa pve-configid y luego mata a write_vm_config, que hace
+    `lc($snapname) eq 'pending'`); los snapshots se indexan por
+    almacenamiento Y dataset, porque dos storages con el mismo tn_dataset
+    en cabinas distintas hacian que un snapshot de una pareciera presente
+    en las dos; DENTRO del lock no se reutiliza nada de fuera: se vuelve a
+    consultar la cabina y los clones, y un candidato que desaparecio o gano
+    un clon se descarta y se informa (antes se escribia con la respuesta
+    vieja); `creation` debe ser un entero positivo en TODOS los discos y
+    con menos de 1 h de diferencia entre ellos (el mismo nombre en dos
+    fechas distintas no es una captura conjunta); una identidad malformada
+    en la respuesta de la API (dataset o snapshot_name que no son un
+    nombre) muere en vez de contarse como «sin snapshots»; el empate de
+    `creation` al segundo se resuelve por `createtxg` (orden transaccional
+    de ZFS) y, si no se puede, el candidato se rechaza en vez de colocarlo
+    en la cadena a ojo; la CLI importa exactamente lo que confirmo el
+    operador (lista blanca `only`) y sin TTY ni `--yes` sale 2
+    (EXIT_USER_CANCEL) en vez de 0; y se rehusa un VMID de contenedor.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Fri, 18 Sep 2026 22:10:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk17) unstable; urgency=medium
 

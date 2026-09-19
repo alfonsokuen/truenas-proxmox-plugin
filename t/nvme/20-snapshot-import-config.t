@@ -10,10 +10,14 @@
 #   - a second run imports nothing and does not write at all - without that,
 #     a cron calling this would rewrite the config of every VM forever;
 #   - --dry-run does not even take the lock;
-#   - it refuses a template, a locked config, a snapshot mid-flight
-#     (snapstate) and any non-cdrom disk living outside this plugin, because
-#     rolling back to a section covering a volume this plugin cannot snapshot
-#     dies half way through.
+#   - NOTHING gathered before the lock is trusted inside it: the array is
+#     asked again, and a snapshot that was destroyed, or gained a clone, or a
+#     config that changed under us, cancels the write;
+#   - two storages pointing at the same tn_dataset on different arrays are
+#     kept apart, or a snapshot on one of them would look present on both;
+#   - it refuses a container, a template, a locked config, a snapshot
+#     mid-flight (snapstate) and any non-cdrom disk living outside this
+#     plugin.
 #
 # Run with:  prove -v t/nvme/20-snapshot-import-config.t
 
@@ -22,6 +26,7 @@ use warnings;
 use Test::More;
 use FindBin;
 use File::Spec;
+use File::Temp qw(tempdir);
 use JSON::PP;
 use Storable qw(dclone);
 
@@ -53,8 +58,6 @@ unless ($PKG->can('import_foreign_snapshots')) {
     exit 1;
 }
 
-plan tests => 26;
-
 # ------------------------------------------------- stub PVE::QemuConfig ---
 # The real module is not loadable outside a PVE node and pulls in qemu-server.
 # These stubs keep the contract the plugin depends on: load_config hands out a
@@ -63,6 +66,7 @@ plan tests => 26;
 our %CONF;
 our @WRITES;
 our $LOCKS = 0;
+our $BEFORE_LOCK;   # runs inside lock_config, before the plugin's code
 {
     package PVE::QemuConfig;
     sub load_config {
@@ -78,6 +82,7 @@ our $LOCKS = 0;
     sub lock_config {
         my ($class, $vmid, $code, @param) = @_;
         $LOCKS++;
+        $BEFORE_LOCK->($vmid) if $BEFORE_LOCK;
         return $code->(@param);
     }
     # Same key set and same order as PVE::QemuServer::Drive::valid_drive_names
@@ -116,9 +121,15 @@ our $LOCKS = 0;
 $INC{'PVE/QemuConfig.pm'} = 1;
 
 # ---------------------------------------------------- stub the storage cfg ---
+# tnnvme and tnother are two DIFFERENT arrays that happen to use the same
+# dataset path - the case that made a snapshot present on one look present on
+# both.
 our $STORECFG = {
     ids => {
-        tnnvme => { type => 'truenasplugin', tn_dataset => 'pool/pve' },
+        tnnvme  => { type => 'truenasplugin', tn_dataset => 'pool/pve',
+                     tn_api_host => 'array-a' },
+        tnother => { type => 'truenasplugin', tn_dataset => 'pool/pve',
+                     tn_api_host => 'array-b' },
         'local' => { type => 'dir' },
         'local-lvm' => { type => 'lvmthin' },
     },
@@ -136,7 +147,9 @@ my $raw = do { local $/; <$fh> };
 close($fh);
 my $RECORDS = JSON::PP->new->decode($raw);
 
-my @api;
+our @api;                 # every method called, in order
+our $SNAPSHOT_ANSWER;     # sub ($scfg, $params, $nth_snapshot_query)
+our $CLONE_ANSWER;        # sub ($scfg, $params)
 {
     no strict 'refs';
     no warnings 'redefine';
@@ -144,11 +157,16 @@ my @api;
     *{"${PKG}::_api_call"} = sub {
         my ($scfg, $method, $params) = @_;
         push @api, $method;
-        return $RECORDS if $method eq 'pool.snapshot.query';
-        # The clone lookup: 'cloned-snap' is the origin of a live clone, so
-        # it must not be imported - PVE could never delete it again. Every
-        # other candidate comes back with no dependents.
+        if ($method eq 'pool.snapshot.query') {
+            my $nth = scalar(grep { $_ eq 'pool.snapshot.query' } @api);
+            return $SNAPSHOT_ANSWER->($scfg, $params, $nth) if $SNAPSHOT_ANSWER;
+            return $RECORDS;
+        }
         if ($method eq 'pool.dataset.query') {
+            return $CLONE_ANSWER->($scfg, $params) if $CLONE_ANSWER;
+            # 'cloned-snap' is the origin of a live clone, so it must not be
+            # imported - PVE could never delete it again. Every other
+            # candidate comes back with no dependents.
             my $id = eval { $params->[0][0][2] } // '';
             return [ { id => 'pool/pve/a-clone' } ] if $id =~ /\@cloned-snap$/;
             return [];
@@ -186,6 +204,9 @@ sub reset_world {
     @WRITES = ();
     @api    = ();
     $LOCKS  = 0;
+    $BEFORE_LOCK     = undef;
+    $SNAPSHOT_ANSWER = undef;
+    $CLONE_ANSWER    = undef;
 }
 
 # ------------------------------------------------------- 1-3. --dry-run ---
@@ -195,7 +216,7 @@ is(scalar(@{ $plan->{import} }), 5, 'dry-run: planifica los 5 importables');
 is(scalar(@WRITES), 0, 'dry-run: NO escribe la configuracion');
 is($LOCKS, 0, 'dry-run: ni siquiera toma el lock');
 
-# --------------------------------------------------- 4-16. the real run ---
+# --------------------------------------------------- 4-19. the real run ---
 reset_world();
 my $res = $PKG->import_foreign_snapshots($VMID, {});
 is($res->{imported}, 5, 'importa los 5 snapshots completos y validos');
@@ -224,7 +245,7 @@ is($snaps->{'auto-2026-09-18_00-00'}{parent}, 's1',
     'el primero importado cuelga del s1 que ya existia');
 is($after->{parent}, 'snap2026', 'conf.parent pasa al importado mas nuevo');
 
-# 19. Nothing outside snapshots/parent changes: the written config is the one
+# 20. Nothing outside snapshots/parent changes: the written config is the one
 #     that was loaded, plus the new sections. A writer that rebuilt the config
 #     from the snapshot sections would pass every assertion above.
 {
@@ -237,18 +258,107 @@ is($after->{parent}, 'snap2026', 'conf.parent pasa al importado mas nuevo');
         'el resto de la configuracion de la VM queda intacta');
 }
 
-# 20. The one thing this command must never do: touch a section PVE wrote.
+# 21. The one thing this command must never do: touch a section PVE wrote.
 is_deeply($snaps->{s1}, base_conf()->{snapshots}{s1},
     'la seccion preexistente queda byte a byte igual');
 
-# --------------------------------------------- 21-22. second pass (idempotencia) ---
+# --------------------------------------- 22-23. second pass (idempotencia) ---
 @WRITES = ();
 $LOCKS  = 0;
 my $second = $PKG->import_foreign_snapshots($VMID, {});
 is($second->{imported}, 0, 'segunda pasada: 0 importados');
 is(scalar(@WRITES), 0, '  ...y NO se llama a write_config');
 
-# ------------------------------------------------------- 23-26. refusals ---
+# ------------------------- 24-27. nothing from before the lock is trusted ---
+# The array is asked again inside the lock. A snapshot destroyed between the
+# listing and the write must not be written from the stale answer.
+{
+    reset_world();
+    $SNAPSHOT_ANSWER = sub {
+        my ($scfg, $params, $nth) = @_;
+        return $nth == 1 ? $RECORDS : [];
+    };
+    my $r = $PKG->import_foreign_snapshots($VMID, {});
+    is($r->{imported}, 0, 'el candidato desaparecio de la cabina: 0 importados');
+    is(scalar(@WRITES), 0, '  ...y no se escribe nada');
+    is(scalar(@{ $r->{dropped} }), 5, '  ...se informa de los 5 descartados');
+    ok((grep { $_ eq 'pool.snapshot.query' } @api) >= 2,
+        '  ...porque la cabina se vuelve a consultar DENTRO del lock');
+}
+
+# 28-29. A candidate that gained a clone between listing and lock is dropped
+#        the same way.
+{
+    reset_world();
+    my $late = 0;
+    $BEFORE_LOCK  = sub { $late = 1 };   # the clone appears while we wait
+    $CLONE_ANSWER = sub {
+        my ($scfg, $params) = @_;
+        my $id = $params->[0][0][2] // '';
+        return [ { id => 'pool/pve/late-clone' } ]
+            if $late && $id =~ /\@snap2026$/;
+        return [];
+    };
+    my $r = $PKG->import_foreign_snapshots($VMID, {});
+    my %imp = map { $_->{name} => 1 } @{ $r->{import} };
+    ok(!$imp{'snap2026'}, 'clon aparecido antes del lock: ese no se importa');
+    is_deeply($r->{dropped}, [ 'snap2026' ], '  ...y se informa de el');
+}
+
+# 30-31. The configuration can change under us too; the re-check happens with
+#        the lock held.
+{
+    reset_world();
+    $BEFORE_LOCK = sub { $CONF{$VMID}{lock} = 'backup' };
+    my $ok = eval { $PKG->import_foreign_snapshots($VMID, {}); 1 };
+    ok(!$ok, 'conf bloqueada mientras teniamos el lock: muere');
+    is(scalar(@WRITES), 0, '  ...sin escribir nada');
+}
+{
+    reset_world();
+    $BEFORE_LOCK = sub { $CONF{$VMID}{scsi1} = 'tnnvme:vol-vm-9990-disk-7-lun7,size=8G' };
+    my $ok = eval { $PKG->import_foreign_snapshots($VMID, {}); 1 };
+    ok(!$ok, 'los discos cambiaron mientras teniamos el lock: muere');
+    is(scalar(@WRITES), 0, '  ...sin escribir nada');
+}
+
+# 34-35. A clone lookup that fails establishes nothing, so it must not be read
+#        as "no clones".
+{
+    reset_world();
+    $CLONE_ANSWER = sub { die "middleware error\n" };
+    my $ok = eval { $PKG->import_foreign_snapshots($VMID, {}); 1 };
+    ok(!$ok, 'si la consulta de clones falla, el import muere');
+    is(scalar(@WRITES), 0, '  ...sin escribir nada');
+}
+
+# ------------------- 36-38. two arrays, one dataset path: kept apart ---
+# scsi0 and scsi1 live on different storages whose tn_dataset is the same and
+# whose zvol name is the same, so both resolve to pool/pve/vm-9990-disk-0.
+# Merging the two answers made 'only-on-b' look present on both disks.
+{
+    reset_world();
+    $CONF{$VMID}{scsi1} = 'tnother:vol-vm-9990-disk-0-lun1,size=8G';
+    delete $CONF{$VMID}{snapshots};
+    delete $CONF{$VMID}{parent};
+    $SNAPSHOT_ANSWER = sub {
+        my ($scfg, $params, $nth) = @_;
+        return [] if $scfg->{tn_api_host} eq 'array-a';
+        return [ { dataset => 'pool/pve/vm-9990-disk-0', snapshot_name => 'only-on-b',
+                   createtxg => '55',
+                   properties => { creation => { rawvalue => '1789700000' } } } ];
+    };
+    my $r = $PKG->import_foreign_snapshots($VMID, { dry_run => 1 });
+    # NOT 'imported': a dry run never imports, so counting that would pass
+    # with the two arrays merged. What must be empty is the PLAN.
+    is(scalar(@{ $r->{import} }), 0,
+        'snapshot presente solo en la cabina B: no entra en el plan');
+    is_deeply($r->{partial}{'only-on-b'}, [ 'tnnvme:vol-vm-9990-disk-0-lun0' ],
+        '  ...se reporta como parcial, y falta en el volumen de la cabina A');
+    is(scalar(@WRITES), 0, '  ...y no se escribe nada');
+}
+
+# ------------------------------------------------------- 39-44. refusals ---
 sub refuses {
     my ($mangle) = @_;
     reset_world();
@@ -274,3 +384,62 @@ sub refuses {
     my ($err, $writes) = refuses(sub { $_[0]->{scsi1} = 'local-lvm:vm-9990-disk-0,size=8G' });
     ok($err && !$writes, 'disco fuera del plugin: se rehusa y no escribe nada');
 }
+{
+    # A VMID that is a container: same AbstractConfig machinery, different
+    # volume keys, not covered yet.
+    reset_world();
+    my $dir = tempdir(CLEANUP => 1);
+    open(my $lxc, '>', "$dir/$VMID.conf") or die $!;
+    close($lxc);
+    no strict 'refs';
+    local ${"${PKG}::TN_LXC_CONF_DIR"} = $dir;
+    my $ok = eval { $PKG->import_foreign_snapshots($VMID, {}); 1 };
+    my $err = $ok ? '' : ($@ // '');
+    like($err, qr/container/i, 'vmid de contenedor: se rehusa por nombre');
+    is(scalar(@WRITES), 0, '  ...sin escribir nada');
+}
+
+# ------------------------------------------------------------ 45-50. CLI ---
+sub run_cli {
+    my (@args) = @_;
+    my ($out, $err) = ('', '');
+    my $rc;
+    {
+        open(my $stdin, '<', \"\n") or die $!;   # a pipe, never a TTY
+        local *STDIN = $stdin;
+        open(my $oldout, '>&', \*STDOUT) or die $!;
+        open(my $olderr, '>&', \*STDERR) or die $!;
+        close(STDOUT); open(STDOUT, '>', \$out) or die $!;
+        close(STDERR); open(STDERR, '>', \$err) or die $!;
+        $rc = eval { $PKG->can('snapshot_import_cli')->(@args) };
+        my $died = $@;
+        close(STDOUT); open(STDOUT, '>&', $oldout) or die $!;
+        close(STDERR); open(STDERR, '>&', $olderr) or die $!;
+        die $died if $died;
+    }
+    return ($rc, $out, $err);
+}
+
+{
+    reset_world();
+    my ($rc, $out) = run_cli($VMID, '--dry-run');
+    is($rc, 0, 'CLI --dry-run: exit 0');
+    like($out, qr/^import\s+Daily-1/m, '  ...lista los importables');
+    is(scalar(@WRITES), 0, '  ...y no escribe');
+}
+{
+    # No --yes and no terminal to ask on: a refusal, and a refusal is not 0.
+    reset_world();
+    my ($rc, $out, $err) = run_cli($VMID);
+    is($rc, 2, 'CLI sin --yes y sin TTY: exit 2 (EXIT_USER_CANCEL)');
+    like($err, qr/no TTY/i, '  ...diciendo por que');
+    is(scalar(@WRITES), 0, '  ...sin escribir nada');
+}
+{
+    reset_world();
+    my ($rc, $out) = run_cli($VMID, '--yes');
+    is($rc, 0, 'CLI --yes: exit 0');
+    like($out, qr/Imported 5 snapshot/, '  ...e importa lo que habia listado');
+}
+
+done_testing();

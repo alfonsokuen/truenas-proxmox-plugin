@@ -295,11 +295,28 @@ What that means afterwards, and why it is opt-in:
   snapshot: rolling back to one restores the disks of that moment with
   today's configuration, and without RAM (the VM starts cold).
 - Only snapshots present on every disk of the VM, with a name PVE accepts
-  (`pve-configid`: `[a-z][a-z0-9_-]*`, 40 characters, not `vzdump` /
-  `current` / `pending` / `__base__` / `__replicate_*`) and with no
-  dependent clone, are imported. The rest are listed with the reason,
-  which is also the tool's answer to "why is this one not in the list".
-- Run it on the node hosting the guest, and prefer `--dry-run` first.
+  (`pve-configid`: `[a-z][a-z0-9_-]+`, at least 2 and at most 40
+  characters, and not `vzdump` / `current` / `pending` / `__base__` /
+  `__replicate_*` in any capitalisation) and with no dependent clone are
+  imported. The rest are listed with the reason, which is also the tool's
+  answer to "why is this one not in the list".
+- The same name on every disk is not enough: every disk must carry a
+  creation time from the array, and they must be within an hour of each
+  other. Two snapshots hours apart that happen to share a name are two
+  snapshots, and a section built from them would pair one disk's Monday
+  with the other disk's Tuesday.
+- Two snapshots created in the same second are ordered by `createtxg`,
+  the ZFS transaction group. When that cannot settle it - the other one
+  is a PVE snapshot, which has none - the candidate is refused rather
+  than placed in the chain by guesswork.
+- An imported snapshot dated *between* two PVE snapshots hangs off the
+  one before it, and the PVE snapshot after it keeps its own parent: it
+  shows up as a **branch** in the Snapshots tree. Existing sections are
+  never rewritten, and that is the trade.
+- Run it on the node hosting the guest, and prefer `--dry-run` first. In
+  a script pass `--yes`: without a terminal to confirm on, the command
+  refuses and exits 2 rather than assuming consent.
+- Containers are not covered yet; the command refuses an LXC VMID.
 
 ---
 

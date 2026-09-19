@@ -70,14 +70,23 @@ Rules, all fail-closed:
 - Only names PVE accepts, and never renamed: here the PVE snapshot name
   **is** the ZFS snapshot name.
 - Not if the snapshot has a dependent clone: PVE could never delete it.
-- `snaptime` is the array's creation time. A snapshot whose creation time
-  the array does not report is refused, not dated at the epoch.
+- `snaptime` is the array's creation time, and **every** disk must report
+  one; disks more than an hour apart are not one capture. Ties in the
+  same second are ordered by `createtxg`, and refused when that cannot
+  order them.
 - No `vmstate`: rollback restores disks and configuration, and the VM
   starts cold.
 - Idempotent: a second run imports nothing and does not rewrite the
   configuration. Existing sections are never modified.
 - Refuses a template, a locked configuration, a snapshot operation in
-  flight, and any non-cdrom disk outside this plugin.
+  flight, any non-cdrom disk outside this plugin, and an LXC VMID.
+- Nothing seen before the lock is trusted inside it: the array is asked
+  again, and any listed snapshot that was destroyed or cloned meanwhile
+  is skipped and reported instead of written.
+
+Exit codes: `0` done (including "nothing to import"), `1` error, `2`
+cancelled - which is what you get when there is no terminal to confirm on
+and `--yes` was not given.
 
 Run it on the node that hosts the guest; QEMU guests only (LXC is not
 covered yet). Details and consequences:
