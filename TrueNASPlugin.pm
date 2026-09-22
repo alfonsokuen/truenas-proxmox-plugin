@@ -2711,6 +2711,13 @@ sub _tn_guest_config($vmid) {
     # the right one.
     my $entry = eval {
         require PVE::Cluster;
+        # cfs_update() is required in a fresh Perl process. The CLI is
+        # always invoked as one (install.sh execs a new perl per call),
+        # so without this, get_vmlist() returns an empty hash and the
+        # "guest is on node X" hint never fires -- the caller falls
+        # through to load_config()'s generic "Configuration file
+        # 'nodes/pve/qemu-server/<vmid>.conf' does not exist" instead.
+        PVE::Cluster::cfs_update();
         PVE::Cluster::get_vmlist()->{ids}{$vmid};
     };
     if (ref($entry) eq 'HASH' && $entry->{node}) {
