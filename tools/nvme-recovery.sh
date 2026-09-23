@@ -219,8 +219,24 @@ list_nvme_storages() {
 get_storage_value() {
     local storage_name="$1"
     local param_name="$2"
-    awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG" | \
-        grep "^\s*${param_name}" | awk '{print $2}' | head -1 || true
+    local value
+    value=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG" | \
+        grep "^\s*${param_name}" | awk '{print $2}' | head -1 || true)
+
+    # tn_api_key/tn_chap_password moved out of storage.cfg into
+    # /etc/pve/priv/storage/<storeid>.{pw,chap} (see TrueNASPlugin.pm's
+    # on_add_hook/on_update_hook_full and 'sensitive-properties'). A storage
+    # migrated with `truenas-proxmox-manage migrate-api-key` has nothing
+    # left inline, so this recovery tool needs the same fallback the plugin
+    # itself uses, or every command here would silently see an empty key.
+    if [[ -z "$value" ]]; then
+        case "$param_name" in
+            tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;
+            tn_chap_password) value=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true) ;;
+        esac
+    fi
+
+    echo "$value"
 }
 
 # ============================================================
