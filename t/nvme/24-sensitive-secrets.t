@@ -83,7 +83,8 @@ for my $sub (qw(_tn_priv_file _tn_api_key _tn_chap_password
                 on_add_hook on_update_hook on_update_hook_full on_delete_hook
                 migrate_priv_secrets migrate_secrets_cli
                 _tn_cluster_secrets_ready _tn_has_corosync_conf
-                _tn_redact_for_log _tn_redact_structure)) {
+                _tn_redact_for_log _tn_redact_structure _tn_redact_secrets_in_text
+                _rpc_error_message)) {
     unless ($PKG->can($sub)) {
         plan tests => 1;
         fail("$sub exists");
@@ -339,7 +340,7 @@ my $ENFORCES_PERMS = do {
 
 # ------------------------------------------------- migrate_priv_secrets ---
 SKIP: {
-    skip 'PVE::Storage not loadable here', 54 unless eval { require PVE::Storage; 1 };
+    skip 'PVE::Storage not loadable here', 60 unless eval { require PVE::Storage; 1 };
 
     my %STORECFG_IDS;
     {
@@ -382,6 +383,7 @@ SKIP: {
         });
     }
 
+    my $MEMBERS_READS = 0;   # C4: how many times .members was actually read
     {
         no strict 'refs';
         no warnings 'redefine';
@@ -389,6 +391,7 @@ SKIP: {
             my ($path) = @_;
             die "unexpected file in test stub: $path\n" if $path ne '/etc/pve/.members';
             die ".members not stubbed for this scenario\n" if !defined $MEMBERS_JSON;
+            $MEMBERS_READS++;
             return $MEMBERS_JSON;
         };
         *{'PVE::Tools::run_command'} = sub {
@@ -752,6 +755,66 @@ SKIP: {
         is(call('_tn_priv_read', 'tn-newmixed', 'pw'), 'FRESH-KEY',
             '  ...the key is still written to priv normally');
     }
+
+    # ------------------------- C4: cluster check memoized per hook call ---
+    # QA round 4 (Kimi): _tn_cluster_secrets_ready() runs synchronous SSH
+    # to every cluster node - on_update_hook_full() can reach the strip
+    # decision up to 4 times (the key plus three optional secrets), and
+    # computing it fresh each time meant up to 4x the SSH cost for a
+    # single `pvesm set` that happens to touch several secrets at once.
+    {
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => '1');
+
+        call('on_add_hook', $PKG, 'tn-memo', {},
+            tn_api_key => 'MEMO-KEY', tn_chap_password => 'MEMO-CHAP');
+        my $scfg = {
+            storeid => 'tn-memo', tn_api_key => 'STALE-INLINE-KEY',
+            tn_chap_password => 'STALE-INLINE-CHAP',
+        };
+
+        $MEMBERS_READS = 0;
+        # Touches BOTH the tn_api_key self-heal branch (inline present,
+        # differs from priv) AND the tn_chap_password self-heal branch
+        # (same) in ONE call - each would call _tn_cluster_secrets_ready()
+        # if it were not memoized.
+        call('on_update_hook_full', $PKG, 'tn-memo', $scfg, { nodes => 'pve3' }, [], {});
+
+        ok(!exists($scfg->{tn_api_key}), 'sanity: tn_api_key self-heal ran (cluster is ready)');
+        ok(!exists($scfg->{tn_chap_password}), 'sanity: tn_chap_password self-heal ran too');
+        is($MEMBERS_READS, 1,
+            'C4: .members is read exactly ONCE for a single hook call, even when two secrets both self-heal');
+    }
+
+    # ------------------------------- C6: single-entry nodelist, NOT local ---
+    # QA round 4 (Kimi): the single-node shortcut used to approve on ENTRY
+    # COUNT alone - a nodelist with exactly one entry that names some
+    # OTHER node (not this process's own) would have been approved with
+    # zero verification of anything. It must fall through to the normal
+    # per-node loop instead, which actually probes that one node.
+    {
+        @SSH_CMDS = ();
+        $MEMBERS_JSON = members_json('pve1',   # local is pve1...
+            pve2 => { online => 1, ip => '10.0.0.2' },   # ...but the only entry is pve2
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => '1');
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok($r->{ready}, 'C6: a single remote entry is still approved - but only after being probed');
+        ok(scalar(@SSH_CMDS) >= 1,
+            '  ...confirmed: it was NOT waved through by the entry-count shortcut - an SSH probe actually ran');
+    }
+    {
+        @SSH_CMDS = ();
+        $MEMBERS_JSON = members_json('pve1',
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => '0');   # this time the one remote node fails
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready}, 'C6: ...and a single remote entry that fails verification is refused, not waved through');
+    }
 }
 
 # ---------------------------------------------------- H4: on_update_hook ---
@@ -838,6 +901,43 @@ SKIP: {
     my $probe = { api_key => 'still-here' };
     call('_tn_redact_structure', $probe);
     is($probe->{api_key}, 'still-here', '_tn_redact_structure: does not mutate its argument');
+}
+
+# ------------------------------------------------------------------ C5 ---
+# _rpc_error_message()'s $reason/$name come from TrueNAS's own free-text
+# error message, not a JSON key this file controls - a validation error
+# can quote the rejected value straight back (e.g. "Invalid dhchap_key
+# format: <the value>"). Neither _tn_redact_structure() nor
+# _tn_redact_for_log() catch that (both key off a JSON key name; free
+# prose has none), so the fix does a literal substring replace of every
+# secret this storage actually has configured.
+{
+    call('on_add_hook', $PKG, 'tn-c5', {},
+        tn_api_key => 'C5-API-KEY', tn_nvme_dhchap_secret => 'C5-DHCHAP-SECRET');
+    my $scfg = { storeid => 'tn-c5' };
+
+    # The PRIMARY return path (a well-formed {data:{reason,errname}} body -
+    # the one most real TrueNAS errors take).
+    my $err1 = { data => { reason => "Invalid value: 'C5-DHCHAP-SECRET' is not a valid key", errname => 'ValidationError' } };
+    my $msg1 = call('_rpc_error_message', $err1, $scfg);
+    unlike($msg1, qr/C5-DHCHAP-SECRET/, 'C5: the primary [errname]: reason return path redacts a secret embedded in free text');
+    like($msg1, qr/ValidationError/, '  ...without losing the rest of the message');
+
+    # The FALLBACK return path (not a {reason,...}-shaped hash at all - a
+    # plain string $err never enters the {data:{reason}} branch above).
+    # Neither _tn_redact_structure() (nothing to walk, it's not a ref) nor
+    # _tn_redact_for_log() (no "key":"value" JSON shape to match in plain
+    # prose) would catch this alone - the literal substring pass is what
+    # does.
+    my $err2 = 'unexpected failure involving C5-API-KEY somewhere';
+    my $msg2 = call('_rpc_error_message', $err2, $scfg);
+    unlike($msg2, qr/C5-API-KEY/, 'C5: the fallback return path redacts too (plain-string error, no JSON shape at all)');
+}
+{
+    # Never dies just because $scfg has no usable secrets to look up (a
+    # storage with no key configured yet, or none passed at all).
+    my $ok = eval { call('_rpc_error_message', { message => 'plain failure' }, undef); 1 };
+    ok($ok, 'C5: does not die when $scfg has nothing to redact against') or diag("died: $@");
 }
 
 # --------------------------------------------------- R1: no priv cache ---
