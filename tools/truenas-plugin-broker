@@ -109,6 +109,27 @@ sub _log_line {
         }
     }
 }
+# Same key list TrueNASPlugin.pm's own $TN_LOG_REDACT_KEYS uses - kept in
+# sync by hand (this daemon runs standalone, independent of the plugin
+# file, by design - see the wire-format note above), not because the two
+# secrets pretend to be different. api_key alone (the previous version of
+# this regex) missed password/dhchap_key/dhchap_ctrl_key - a malformed
+# request line carrying any of those would have logged them in the clear
+# (Kimi finding). Value pattern: any run of characters that are neither an
+# unescaped quote nor a backslash, OR a backslash followed by one
+# character (an escaped quote `\"` among them) - a naive `[^"]*` stops at
+# the first escaped quote inside the value and leaves the remainder
+# exposed.
+my $REDACT_KEYS = qr/api_key|password|passwd|secret|token|dhchap_key|dhchap_ctrl_key/i;
+my $JSON_STRING_VALUE = qr/(?:[^"\\]|\\.)*+/;
+
+sub redact_raw_line {
+    my ($text) = @_;
+    return $text if !defined($text);
+    $text =~ s/("(?:$REDACT_KEYS)"\s*:\s*)"$JSON_STRING_VALUE"/$1"<redacted>"/g;
+    return $text;
+}
+
 sub linfo  { _log_line('INFO',  $_[0]); }
 sub lwarn  { _log_line('WARN',  $_[0]); }
 sub lerr   { _log_line('ERROR', $_[0]); }
@@ -630,11 +651,11 @@ sub handle_request {
         }
         # Dump the raw line so we can tell whether the client really
         # sent a malformed envelope or whether our decode is at fault.
-        # Redact any api_key= occurrences before logging (defense in
-        # depth; the key shouldn't be in this code path but we still
-        # don't want it in journal). Truncate to 600 bytes.
+        # Redact any known-sensitive field before logging (defense in
+        # depth; none of them should be in this code path but we still
+        # don't want them in journal). Truncate to 600 bytes.
         my $raw = $line // '<undef>';
-        $raw =~ s/("api_key"\s*:\s*)"[^"]*"/$1"<redacted>"/g;
+        $raw = redact_raw_line($raw);
         $raw = substr($raw, 0, 600) . (length($raw) > 600 ? "...[truncated]" : "");
         lwarn("  raw request: $raw");
         # Top-level keys of the decoded request envelope.
