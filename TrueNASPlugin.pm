@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk22';
+our $VERSION = '2.1.23~alpha1+idk21';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -532,6 +532,20 @@ sub plugindata {
     return {
         content => [ { images => 1, rootdir => 1 }, { images => 1 } ],
         format  => [ { raw => 1 }, 'raw' ],
+        # Tuning knobs: collapsed under "Advanced" in the form PVE generates
+        # for custom plugins (pve-devel "GUI Support for Custom Storage
+        # Plugins"); ignored by PVE versions without that series.
+        'advanced-properties' => { map { $_ => 1 } qw(
+            tn_api_scheme tn_api_port tn_prefer_ipv4
+            tn_use_by_path tn_ipv6_by_path tn_debug
+            tn_force_delete_on_inuse tn_logout_on_free
+            tn_enable_bulk_operations
+            tn_api_retry_max tn_api_retry_delay tn_status_budget_s
+            tn_status_probe_backoff_s tn_nvme_max_io_kb tn_op_budget_s
+            tn_api_budget_s tn_broker_timeout tn_storage_lock_timeout
+            tn_device_ready_retries tn_nr_io_queues tn_nvme_ctrl_loss_tmo
+            tn_nvme_reconnect_delay tn_nvme_keep_alive_tmo
+        ) },
         # Routed by PVE's storage API (PVE::API2::Storage::Config) around
         # check_config instead of through it: on add/update, these are
         # extracted from the request into a separate %sensitive hash BEFORE

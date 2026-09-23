@@ -313,7 +313,7 @@ truenasplugin: truenas-nvme
     shared 1
 ```
 
-**Update (idk21/idk22):** `tn_api_key_file` was never implemented by this
+**Update (idk21):** `tn_api_key_file` was never implemented by this
 plugin. The plugin fixes the underlying leak itself now: `tn_api_key`,
 `tn_chap_password`, `tn_nvme_dhchap_secret` and `tn_nvme_dhchap_ctrl_secret`
 are all `sensitive-properties`, so `pvesm add`/`set`/the GUI write them to

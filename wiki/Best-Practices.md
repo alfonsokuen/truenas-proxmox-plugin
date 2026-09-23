@@ -387,7 +387,7 @@ Do not give the plugin's API key `Full Admin`. See
 minimum role set. The plugin's audit is what the file records; do not
 grant beyond it.
 
-**Update (idk21/idk22):** `tn_api_key_file` below was never implemented by
+**Update (idk21):** `tn_api_key_file` below was never implemented by
 this plugin - it silently did nothing, leaving the key inline regardless.
 As of these versions the plugin fixes the underlying problem itself:
 `tn_api_key`, `tn_chap_password`, `tn_nvme_dhchap_secret` and

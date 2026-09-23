@@ -1,61 +1,38 @@
-truenas-proxmox-plugin (1:2.1.23~alpha1+idk22) unstable; urgency=medium
-
-  * Seguridad: `tn_nvme_dhchap_secret` y `tn_nvme_dhchap_ctrl_secret`
-    (DH-HMAC-CHAP de NVMe/TCP) tenian la misma exposicion que idk21 arreglo
-    para `tn_api_key`/`tn_chap_password` - vivian en claro en `storage.cfg`
-    y salian por `pvesh get /storage/<id>`. Pasan a 'sensitive-properties'
-    igual que las otras dos, con fichero propio en
-    `/etc/pve/priv/storage/<storeid>.{dhchap,dhchapctrl}` (0600); todas las
-    lecturas en TrueNASPlugin.pm (`_nvme_ensure_host_registered`, el
-    builder de `nvme connect`) pasan por los helpers nuevos
-    `_tn_nvme_dhchap_secret`/`_tn_nvme_dhchap_ctrl_secret`, con el mismo
-    fallback a `$scfg` para clusters no migrados. La subcomanda de
-    migracion se renombra a `truenas-proxmox-manage migrate-secrets
-    <storeid> [--dry-run]` (ya mueve las 4 propiedades sensibles, no solo
-    la API key); `migrate-api-key` queda como alias que sigue funcionando,
-    en Perl (`migrate_api_key_cli` llama a `migrate_secrets_cli`) y en el
-    dispatch de `install.sh`. Revisadas las 46 `properties()` completas:
-    ningun otro campo es un secreto.
-
-  * Correccion (idk21 se equivocaba en esto): el comentario y la wiki
-    decian que `/etc/pve/storage.cfg` es "0644, world-readable" - en PVE 9
-    es `0640 root:www-data`, verificado en un nodo real, no world-readable.
-    El riesgo real que este fix cierra no es "cualquiera en el sistema
-    puede leer el archivo": es que `pvesh get /storage/<id>` (permiso
-    Datastore.Allocate, tipicamente en manos de un admin de storage sin
-    motivo para ver una key FULL_ADMIN de TrueNAS) devuelve el config
-    completo, y que cualquier proceso en el grupo www-data (pveproxy)
-    lee el fichero directamente. Corregido en TrueNASPlugin.pm,
-    install.sh y las 4 paginas de wiki que repetian la cifra equivocada.
-
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 11:30:00 -0500
-
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
 
-  * Seguridad: `pvesh get /storage/<id>` (y por tanto la API, la GUI y
-    cualquier usuario con permiso de lectura sobre /storage) devolvia
-    `tn_api_key` EN CLARO - una API key de TrueNAS con rol FULL_ADMIN - y
-    `tn_chap_password` igual, porque ambas vivian como opciones normales de
-    `storage.cfg`, fichero 0644. `tn_api_key` ademas estaba declarada
-    `fixed => 1`, asi que ni siquiera se podia rotar con `pvesm set`: la
-    unica via era editar `storage.cfg` a mano. Arreglo: ambas pasan a ser
-    'sensitive-properties' (el mismo mecanismo que usan PBSPlugin.pm para
-    `password`/`encryption-key` y CIFSPlugin.pm para `password`). PVE las
-    extrae de la peticion antes de que `check_config` las vea y las entrega
-    solo a `on_add_hook`/`on_update_hook_full`/`on_delete_hook`, que ahora
-    las escriben en `/etc/pve/priv/storage/<storeid>.{pw,chap}` (0600,
-    solo root) en vez de en `storage.cfg`. `tn_api_key` deja de ser
-    `fixed`, asi que `pvesm set <id> --tn_api_key ...` ya rota la key.
-    Ambos secretos siguen siendo legibles desde `storage.cfg` en un
-    cluster que no se ha migrado (compatibilidad hacia atras); el fichero
-    en `/etc/pve/priv` gana si existen los dos. Nueva subcomanda
-    `truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]` para
-    mover los secretos de una storage existente al fichero priv sin
-    esperar a tocarla por otra via; no se migra nada automaticamente en el
-    postinst (un rewrite de storage.cfg en cada nodo durante un upgrade de
-    paquete es el tipo de sorpresa que termina en incidente).
+  * Seguridad: `pvesh get /storage/<id>` (API y GUI, permiso
+    Datastore.Allocate) devolvia EN CLARO cuatro secretos que vivian como
+    opciones normales de `storage.cfg` (0640 root:www-data, legible por
+    pveproxy): `tn_api_key` (key de TrueNAS con rol FULL_ADMIN),
+    `tn_chap_password`, `tn_nvme_dhchap_secret` y
+    `tn_nvme_dhchap_ctrl_secret`. Un admin de storage de PVE obtenia asi
+    admin total del TrueNAS. Pasan a 'sensitive-properties', el mismo
+    mecanismo que PBSPlugin.pm y CIFSPlugin.pm: PVE los saca de la peticion
+    y solo los ven `on_add_hook`/`on_update_hook_full`/`on_delete_hook`,
+    que los guardan en `/etc/pve/priv/storage/<storeid>.{pw,chap,dhchap,
+    dhchapctrl}` (0600). Toda lectura pasa por un helper que prefiere el
+    fichero priv y cae a `storage.cfg` (clusters sin migrar siguen
+    funcionando igual).
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 09:00:00 -0500
+  * `tn_api_key` deja de ser `fixed`: `pvesm set <id> --tn_api_key ...`
+    rota la key (antes solo se podia editando `storage.cfg` a mano).
+
+  * Nueva subcomanda `truenas-proxmox-manage migrate-secrets <storeid>
+    [--dry-run]` (alias `migrate-api-key`) que mueve los secretos de una
+    storage existente de `storage.cfg` al fichero priv. Nada se migra
+    automaticamente en el postinst.
+
+  * GUI: cada propiedad del schema lleva `title`, y las de ajuste fino
+    (presupuestos, reintentos, timeouts, colas NVMe, by-path) se marcan en
+    'advanced-properties', para el formulario que PVE genera con la serie
+    "GUI Support for Custom Storage Plugins" (pve-devel, v3). Sin esa serie
+    las claves se ignoran.
+
+  * Tests: t/nvme/24-sensitive-secrets.t (65 casos: escritura/lectura/
+    borrado priv, prioridad priv sobre scfg, rotacion, migracion
+    idempotente, key ausente = error claro).
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 12:00:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
 
