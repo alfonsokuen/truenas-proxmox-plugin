@@ -214,7 +214,60 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
     despues del arreglo, con la suite completa corrida en el nodo real
     (solo los 13 fallos preexistentes).
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 18:00:00 -0500
+  * QA ronda 3 (Codex, con reproduccion real):
+
+    - La guarda de autolimpieza (introducida en la ronda anterior) solo
+      comprobaba que el fichero priv EXISTE (-e), no que tuviera contenido
+      utilizable. Un `.pw` vacio o ilegible (0 bytes, una escritura
+      parcial fallida - cualquier cosa para la que `-e` sigue siendo
+      verdadero) hacia que se borrara igualmente la copia inline, dejando
+      la storage SIN credencial en ningun sitio. Ahora la decision de
+      borrar se basa en una lectura real (defined() del valor, no solo
+      existencia del fichero) para los 4 secretos; eliminada
+      `_tn_priv_exists()` (quedo sin uso una vez corregido - una
+      comprobacion de existencia sola nunca fue la pregunta correcta
+      aqui).
+
+    - La guarda de cluster exigia una `nodelist` en `/etc/pve/.members` -
+      pero pmxcfs, verificado contra su propio codigo fuente
+      (cfs_create_memberlist_msg() en pve-cluster), solo emite
+      `{"nodename":..., "version":N}` SIN `nodelist` en absoluto cuando el
+      nodo nunca se unio a un cluster corosync. La version anterior de
+      esta comprobacion trataba esa ausencia como un fallo de parseo y
+      fallaba cerrado, asi que `migrate-secrets` (y la autolimpieza de
+      rotacion) nunca podian tener exito en un nodo standalone real - el
+      caso que deberia ser el mas facil de aprobar. Ahora distingue
+      "standalone confirmado" (sin `nodelist` en el inventario Y sin
+      `/etc/pve/corosync.conf` - ambas señales a la vez, ninguna sola)
+      de "inventario invalido" (falla cerrado igual que antes).
+
+    - El rollback de rotacion de install.sh (menu_edit_storage) llamaba a
+      `write_priv_secret()` con la key previa para restaurarla si
+      `update_storage_config` fallaba - pero si esa key previa estaba
+      vacia (fichero ausente, o presente pero vacio),
+      `write_priv_secret()` no escribe nada por diseño (es un no-op
+      silencioso para un llamador que no dio valor), asi que la
+      "restauracion" dejaba la key NUEVA puesta sin avisar. Ahora
+      restaurar a "sin key previa utilizable" borra el fichero
+      explicitamente en vez de depender de ese no-op. Ademas, si la
+      LECTURA de la key previa fallaba (no "ausente", un error real de
+      E/S), se aborta ANTES de escribir la key nueva - antes se trataba
+      igual que "vacia" y se seguia adelante sin garantia de poder volver
+      atras.
+
+    Tests: cobertura nueva para las tres correcciones - `.pw` vacio con
+    inline valido y un update de otra opcion (la inline se conserva),
+    `_tn_cluster_secrets_ready()` con el `{"nodename":"solo","version":0}`
+    real de pmxcfs (aprobado sin `corosync.conf`, rechazado si existe pese
+    a la ausencia de `nodelist` - inconsistente, no se confia en ninguna
+    señal sola), y guardas de regresion estaticas para el rollback del
+    instalador (la misma tecnica que K5 ya usaba para lo que es
+    demasiado costoso de simular via los prompts interactivos reales) -
+    cada una confirmada en ROJO contra el commit anterior a esta ronda y
+    en VERDE despues, con la suite completa corrida en el nodo real (solo
+    los 13 fallos preexistentes).
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 20:00:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
 

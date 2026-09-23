@@ -1351,19 +1351,6 @@ sub _tn_priv_read {
     return $line;
 }
 
-# Real, uncached existence check for a priv file - used where a decision
-# must be based on the file actually being there RIGHT NOW (e.g. "is it
-# safe to delete the only other copy of this secret"), not on whatever
-# _tn_priv_read() last happened to see. Since _tn_priv_read() is itself
-# uncached now, this is equivalent to `defined(_tn_priv_read(...))`, but
-# named separately so a call site reads as a deliberate existence check,
-# not a value read whose result happens to be discarded.
-sub _tn_priv_exists {
-    my ($storeid, $suffix) = @_;
-    my $file = _tn_priv_file($storeid, $suffix);
-    return defined($file) && -e $file;
-}
-
 # Generic set/delete/read-with-fallback over any key in %TN_SENSITIVE_SUFFIX.
 # Introduced at the third and fourth sensitive property (tn_chap_password
 # then the two DHCHAP secrets) so a fifth one is a one-line table entry, not
@@ -1566,28 +1553,39 @@ sub on_update_hook_full {
               . "requires an API key at all times. Set a replacement with "
               . "--tn_api_key instead of deleting it.\n";
         }
-    } elsif (defined($scfg) && defined($scfg->{tn_api_key}) && $scfg->{tn_api_key} ne ''
-             && _tn_priv_exists($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key})) {
-        # This particular call did not touch the key, but a priv copy
-        # already exists (migrated earlier, or rotated before) and $scfg
-        # still carries an inline duplicate (e.g. from hand-editing
-        # storage.cfg after migrating) - self-heal it on any update that
-        # happens to pass through here. _tn_priv_exists() is a real,
-        # uncached read of the file done right now: a cached "yes it
-        # exists" answer used to let this branch delete the only copy of
-        # an unmigrated storage's key on a stale premise (QA round 2).
+    } elsif (defined($scfg) && defined($scfg->{tn_api_key}) && $scfg->{tn_api_key} ne '') {
+        # This particular call did not touch the key, but $scfg still
+        # carries an inline duplicate (e.g. from hand-editing storage.cfg
+        # after migrating) - self-heal it on any update that happens to
+        # pass through here, PROVIDED priv actually has a USABLE value to
+        # fall back to. _tn_priv_read() is a real, uncached read done
+        # right now (a cached "yes it exists" answer used to let this
+        # branch delete the only copy of an unmigrated storage's key on a
+        # stale premise - QA round 2), and - critically - it already
+        # treats an empty/unreadable file the same as "not there" (see its
+        # own `return undef if ... $line eq ''`). An EARLIER version of
+        # this guard checked existence only (_tn_priv_exists(), `-e
+        # $file`) and then stripped the inline copy unconditionally once
+        # that passed - an empty or corrupted .pw file (0 bytes, a failed
+        # partial write, anything `-e` is still true for) would have left
+        # the storage with NO usable credential anywhere (QA round 4,
+        # Codex). Gating the strip itself on `defined($priv_val)` - not
+        # just on file existence - closes that.
         my $priv_val = _tn_priv_read($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key});
-        if (defined($priv_val) && $priv_val ne $scfg->{tn_api_key}) {
-            # R9: the two disagree - never discard that silently. priv is
-            # authoritative (see _tn_read_secret()'s priority rule); this
-            # only logs it, the same "which one is actually in effect"
-            # information migrate_priv_secrets()'s conflict-kept-priv
-            # gives an operator running it by hand.
-            syslog('warning', "[TrueNAS] Storage '$storeid': tn_api_key inline in "
-              . "storage.cfg differs from the priv file - the priv file is what this "
-              . "plugin actually uses, the inline copy is stale");
+        if (defined($priv_val)) {
+            if ($priv_val ne $scfg->{tn_api_key}) {
+                # R9: the two disagree - never discard that silently. priv
+                # is authoritative (see _tn_read_secret()'s priority
+                # rule); this only logs it, the same "which one is
+                # actually in effect" information
+                # migrate_priv_secrets()'s conflict-kept-priv gives an
+                # operator running it by hand.
+                syslog('warning', "[TrueNAS] Storage '$storeid': tn_api_key inline in "
+                  . "storage.cfg differs from the priv file - the priv file is what this "
+                  . "plugin actually uses, the inline copy is stale");
+            }
+            _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key');
         }
-        _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key');
     }
 
     for my $opt_key (@TN_OPTIONAL_SECRETS) {
@@ -1609,15 +1607,19 @@ sub on_update_hook_full {
                 _tn_delete_secret($storeid, $opt_key);
                 delete $scfg->{$opt_key} if defined($scfg);
             }
-        } elsif (defined($scfg) && defined($scfg->{$opt_key}) && $scfg->{$opt_key} ne ''
-                 && _tn_priv_exists($storeid, $suffix)) {
+        } elsif (defined($scfg) && defined($scfg->{$opt_key}) && $scfg->{$opt_key} ne '') {
+            # Same content-gated self-heal as the tn_api_key branch above
+            # (C1, QA round 4): only strip once priv is confirmed to hold
+            # a USABLE value, not merely a file that exists.
             my $priv_val = _tn_priv_read($storeid, $suffix);
-            if (defined($priv_val) && $priv_val ne $scfg->{$opt_key}) {
-                syslog('warning', "[TrueNAS] Storage '$storeid': $opt_key inline in "
-                  . "storage.cfg differs from the priv file - the priv file is what this "
-                  . "plugin actually uses, the inline copy is stale");
+            if (defined($priv_val)) {
+                if ($priv_val ne $scfg->{$opt_key}) {
+                    syslog('warning', "[TrueNAS] Storage '$storeid': $opt_key inline in "
+                      . "storage.cfg differs from the priv file - the priv file is what this "
+                      . "plugin actually uses, the inline copy is stale");
+                }
+                _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key);
             }
-            _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key);
         }
     }
 
@@ -4389,6 +4391,14 @@ sub snapshot_import_cli(@argv) {
 # Returns 'ready' with no problem nodes, or an explanation of exactly what
 # could not be confirmed - never a silent guess, and never approved on
 # malformed or empty membership data (fails closed).
+
+# Overridable only for tests (TRUENAS_TEST_COROSYNC_CONF, same pattern as
+# TRUENAS_PRIV_DIR) - a real corosync.conf lives at a fixed cluster-wide
+# path that no production code should ever want pointed elsewhere.
+sub _tn_has_corosync_conf {
+    return -e ($ENV{TRUENAS_TEST_COROSYNC_CONF} // '/etc/pve/corosync.conf');
+}
+
 sub _tn_cluster_secrets_ready {
     my ($class) = @_;
 
@@ -4402,22 +4412,47 @@ sub _tn_cluster_secrets_ready {
     }
 
     my $members = eval { decode_json($raw) };
-    if ($@ || ref($members) ne 'HASH' || ref($members->{nodelist}) ne 'HASH') {
+    if ($@ || ref($members) ne 'HASH') {
         return { ready => 0, reason => "could not parse $members_file" };
+    }
+
+    # QA round 4 (Codex): pmxcfs itself omits 'nodelist' (and 'cluster')
+    # ENTIRELY when it has no corosync cluster info - see pve-cluster's
+    # cfs_create_memberlist_msg(): nodecount == 0 emits only {"nodename":
+    # ..., "version": N}, never an empty "nodelist": {}. The previous
+    # version of this check treated a missing nodelist as a parse failure
+    # and failed closed - which meant `migrate-secrets` (and the
+    # self-heal/rotation gate) could never succeed on ANY standalone,
+    # never-clustered node, exactly the case that should be the simplest
+    # one to approve (nothing to roll through). Confirmed two ways before
+    # calling it standalone, not just the absent key: the absence of
+    # /etc/pve/corosync.conf too - either alone could be a coincidence (a
+    # cluster mid-bootstrap, a stale/incomplete read), both together is
+    # the real signature of "never joined a cluster at all". Anything
+    # else with a missing/malformed nodelist still fails closed below.
+    if (!exists($members->{nodelist}) && !_tn_has_corosync_conf()) {
+        return { ready => 1 } if __PACKAGE__->can('migrate_priv_secrets');
+        return { ready => 0, reason => "this node's own plugin is too old to confirm" };
+    }
+
+    if (ref($members->{nodelist}) ne 'HASH') {
+        return { ready => 0, reason => "could not parse $members_file (missing or malformed nodelist)" };
     }
 
     my $nodelist = $members->{nodelist};
     my $local_node = $members->{nodename};
 
     # Fail closed on data that looks wrong rather than guessing "probably
-    # fine" - an empty nodelist is a parsing/data problem, not evidence of
-    # a genuinely standalone host.
+    # fine" - an empty nodelist (the key IS present, just with nothing in
+    # it) is a parsing/data problem, not the standalone signature handled
+    # above.
     my @names = keys %$nodelist;
     return { ready => 0, reason => "$members_file lists no nodes at all" }
         if !@names;
 
-    # A GENUINELY standalone host (no corosync cluster) lists only itself,
-    # with a real name - nothing rolling to guard against.
+    # A single-node CLUSTER (nodelist present, one real entry) - as
+    # opposed to a host that never joined one at all, handled above -
+    # still has nothing rolling to guard against.
     return { ready => 1 }
         if @names == 1 && defined($names[0]) && $names[0] ne '';
 
