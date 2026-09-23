@@ -764,6 +764,15 @@ COMMANDS:
                         with a name PVE accepts and no dependent clone, are
                         imported.
 
+    migrate-api-key <storeid> [--dry-run]
+                        Move tn_api_key/tn_chap_password for an existing
+                        truenasplugin storage out of storage.cfg (world-
+                        readable) into /etc/pve/priv/storage (root-only).
+                        Storages created or edited after this installer
+                        already store secrets there; this is only needed for
+                        one configured before the upgrade. Safe to run more
+                        than once.
+
 OPTIONS:
     --version           Display installer version
     --non-interactive   Run in non-interactive mode with defaults
@@ -780,6 +789,10 @@ EXAMPLES:
 
     # Show what could be imported for VM 100, without writing anything
     truenas-proxmox-manage import-snapshots 100 --dry-run
+
+    # Move an existing storage's tn_api_key out of storage.cfg
+    truenas-proxmox-manage migrate-api-key tn-prod --dry-run
+    truenas-proxmox-manage migrate-api-key tn-prod
 
     # Non-interactive APT bootstrap install
     $0 --non-interactive --apt-install --apt-suite trixie
@@ -814,6 +827,16 @@ parse_arguments() {
                 shift
                 exec perl -MPVE::Storage::Custom::TrueNASPlugin \
                     -e 'exit PVE::Storage::Custom::TrueNASPlugin::snapshot_import_cli(@ARGV)' \
+                    -- "$@"
+                ;;
+            migrate-api-key)
+                # Same rationale as import-snapshots above: dispatched before
+                # the installer proper starts, exec replaces this shell, and
+                # the logic lives in the plugin since it is the only thing
+                # that knows the priv-file layout it itself reads from.
+                shift
+                exec perl -MPVE::Storage::Custom::TrueNASPlugin \
+                    -e 'exit PVE::Storage::Custom::TrueNASPlugin::migrate_api_key_cli(@ARGV)' \
                     -- "$@"
                 ;;
             --version)
@@ -4377,13 +4400,28 @@ menu_health_check() {
 get_storage_config_value() {
     local storage_name="$1"
     local param_name="$2"
-    local config_block
+    local config_block value
 
     # Extract only the configuration block for this storage (stop at next storage entry)
     config_block=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG")
 
     # Extract parameter from block
-    echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1
+    value=$(echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1)
+
+    # tn_api_key/tn_chap_password moved out of storage.cfg into
+    # /etc/pve/priv/storage/<storeid>.{pw,chap} (see TrueNASPlugin.pm's
+    # on_add_hook/on_update_hook_full and 'sensitive-properties'). Fall back
+    # to the priv file so every caller of this function keeps working for a
+    # storage that has run `truenas-proxmox-manage migrate-api-key`, or was
+    # created after this installer version, with no changes on their end.
+    if [[ -z "$value" ]]; then
+        case "$param_name" in
+            tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;
+            tn_chap_password) value=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true) ;;
+        esac
+    fi
+
+    echo "$value"
 }
 
 # Detect orphaned resources (transport-aware)
@@ -5547,10 +5585,29 @@ get_all_storage_config_values() {
     fi
 
     # Extract the entire configuration block for this storage
-    awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^[a-z].*:/{flag=0} flag" "$STORAGE_CFG" | \
-    grep -v "^\s*$" | \
-    sed 's/^\s*//' | \
-    awk '{print $1 "=" $2}'
+    local block
+    block=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^[a-z].*:/{flag=0} flag" "$STORAGE_CFG" | \
+        grep -v "^\s*$" | \
+        sed 's/^\s*//' | \
+        awk '{print $1 "=" $2}')
+
+    echo "$block"
+
+    # tn_api_key/tn_chap_password may live in /etc/pve/priv/storage instead
+    # of inline in storage.cfg (see get_storage_config_value() above for
+    # why). Emit them here too, so a caller building config_values[] from
+    # this output - e.g. menu_edit_storage - still sees whichever value is
+    # actually in effect, not a blank.
+    if ! grep -q "^tn_api_key=" <<< "$block"; then
+        local priv_key
+        priv_key=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true)
+        [[ -n "$priv_key" ]] && echo "tn_api_key=${priv_key}"
+    fi
+    if ! grep -q "^tn_chap_password=" <<< "$block"; then
+        local priv_chap
+        priv_chap=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true)
+        [[ -n "$priv_chap" ]] && echo "tn_chap_password=${priv_chap}"
+    fi
 }
 
 # Validate IP address format
@@ -9405,7 +9462,7 @@ prompt_node_selection() {
 generate_storage_config() {
     local name="$1"
     local ip="$2"
-    local apikey="$3"
+    local apikey="$3"  # unused here now (see below); kept for positional compat with callers
     local dataset="$4"
     local target_or_nqn="$5"  # target_iqn for iSCSI, subsystem_nqn for NVMe
     local portal="${6:-}"
@@ -9419,10 +9476,17 @@ generate_storage_config() {
 
     local api_port="${TN_API_PORT:-443}"
 
+    # tn_api_key is deliberately NOT written into this block: it goes to
+    # /etc/pve/priv/storage/<name>.pw instead (write_priv_secret, called by
+    # every caller of this function right after update_storage_config
+    # succeeds - never before, so a cancelled review never leaves an orphan
+    # priv file for a storage that was never created). Writing it here would
+    # put a FULL_ADMIN TrueNAS credential straight back into storage.cfg,
+    # which is mode 0644 - the exact bug this whole file's tn_api_key
+    # handling exists to fix. See TrueNASPlugin.pm's 'sensitive-properties'.
     cat <<EOF
 truenasplugin: ${name}
 	tn_api_host ${ip}
-	tn_api_key ${apikey}
 	tn_dataset ${dataset}
 EOF
 
@@ -9475,6 +9539,30 @@ EOF
 
     # Always add content type
     echo "	content images"
+}
+
+# Write a TrueNAS storage secret (API key or CHAP password) to the same
+# /etc/pve/priv/storage/<name>.{pw,chap} files TrueNASPlugin.pm's
+# on_add_hook/on_update_hook_full write for a storage created via `pvesm
+# add`/`pvesm set`. This installer edits storage.cfg directly instead of
+# going through the PVE storage API, so those hooks never run for a storage
+# created or edited here - this is what keeps the guided wizard from
+# putting the key right back into a 0644 file. Call ONLY after the
+# corresponding add_storage_config/update_storage_config has already
+# succeeded, so a cancelled or failed review never leaves an orphan secret
+# file for a storage that was never actually created.
+write_priv_secret() {
+    local storage_name="$1"
+    local suffix="$2"   # pw (tn_api_key) or chap (tn_chap_password)
+    local value="$3"
+
+    [[ -z "$value" ]] && return 0
+
+    local priv_dir="/etc/pve/priv/storage"
+    mkdir -p "$priv_dir"
+    local priv_file="${priv_dir}/${storage_name}.${suffix}"
+    ( umask 0177 && printf '%s\n' "$value" > "$priv_file" )
+    chmod 600 "$priv_file"
 }
 
 # Add storage configuration to storage.cfg
@@ -9735,6 +9823,7 @@ menu_edit_storage() {
 
     # Update configuration (remove old, add new)
     if update_storage_config "$storage_name" "$config"; then
+        write_priv_secret "$storage_name" "pw" "$api_key"
         echo
         success "Storage configuration updated successfully!"
         info "Storage '$storage_name' has been reconfigured"
@@ -11027,6 +11116,7 @@ menu_configure_storage() {
 
     # Add configuration
     if add_storage_config "$config"; then
+        write_priv_secret "$storage_name" "pw" "$api_key"
         echo
         success "Storage configured successfully!"
         info "You can now use '$storage_name' storage in Proxmox"
