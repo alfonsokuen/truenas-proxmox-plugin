@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk20';
+our $VERSION = '2.1.23~alpha1+idk21';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -532,6 +532,19 @@ sub plugindata {
     return {
         content => [ { images => 1, rootdir => 1 }, { images => 1 } ],
         format  => [ { raw => 1 }, 'raw' ],
+        # Routed by PVE's storage API (PVE::API2::Storage::Config) around
+        # check_config instead of through it: on add/update, these are
+        # extracted from the request into a separate %sensitive hash BEFORE
+        # check_config ever sees $param, and handed only to on_add_hook /
+        # on_update_hook_full. That is what keeps them out of the return
+        # value of `pvesh get /storage/<id>` and out of storage.cfg (0644,
+        # world-readable) - the same mechanism PBSPlugin.pm uses for
+        # `password`/`encryption-key` and CIFSPlugin.pm for `password`. See
+        # _tn_priv_file() below for where they actually live on disk.
+        'sensitive-properties' => {
+            tn_api_key       => 1,
+            tn_chap_password => 1,
+        },
     };
 }
 
@@ -816,7 +829,17 @@ sub options {
 
         # Connection (fixed to avoid orphaning volumes)
         tn_api_host      => { fixed => 1 },
-        tn_api_key       => { fixed => 1 },
+        # NOT fixed: a sensitive-property is stripped from $param before
+        # check_config runs (see plugindata()), so `fixed => 1` here would
+        # never be evaluated on update anyway - it only blocked `pvesm set
+        # <id> --tn_api_key ...` from working at all, forcing key rotation
+        # via hand-editing storage.cfg. Rotation now goes through
+        # on_update_hook_full(), which writes straight to
+        # /etc/pve/priv/storage/<id>.pw. It is still required in practice:
+        # on_add_hook() refuses to create a storage without one, and
+        # _tn_api_key() dies with a clear message if a storage somehow has
+        # neither a priv file nor an inline value when actually used.
+        tn_api_key       => { optional => 1 },
         tn_api_scheme    => { optional => 1, fixed => 1 },
         tn_api_transport => { optional => 1, fixed => 1 },
         tn_api_port      => { optional => 1, fixed => 1 },
@@ -896,6 +919,20 @@ sub options {
 sub check_config {
     my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
     my $opts = $class->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
+
+    # Every internal helper that ends up needing the sensitive-property priv
+    # files (_tn_api_key, _tn_chap_password) only ever receives $scfg, never
+    # $storeid - threading a new parameter through every call site between
+    # PVE's plugin entry points and the WebSocket layer would touch most of
+    # this file. check_config() is the one place a storeid is guaranteed:
+    # PVE::SectionConfig::parse_config() calls it for every section on every
+    # config load, and PVE::API2::Storage::Config calls it for add/update
+    # too, always with $sectionId as the real storage ID. Stashing it onto
+    # the returned hash - which becomes $scfg everywhere else - makes it
+    # available without changing a single method signature. write_config()
+    # only ever emits keys declared in options(), so this extra key is never
+    # written back to storage.cfg.
+    $opts->{storeid} = $sectionId;
 
     # Always set shared=1 since this is block-based shared storage (iSCSI or NVMe/TCP)
     $opts->{shared} = 1;
@@ -1032,9 +1069,14 @@ sub check_config {
     if (!$opts->{tn_api_host}) {
         die "tn_api_host is required\n";
     }
-    if (!$opts->{tn_api_key}) {
-        die "tn_api_key is required\n";
-    }
+    # tn_api_key is deliberately NOT checked here anymore. It is a
+    # sensitive-property (see plugindata()): on a real `pvesm add`/API
+    # create it has already been extracted out of $config into %sensitive
+    # before check_config ever runs, so $opts->{tn_api_key} is undef even
+    # when the caller supplied a perfectly valid key - checking for it here
+    # would refuse every creation unconditionally. The actual "is it there"
+    # requirement now lives in on_add_hook(), which sees the real value via
+    # %sensitive and is the only place PVE calls exactly once, at creation.
     if (!$opts->{tn_dataset}) {
         die "tn_dataset is required\n";
     }
@@ -1113,6 +1155,202 @@ sub check_config {
     }
 
     return $opts;
+}
+
+# ======== Sensitive credential storage (/etc/pve/priv) ========
+# tn_api_key and tn_chap_password are declared in plugindata()'s
+# 'sensitive-properties' (see above), the same mechanism PVE's own
+# PBSPlugin.pm (password, encryption-key, master-pubkey) and CIFSPlugin.pm
+# (password) use. PVE::API2::Storage::Config extracts them from the request
+# before check_config/write_config ever see them and hands them to
+# on_add_hook / on_update_hook_full / on_delete_hook below as a separate
+# %sensitive hash. That keeps them:
+#   - out of storage.cfg, which is mode 0644 (world-readable) by default;
+#   - out of `pvesh get /storage/<id>` and the GUI's storage list, both of
+#     which just serialize storage.cfg's parsed config.
+# They are written to /etc/pve/priv/storage/<storeid>.<suffix> instead - the
+# same directory PBS/CIFS use, mode 0600, readable only by root. The suffix
+# distinguishes the two secrets a single TrueNAS storage can have; 'pw'
+# matches PBSPlugin.pm's own file for the API key so an admin who already
+# knows that convention finds it in the expected place.
+#
+# Back-compat: a cluster that has not run
+# `truenas-proxmox-manage migrate-api-key <storeid>` (see below) still has
+# tn_api_key/tn_chap_password inline in storage.cfg. check_config() does not
+# strip them from a config it merely parsed off disk (only the API layer
+# extracts sensitive params, and only for a genuine add/update call), so
+# _tn_api_key()/_tn_chap_password() fall back to $scfg for exactly that
+# case. Priority is priv-file first: once on_update_hook_full() has written
+# a rotated key to the priv file, a stale copy left behind in storage.cfg
+# (e.g. by an admin who edited the file by hand) must not silently win.
+my %TN_SENSITIVE_SUFFIX = (
+    tn_api_key       => 'pw',
+    tn_chap_password => 'chap',
+);
+
+sub _tn_priv_dir {
+    # Overridable so unit tests never touch a real node's /etc/pve, exactly
+    # like TRUENAS_BROKER_RUNDIR overrides the broker's runtime directory.
+    return $ENV{TRUENAS_PRIV_DIR} // '/etc/pve/priv/storage';
+}
+
+sub _tn_priv_file {
+    my ($storeid, $suffix) = @_;
+    return undef if !defined($storeid) || $storeid eq '';
+    return _tn_priv_dir() . "/${storeid}.${suffix}";
+}
+
+sub _tn_priv_write {
+    my ($storeid, $suffix, $value) = @_;
+    die "cannot store secret: no storage ID given\n" if !defined($storeid) || $storeid eq '';
+    my $dir = _tn_priv_dir();
+    mkdir $dir;
+    my $file = _tn_priv_file($storeid, $suffix);
+    PVE::Tools::file_set_contents($file, "$value\n", 0600, 1);
+    return $file;
+}
+
+sub _tn_priv_delete {
+    my ($storeid, $suffix) = @_;
+    return if !defined($storeid) || $storeid eq '';
+    my $file = _tn_priv_file($storeid, $suffix);
+    return if !defined($file);
+    unlink($file);
+    return;
+}
+
+sub _tn_priv_read {
+    my ($storeid, $suffix) = @_;
+    my $file = _tn_priv_file($storeid, $suffix);
+    return undef if !defined($file) || !-e $file;
+    my $line = PVE::Tools::file_read_firstline($file);
+    return undef if !defined($line) || $line eq '';
+    return $line;
+}
+
+sub _tn_set_api_key {
+    my ($storeid, $key) = @_;
+    return _tn_priv_write($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key}, $key);
+}
+
+sub _tn_delete_api_key {
+    my ($storeid) = @_;
+    return _tn_priv_delete($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key});
+}
+
+sub _tn_set_chap_password {
+    my ($storeid, $password) = @_;
+    return _tn_priv_write($storeid, $TN_SENSITIVE_SUFFIX{tn_chap_password}, $password);
+}
+
+sub _tn_delete_chap_password {
+    my ($storeid) = @_;
+    return _tn_priv_delete($storeid, $TN_SENSITIVE_SUFFIX{tn_chap_password});
+}
+
+# The only thing that reads $scfg->{tn_api_key} directly anywhere else in
+# this file. Every call site that needs the API key (WebSocket auth, the
+# broker request, the connection-cache key) goes through this instead.
+sub _tn_api_key {
+    my ($scfg) = @_;
+    my $storeid = $scfg->{storeid};
+
+    if (defined(my $key = _tn_priv_read($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key}))) {
+        return $key;
+    }
+    if (defined($scfg->{tn_api_key}) && $scfg->{tn_api_key} ne '') {
+        return $scfg->{tn_api_key};
+    }
+
+    my $id = (defined($storeid) && $storeid ne '') ? $storeid : '(unknown storage)';
+    die "TrueNAS API key missing for storage '$id'. Set one with "
+      . "'pvesm set $id --tn_api_key <key>', or if this storage was "
+      . "configured before the plugin moved keys to /etc/pve/priv/storage, "
+      . "run 'truenas-proxmox-manage migrate-api-key $id'.\n";
+}
+
+# CHAP is optional per-storage (iSCSI only), so unlike _tn_api_key() this
+# never dies for a missing password - absence just means "no CHAP auth",
+# exactly as it did before this file existed.
+sub _tn_chap_password {
+    my ($scfg) = @_;
+    my $storeid = $scfg->{storeid};
+
+    if (defined(my $pw = _tn_priv_read($storeid, $TN_SENSITIVE_SUFFIX{tn_chap_password}))) {
+        return $pw;
+    }
+    return $scfg->{tn_chap_password};
+}
+
+# Called once, by PVE::API2::Storage::Config's create handler, before the
+# new section is written to storage.cfg. %sensitive holds exactly the keys
+# declared in plugindata()'s 'sensitive-properties' that were present in the
+# request - never anything else, and never from a config-file parse (that
+# path calls check_config() directly and never reaches this hook).
+sub on_add_hook {
+    my ($class, $storeid, $scfg, %sensitive) = @_;
+
+    my $key = $sensitive{tn_api_key};
+    die "tn_api_key is required\n" if !defined($key) || $key eq '';
+    _tn_set_api_key($storeid, $key);
+
+    my $chap = $sensitive{tn_chap_password};
+    if (defined($chap) && $chap ne '') {
+        _tn_set_chap_password($storeid, $chap);
+    }
+
+    return;
+}
+
+# Called once, by PVE::API2::Storage::Config's update handler
+# (`pvesm set`/API/GUI), before the modified section is written back.
+# $scfg here is the CURRENT config (pre-update); $update is only the
+# properties that changed and $delete the ones being removed - neither is
+# used here, since a sensitive property never appears in either (it is
+# routed to $sensitive instead, exists()-checked the same way $delete
+# entries are: undef means "delete this").
+sub on_update_hook_full {
+    my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
+
+    if (exists($sensitive->{tn_api_key})) {
+        my $key = $sensitive->{tn_api_key};
+        if (defined($key) && $key ne '') {
+            _tn_set_api_key($storeid, $key);
+        } else {
+            # `pvesm set <id> --delete tn_api_key` or an explicit empty
+            # value. A TrueNAS storage cannot authenticate without a key at
+            # all, so - unlike CIFSPlugin's password, which falls back to a
+            # guest mount - this is refused rather than silently accepted.
+            die "tn_api_key cannot be removed: TrueNAS storage '$storeid' "
+              . "requires an API key at all times. Set a replacement with "
+              . "--tn_api_key instead of deleting it.\n";
+        }
+    }
+
+    if (exists($sensitive->{tn_chap_password})) {
+        my $chap = $sensitive->{tn_chap_password};
+        if (defined($chap) && $chap ne '') {
+            _tn_set_chap_password($storeid, $chap);
+        } else {
+            # CHAP is optional: removing it just disables CHAP auth on the
+            # next iSCSI (re)discovery/login, same as it always could.
+            _tn_delete_chap_password($storeid);
+        }
+    }
+
+    return;
+}
+
+# Called on deletion of the storage, and also as cleanup if on_add_hook
+# succeeded but the post-create activation check failed (see
+# PVE::API2::Storage::Config's create handler).
+sub on_delete_hook {
+    my ($class, $storeid, $scfg) = @_;
+
+    _tn_delete_api_key($storeid);
+    _tn_delete_chap_password($storeid);
+
+    return;
 }
 
 # ======== DNS/IPv4 helper ========
@@ -1220,7 +1458,7 @@ sub _ws_open($scfg) {
     _ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
         method  => "auth.login_with_api_key",
-        params  => [ $scfg->{tn_api_key} ],
+        params  => [ _tn_api_key($scfg) ],
     }) or die "TrueNAS authentication failed: auth.login_with_api_key error. Verify API key is valid for TrueNAS 25.10+.\n";
     return $conn;
 }
@@ -1474,7 +1712,7 @@ sub _broker_rpc {
     my $req = {
         scfg => {
             api_host     => $scfg->{tn_api_host},
-            api_key      => $scfg->{tn_api_key},
+            api_key      => _tn_api_key($scfg),
             api_scheme   => $scfg->{tn_api_scheme}   // 'wss',
             api_port     => $scfg->{tn_api_port},
             api_insecure => $scfg->{tn_api_insecure} // 0,
@@ -1559,7 +1797,7 @@ my $_ws_creator_pid = $$; # Track PID to detect fork
 sub _ws_connection_key($scfg) {
     # Create a unique key for this storage configuration
     my $host = $scfg->{tn_api_host};
-    my $key = $scfg->{tn_api_key};
+    my $key = _tn_api_key($scfg);
     return "$host:$key";
 }
 
@@ -3727,6 +3965,113 @@ sub snapshot_import_cli(@argv) {
     return 0;
 }
 
+# `truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]`
+#
+# Moves tn_api_key/tn_chap_password for one truenasplugin storage out of
+# storage.cfg (mode 0644, world-readable) into /etc/pve/priv/storage
+# (mode 0600, root-only) - the same files on_add_hook()/on_update_hook_full()
+# above write for a storage created or edited after this fix. Existing
+# clusters were never migrated automatically on upgrade (see NOT
+# auto-migrating in postinst, deliberately: a background rewrite of
+# storage.cfg on every node during a package upgrade is exactly the kind of
+# surprise that turns into an outage ticket). This is how an operator does
+# it by hand, once, whenever they choose to.
+#
+# Idempotent: a storage with no inline secrets left (already migrated, or
+# never had any) reports nothing to do and does not touch storage.cfg.
+sub migrate_priv_secrets {
+    my ($class, $storeid, %opts) = @_;
+    my $dry_run = $opts{dry_run};
+
+    die "storage ID must not be empty\n" if !defined($storeid) || $storeid eq '';
+
+    # Required at run time, not compile time - see import_foreign_snapshots()
+    # above for why (loaded on nodes and in tests where it is not present).
+    require PVE::Storage;
+
+    my $result = { storeid => $storeid, type => undef, moved => [] };
+
+    PVE::Storage::lock_storage_config(sub {
+        my $cfg = PVE::Storage::config();
+        my $scfg = PVE::Storage::storage_config($cfg, $storeid);
+        $result->{type} = $scfg->{type};
+        return if $scfg->{type} ne 'truenasplugin';
+
+        my $changed = 0;
+        for my $key (sort keys %TN_SENSITIVE_SUFFIX) {
+            my $value = $scfg->{$key};
+            next if !defined($value) || $value eq '';
+
+            my $suffix = $TN_SENSITIVE_SUFFIX{$key};
+            my $file = _tn_priv_file($storeid, $suffix);
+            push @{ $result->{moved} }, { key => $key, file => $file };
+            next if $dry_run;
+
+            _tn_priv_write($storeid, $suffix, $value);
+            delete $scfg->{$key};
+            $changed = 1;
+        }
+
+        PVE::Storage::write_config($cfg) if $changed;
+    }, "migrate-api-key failed for '$storeid'");
+
+    return $result;
+}
+
+sub migrate_api_key_cli(@argv) {
+    my ($storeid, $dry_run);
+
+    while (@argv) {
+        my $arg = shift @argv;
+        if ($arg eq '--dry-run' || $arg eq '-n') {
+            $dry_run = 1;
+        } elsif ($arg eq '--help' || $arg eq '-h') {
+            print "Usage: truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]\n";
+            return 0;
+        } elsif (!defined($storeid) && $arg !~ /^-/) {
+            $storeid = $arg;
+        } else {
+            print STDERR "unexpected argument '$arg'\n";
+            return 1;
+        }
+    }
+
+    if (!defined($storeid)) {
+        print STDERR "Usage: truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]\n";
+        return 1;
+    }
+
+    my $result = eval { __PACKAGE__->migrate_priv_secrets($storeid, dry_run => $dry_run) };
+    if (my $err = $@) {
+        print STDERR "migrate-api-key: $err";
+        return 1;
+    }
+
+    if (!defined($result->{type})) {
+        print STDERR "migrate-api-key: storage '$storeid' not found\n";
+        return 1;
+    }
+    if ($result->{type} ne 'truenasplugin') {
+        print STDERR "migrate-api-key: storage '$storeid' is type "
+          . "'$result->{type}', not truenasplugin - nothing to do\n";
+        return 1;
+    }
+    if (!@{ $result->{moved} }) {
+        print "storage '$storeid': no inline secrets in storage.cfg "
+          . "(already migrated, or none were ever set inline)\n";
+        return 0;
+    }
+
+    for my $m (@{ $result->{moved} }) {
+        printf("%s%-20s -> %s\n", $dry_run ? '[dry-run] ' : '', $m->{key}, $m->{file});
+    }
+    print $dry_run
+        ? "Dry run: nothing was written.\n"
+        : "Moved " . scalar(@{ $result->{moved} })
+            . " secret(s) for '$storeid' into /etc/pve/priv/storage.\n";
+    return 0;
+}
+
 # List TrueNAS iSCSI targets (array of hashes; each has at least {id, name, ...}).
 sub _tn_targets {
     my ($scfg) = @_;
@@ -4366,12 +4711,13 @@ sub _all_portals_connected($scfg) {
 # Verified live 2026-08-23 against TrueNAS 25.10.4.
 sub _iscsi_discover {
     my ($scfg, $portal, $label) = @_;
-    if ($scfg->{tn_chap_user} && $scfg->{tn_chap_password}) {
+    my $chap_password = _tn_chap_password($scfg);
+    if ($scfg->{tn_chap_user} && $chap_password) {
         _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,'-o','new'],
                  "iSCSI discoverydb create failed ($label)");
         for my $kv (['discovery.sendtargets.auth.authmethod','CHAP'],
                     ['discovery.sendtargets.auth.username',$scfg->{tn_chap_user}],
-                    ['discovery.sendtargets.auth.password',$scfg->{tn_chap_password}]) {
+                    ['discovery.sendtargets.auth.password',$chap_password]) {
             _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,
                       '-o','update','-n',$kv->[0],'-v',$kv->[1]],
                      "iSCSI discoverydb auth update failed ($label)");
@@ -4414,6 +4760,8 @@ sub _iscsi_login_all($scfg) {
     # Get current session list once for efficiency
     my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
 
+    my $chap_password = _tn_chap_password($scfg);
+
     # Login to all discovered portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
         # the list form is "190.0.2.1:3260,1 iqn..." - strip the ,tpgt suffix
@@ -4421,11 +4769,11 @@ sub _iscsi_login_all($scfg) {
         my $portal = _normalize_portal($1);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
                  "iscsiadm update failed (node.startup)");
-        if ($scfg->{tn_chap_user} && $scfg->{tn_chap_password}) {
+        if ($scfg->{tn_chap_user} && $chap_password) {
             for my $cmd (
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.authmethod','-v','CHAP'],
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{tn_chap_user}],
-                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{tn_chap_password}],
+                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$chap_password],
             ) { _try_run($cmd, "iscsiadm CHAP update failed"); }
         }
         # Skip login if this portal is already connected
