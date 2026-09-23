@@ -118,6 +118,33 @@ Generate in TrueNAS: **Credentials** → **Local Users** → **Edit User** → *
 tn_api_key 1-your-api-key-here
 ```
 
+**Where it actually lives**: `tn_api_key` and `tn_chap_password` (see
+[`tn_chap_password`](#tn_chap_password)) are `sensitive-properties` - the
+same mechanism Proxmox's own PBS and CIFS storage plugins use for their
+credentials. `pvesm add`/`pvesm set`/the GUI never write them into
+`/etc/pve/storage.cfg` (mode `0644`, world-readable, and the source of
+`pvesh get /storage/<id>` and the storage list in the GUI); instead they go
+to `/etc/pve/priv/storage/<storeid>.pw` / `.chap` (mode `0600`, root only).
+This is transparent to normal use - configure the key exactly as shown
+above - but matters for two things:
+
+- **Rotating the key**: `pvesm set <storeid> --tn_api_key <new-key>` now
+  works (it used to be `fixed`, so the only way to rotate a key was editing
+  `storage.cfg` by hand). Removing it entirely
+  (`pvesm set <storeid> --delete tn_api_key`) is refused: a TrueNAS storage
+  cannot authenticate without one.
+- **A storage configured before this change**: the key still works exactly
+  as before, read straight out of `storage.cfg`, for backward
+  compatibility. Move it to the priv file at your convenience with:
+
+  ```
+  truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]
+  ```
+
+  This is optional and idempotent - not required for the storage to keep
+  working, and safe to run more than once. See
+  [Tools.md](Tools.md#migrate-api-key) for details.
+
 ### `tn_target_iqn`
 **Description**: iSCSI target IQN (iSCSI Qualified Name)
 **Type**: String (IQN format)

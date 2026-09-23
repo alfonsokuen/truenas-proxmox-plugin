@@ -313,17 +313,20 @@ truenasplugin: truenas-nvme
     shared 1
 ```
 
-Store the API key in a root-owned key file referenced by
-`tn_api_key_file`, not inline via `tn_api_key`. `/etc/pve/storage.cfg`
-is world-readable to the `www-data` user on a stock Proxmox install; a
-key file is not.
+**Update (idk21):** `tn_api_key_file` was never implemented by this
+plugin. As of idk21 the plugin fixes the underlying leak itself:
+`tn_api_key` is a `sensitive-property`, so `pvesm add`/`set`/the GUI write
+it to `/etc/pve/priv/storage/<storeid>.pw` (root-only, `0600`) instead of
+into `storage.cfg` (`0644`, world-readable) - no key-file option needed.
+Migrate an older storage with `truenas-proxmox-manage migrate-api-key
+<storeid>`. See [Configuration.md](Configuration.md#tn_api_key).
 
 Key parameters (a subset of the full option set):
 
 | Parameter | Purpose | Default |
 |---|---|---|
 | `tn_api_host` | TrueNAS management hostname or IP | (required) |
-| `tn_api_key` / `tn_api_key_file` | API key (inline) or path to file containing it | (one required) |
+| `tn_api_key` | API key; stored in `/etc/pve/priv/storage` since idk21, see above | (required) |
 | `tn_api_scheme` | `wss` (recommended) or `ws` | `wss` |
 | `tn_dataset` | ZFS dataset that will hold this storage's zvols | (required) |
 | `tn_transport` | `iscsi` or `nvme-tcp` | `iscsi` |

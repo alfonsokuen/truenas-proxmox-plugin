@@ -14,6 +14,7 @@ The plugin includes several tools to simplify installation, testing, cluster man
 
 **Subcommands** (via `truenas-proxmox-manage`):
 - **[Import Foreign Snapshots](#import-foreign-snapshots)** - Adopt snapshots taken on TrueNAS into a VM's configuration
+- **[Migrate API Key](#migrate-api-key)** - Move a storage's `tn_api_key`/`tn_chap_password` out of `storage.cfg` into `/etc/pve/priv/storage`
 
 **Standalone Tools**:
 - **[Development Test Suite](#development-test-suite)** - **Development/testing only** - Comprehensive plugin testing
@@ -104,6 +105,52 @@ guest type is taken from the configuration file that exists, and a
 container goes through `PVE::LXC::Config` with `rootfs`/`mpN` instead of
 `scsiN`/`virtioN`. Details and consequences:
 [Best Practices](Best-Practices.md#snapshots-taken-on-truenas).
+
+---
+
+## Migrate API Key
+
+```
+truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]
+```
+
+`tn_api_key` and `tn_chap_password` are `sensitive-properties` (see
+[Configuration.md](Configuration.md#tn_api_key)): a storage created or
+edited with a current plugin already has them in
+`/etc/pve/priv/storage/<storeid>.{pw,chap}` (root-only, `0600`), never in
+`storage.cfg`. This command is for a storage that predates that change and
+still has one or both inline in `storage.cfg` (mode `0644`, readable by
+anyone with API/GUI access to `/storage`).
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Print what would move, write nothing |
+
+```
+$ truenas-proxmox-manage migrate-api-key tn-prod --dry-run
+[dry-run] tn_api_key           -> /etc/pve/priv/storage/tn-prod.pw
+Dry run: nothing was written.
+
+$ truenas-proxmox-manage migrate-api-key tn-prod
+tn_api_key           -> /etc/pve/priv/storage/tn-prod.pw
+Moved 1 secret(s) for 'tn-prod' into /etc/pve/priv/storage.
+```
+
+Rules:
+
+- Idempotent: nothing left inline (already migrated, or none were ever
+  set) reports so and does not touch `storage.cfg`.
+- Runs under the same cluster-wide config lock as `pvesm set`, so it is
+  safe to run while the storage is in use.
+- Refuses a storage ID that is not type `truenasplugin`.
+- Not run automatically by the installer or the package's `postinst` on
+  upgrade - a background rewrite of every node's `storage.cfg` during a
+  package upgrade is not something to do without the operator asking for
+  it. Run it by hand, on any one node, whenever convenient; the priv files
+  live under `/etc/pve`, so they are visible cluster-wide immediately.
+
+Exit codes: `0` done (including "nothing to migrate"), `1` error (storage
+not found, wrong type, or the lock/write failed).
 
 ---
 

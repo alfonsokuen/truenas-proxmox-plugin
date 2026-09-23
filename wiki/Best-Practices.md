@@ -387,9 +387,19 @@ Do not give the plugin's API key `Full Admin`. See
 minimum role set. The plugin's audit is what the file records; do not
 grant beyond it.
 
-Store the API key via `tn_api_key_file` (a path readable only by
-`root:root`) instead of inline `tn_api_key` in `storage.cfg`. The latter
-is world-readable to `www-data` on a stock PVE install.
+**Update (idk21):** `tn_api_key_file` below was never implemented by this
+plugin - it silently did nothing, leaving the key inline regardless. As of
+this version the plugin fixes the underlying problem itself: `tn_api_key`
+(and `tn_chap_password`) are `sensitive-properties`, so `pvesm
+add`/`set`/the GUI now write them to `/etc/pve/priv/storage/<storeid>.pw`
+(root-only, `0600`) instead of into `storage.cfg` (`0644`, world-readable)
+- no separate key-file option needed. A storage configured before idk21
+still has the key inline for backward compatibility; move it with
+`truenas-proxmox-manage migrate-api-key <storeid>`. See
+[Configuration.md](Configuration.md#tn_api_key) for the full explanation.
+The `tn_api_key_file` lines in the examples below are kept only so this
+page's history is visible in the diff; do not use them in a real
+`storage.cfg` - the plugin does not read that key.
 
 ### DH-HMAC-CHAP for NVMe/TCP
 
