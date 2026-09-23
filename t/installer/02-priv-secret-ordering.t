@@ -312,20 +312,44 @@ sub call_cat {
 # Full interactive coverage would need to drive menu_edit_storage()'s TTY
 # prompts; this pins the fix as a static regression guard instead, the
 # same technique the K1 guard above uses.
+my $menu_edit_storage_body;
 {
     open(my $fh, '<', $SCRIPT) or die "cannot read $SCRIPT: $!";
     my $body = do { local $/; <$fh> };
     close($fh);
 
     if ($body =~ /^menu_edit_storage\(\)\s*\{(.*?)^\}/ms) {
-        my $fn_body = $1;
-        like($fn_body, qr/had_previous_key/,
+        $menu_edit_storage_body = $1;
+        like($menu_edit_storage_body, qr/had_previous_key/,
             'K5: menu_edit_storage() captures whether a previous priv key existed before rotating');
-        like($fn_body, qr/write_priv_secret "\$storage_name" "pw" "\$previous_key"/,
+        like($menu_edit_storage_body, qr/write_priv_secret "\$storage_name" "pw" "\$previous_key"/,
             '  ...and restores it specifically on update_storage_config failure');
     } else {
         fail('K5: could not find menu_edit_storage() to check for the rollback');
     }
+}
+
+# ------------------------------------------------------------------ C3 ---
+# Two follow-on bugs in the K5 rollback itself:
+#   - "restore" when there was no PREVIOUS key (file absent, or present
+#     but empty) must DELETE the .pw file - calling write_priv_secret()
+#     with an empty value is a silent no-op by that function's own
+#     contract (see write_priv_secret()'s own comment), which would have
+#     left the NEW (rotated) key in place while claiming the rollback
+#     succeeded;
+#   - if READING the previous key fails (not "absent", a genuine I/O
+#     error), there is no safe value to roll back to - abort BEFORE the
+#     NEW key is ever written, not after.
+SKIP: {
+    skip 'menu_edit_storage() body not extracted above', 2 if !defined($menu_edit_storage_body);
+
+    like($menu_edit_storage_body,
+        qr/if \[\[ "\$had_previous_key" == true && -n "\$previous_key" \]\]/,
+        'C3: rollback restore-vs-delete decision requires $previous_key non-empty, not just "a file existed" '
+      . '(had_previous_key alone would call write_priv_secret() with an empty value - a silent no-op - '
+      . 'instead of deleting the file)');
+    like($menu_edit_storage_body, qr/if\s*!\s*previous_key=\$\(cat "\$priv_file"/,
+        'C3: reading the previous key failing is checked before the NEW key is ever written (not silently treated as "empty")');
 }
 
 done_testing();

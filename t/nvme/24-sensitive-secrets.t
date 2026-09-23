@@ -78,11 +78,12 @@ unless (eval { require $PLUGIN; 1 }) {
 
 my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 
-for my $sub (qw(_tn_priv_file _tn_priv_exists _tn_api_key _tn_chap_password
+for my $sub (qw(_tn_priv_file _tn_api_key _tn_chap_password
                 _tn_nvme_dhchap_secret _tn_nvme_dhchap_ctrl_secret
                 on_add_hook on_update_hook on_update_hook_full on_delete_hook
                 migrate_priv_secrets migrate_secrets_cli
-                _tn_cluster_secrets_ready _tn_redact_for_log _tn_redact_structure)) {
+                _tn_cluster_secrets_ready _tn_has_corosync_conf
+                _tn_redact_for_log _tn_redact_structure)) {
     unless ($PKG->can($sub)) {
         plan tests => 1;
         fail("$sub exists");
@@ -338,7 +339,7 @@ my $ENFORCES_PERMS = do {
 
 # ------------------------------------------------- migrate_priv_secrets ---
 SKIP: {
-    skip 'PVE::Storage not loadable here', 49 unless eval { require PVE::Storage; 1 };
+    skip 'PVE::Storage not loadable here', 54 unless eval { require PVE::Storage; 1 };
 
     my %STORECFG_IDS;
     {
@@ -412,6 +413,39 @@ SKIP: {
         $MEMBERS_JSON = members_json('solo', solo => { online => 1, ip => '10.0.0.1' });
         my $r = $PKG->_tn_cluster_secrets_ready();
         ok($r->{ready}, '_tn_cluster_secrets_ready: a single-node "cluster" is always ready');
+    }
+
+    # --------------------- C2: a NEVER-clustered host (pmxcfs's real shape) ---
+    # QA round 4 (Codex): pmxcfs itself emits ONLY {"nodename":...,
+    # "version":N} - no 'nodelist' key at all - when it has no corosync
+    # cluster info (verified against pve-cluster's own
+    # cfs_create_memberlist_msg(): nodecount == 0 skips 'nodelist'
+    # entirely, it never emits an empty one). The previous version of this
+    # check treated ANY missing nodelist as a parse failure and failed
+    # closed, so migrate-secrets (and the rotation/self-heal cleanup)
+    # could never succeed on a standalone, never-clustered node - exactly
+    # the case that should be the easiest one to approve.
+    {
+        $ENV{TRUENAS_TEST_COROSYNC_CONF} = '/nonexistent/for-this-test/corosync.conf';
+        $MEMBERS_JSON = encode_json({ nodename => 'solo', version => 0 });
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok($r->{ready},
+            'C2: a real standalone host (.members has no "nodelist" key at all, and no corosync.conf) is ready');
+        delete $ENV{TRUENAS_TEST_COROSYNC_CONF};
+    }
+    {
+        # Inconsistent data: no 'nodelist' key, but corosync.conf DOES
+        # exist - do not trust either signal alone; fail closed instead of
+        # guessing which one is stale.
+        my $fake_corosync = tempdir(CLEANUP => 1) . '/corosync.conf';
+        open(my $fh, '>', $fake_corosync) or die $!;
+        close($fh);
+        $ENV{TRUENAS_TEST_COROSYNC_CONF} = $fake_corosync;
+        $MEMBERS_JSON = encode_json({ nodename => 'solo', version => 0 });
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready},
+            'C2: missing "nodelist" but corosync.conf DOES exist -> inconsistent, fails closed (not silently standalone)');
+        delete $ENV{TRUENAS_TEST_COROSYNC_CONF};
     }
     {
         @SSH_CMDS = ();
@@ -669,6 +703,36 @@ SKIP: {
             'R9: priv keeps ITS value when it differs from a stale inline copy - never silently overwritten');
         ok(!exists($scfg->{tn_api_key}),
             '  ...and the differing inline copy is still cleaned up (cluster is ready in this scenario)');
+    }
+
+    # ------------------- C1: an EMPTY/unreadable priv file is not "usable" ---
+    # QA round 4 (Codex): the self-heal guard used to check only that the
+    # priv file EXISTS (-e) before stripping the inline copy. A priv file
+    # that exists but is empty (a zero-byte file, a failed partial write,
+    # anything -e is still true for) would have left the storage with NO
+    # usable credential anywhere once the inline copy was also stripped.
+    {
+        $MEMBERS_JSON = members_json('solo', solo => { online => 1, ip => '10.0.0.1' });
+
+        # A priv file that exists but is empty - not "on_add_hook wrote an
+        # empty string" (that's refused elsewhere), but the shape of a
+        # corrupted/truncated file: create it directly, bypassing the
+        # normal write path.
+        my $file = call('_tn_priv_file', 'tn-empty', 'pw');
+        open(my $fh, '>', $file) or die $!;
+        close($fh);
+        ok(-e $file, 'sanity: tn-empty has a .pw file that exists');
+        is(call('_tn_priv_read', 'tn-empty', 'pw'), undef,
+            'sanity: _tn_priv_read() already treats an empty file as "nothing usable"');
+
+        my $scfg = { storeid => 'tn-empty', tn_api_key => 'ONLY-USABLE-CREDENTIAL' };
+        # An update that does not touch tn_api_key at all - the self-heal
+        # branch is the only thing that could strip the inline copy here.
+        call('on_update_hook_full', $PKG, 'tn-empty', $scfg, { nodes => 'pve3' }, [], {});
+
+        is($scfg->{tn_api_key}, 'ONLY-USABLE-CREDENTIAL',
+            'C1: inline copy is KEPT when priv exists but has no usable content - '
+          . 'stripping it would have left the storage with no credential anywhere');
     }
 
     # --------------------------- K9: on_add_hook warns on a mixed cluster ---
