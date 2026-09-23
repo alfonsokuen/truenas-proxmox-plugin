@@ -772,9 +772,12 @@ COMMANDS:
                         and by the www-data group) into /etc/pve/priv/storage
                         (root-only). Storages created or edited after this
                         installer already store secrets there; this is only
-                        needed for one configured before the upgrade. Safe to
-                        run more than once. `migrate-api-key` is kept working
-                        as an alias for this command's pre-idk21 name.
+                        needed for one configured before the upgrade. Refuses
+                        to run (outside --dry-run) unless every cluster node
+                        can be confirmed to run a plugin new enough to read
+                        /etc/pve/priv/storage - --all-nodes-upgraded skips
+                        that check once you have confirmed it by hand. See
+                        wiki/Tools.md#migrate-secrets.
 
 OPTIONS:
     --version           Display installer version
@@ -840,16 +843,6 @@ parse_arguments() {
                 shift
                 exec perl -MPVE::Storage::Custom::TrueNASPlugin \
                     -e 'exit PVE::Storage::Custom::TrueNASPlugin::migrate_secrets_cli(@ARGV)' \
-                    -- "$@"
-                ;;
-            migrate-api-key)
-                # Pre-idk21 name of migrate-secrets, back when it only
-                # covered tn_api_key. Kept as a working alias - dispatches
-                # to the plugin's own compatibility alias sub, not a
-                # duplicate implementation.
-                shift
-                exec perl -MPVE::Storage::Custom::TrueNASPlugin \
-                    -e 'exit PVE::Storage::Custom::TrueNASPlugin::migrate_api_key_cli(@ARGV)' \
                     -- "$@"
                 ;;
             --version)
@@ -4415,26 +4408,24 @@ get_storage_config_value() {
     local param_name="$2"
     local config_block value
 
-    # Extract only the configuration block for this storage (stop at next storage entry)
-    config_block=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG")
-
-    # Extract parameter from block
-    value=$(echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1)
-
-    # tn_api_key/tn_chap_password moved out of storage.cfg into
-    # /etc/pve/priv/storage/<storeid>.{pw,chap} (see TrueNASPlugin.pm's
-    # on_add_hook/on_update_hook_full and 'sensitive-properties'; the other
-    # two sensitive properties, tn_nvme_dhchap_secret/tn_nvme_dhchap_ctrl_secret,
+    # tn_api_key/tn_chap_password may live in /etc/pve/priv/storage instead
+    # of inline in storage.cfg (see TrueNASPlugin.pm's on_add_hook/
+    # on_update_hook_full and 'sensitive-properties'; the other two
+    # sensitive properties, tn_nvme_dhchap_secret/tn_nvme_dhchap_ctrl_secret,
     # are not read anywhere in this installer, so they need no fallback
-    # here). Fall back to the priv file so every caller of this function
-    # keeps working for a storage that has run
-    # `truenas-proxmox-manage migrate-secrets`, or was created after this
-    # installer version, with no changes on their end.
+    # here). Priv wins when both exist - it is what the plugin itself uses
+    # at runtime (_tn_read_secret()'s priority rule), so a stale inline
+    # duplicate left over from before a rotation or a migration must not
+    # shadow it here either.
+    case "$param_name" in
+        tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;
+        tn_chap_password) value=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true) ;;
+    esac
+
     if [[ -z "$value" ]]; then
-        case "$param_name" in
-            tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;
-            tn_chap_password) value=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true) ;;
-        esac
+        # Extract only the configuration block for this storage (stop at next storage entry)
+        config_block=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG")
+        value=$(echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1)
     fi
 
     echo "$value"
@@ -5607,23 +5598,25 @@ get_all_storage_config_values() {
         sed 's/^\s*//' | \
         awk '{print $1 "=" $2}')
 
-    echo "$block"
+    # Everything except the two sensitive keys emitted below, unchanged.
+    grep -v -E '^(tn_api_key|tn_chap_password)=' <<< "$block"
 
     # tn_api_key/tn_chap_password may live in /etc/pve/priv/storage instead
-    # of inline in storage.cfg (see get_storage_config_value() above for
-    # why). Emit them here too, so a caller building config_values[] from
-    # this output - e.g. menu_edit_storage - still sees whichever value is
-    # actually in effect, not a blank.
-    if ! grep -q "^tn_api_key=" <<< "$block"; then
-        local priv_key
-        priv_key=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true)
-        [[ -n "$priv_key" ]] && echo "tn_api_key=${priv_key}"
-    fi
-    if ! grep -q "^tn_chap_password=" <<< "$block"; then
-        local priv_chap
-        priv_chap=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true)
-        [[ -n "$priv_chap" ]] && echo "tn_chap_password=${priv_chap}"
-    fi
+    # of, or alongside a stale duplicate of, an inline value in
+    # storage.cfg. Priv wins when both exist - the same priority rule the
+    # plugin itself uses at runtime (_tn_read_secret()) - so a caller
+    # building config_values[] from this output (e.g. menu_edit_storage)
+    # never has a stale inline copy shadow a rotated/migrated value.
+    local inline_key inline_chap priv_key priv_chap
+    inline_key=$(grep -E '^tn_api_key=' <<< "$block" | head -1 | cut -d= -f2-)
+    inline_chap=$(grep -E '^tn_chap_password=' <<< "$block" | head -1 | cut -d= -f2-)
+    priv_key=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true)
+    priv_chap=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true)
+
+    local key="${priv_key:-$inline_key}"
+    local chap="${priv_chap:-$inline_chap}"
+    [[ -n "$key"  ]] && echo "tn_api_key=${key}"
+    [[ -n "$chap" ]] && echo "tn_chap_password=${chap}"
 }
 
 # Validate IP address format
@@ -9493,10 +9486,11 @@ generate_storage_config() {
     local api_port="${TN_API_PORT:-443}"
 
     # tn_api_key is deliberately NOT written into this block: it goes to
-    # /etc/pve/priv/storage/<name>.pw instead (write_priv_secret, called by
-    # every caller of this function right after update_storage_config
-    # succeeds - never before, so a cancelled review never leaves an orphan
-    # priv file for a storage that was never created). Writing it here would
+    # /etc/pve/priv/storage/<name>.pw instead. write_priv_secret() must be
+    # called BEFORE the block this function returns is ever published to
+    # $STORAGE_CFG - see each of this function's three call sites (guided
+    # create, automated provisioning, and reconfigure) for exactly where.
+    # Writing it here would
     # put a FULL_ADMIN TrueNAS credential straight back into storage.cfg -
     # readable via `pvesh get /storage/<id>` by anyone holding
     # Datastore.Allocate, and by the www-data group that owns the file
@@ -9567,10 +9561,22 @@ EOF
 # going through the PVE storage API, so those hooks never run for a storage
 # created or edited here - this is what keeps the guided wizard from
 # putting the key right back where GET /storage/<id> and the www-data
-# group can read it. Call ONLY after the
-# corresponding add_storage_config/update_storage_config has already
-# succeeded, so a cancelled or failed review never leaves an orphan secret
-# file for a storage that was never actually created.
+# group can read it.
+#
+# Call this BEFORE publishing the storage.cfg block (add_storage_config/
+# update_storage_config/the automated-provisioning finalize step), not
+# after: writing storage.cfg first and the secret second would leave a
+# window - and on any failure in between, a permanent state - where the
+# storage exists but its key exists nowhere at all. Abort without
+# publishing if this returns non-zero; every call site does. The read
+# side of this (get_storage_config_value() and friends) tolerates a priv
+# file existing for a storeid that never made it into storage.cfg (it
+# simply never matches anything), so there is no matching "orphan" risk
+# in this direction to weigh against that ordering.
+#
+# Writes atomically: a tmp file in the same directory (so the rename is on
+# the same filesystem), then renamed over the real target - a reader never
+# observes a partial write or a too-wide permission mode.
 write_priv_secret() {
     local storage_name="$1"
     local suffix="$2"   # pw (tn_api_key) or chap (tn_chap_password)
@@ -9579,10 +9585,37 @@ write_priv_secret() {
     [[ -z "$value" ]] && return 0
 
     local priv_dir="/etc/pve/priv/storage"
-    mkdir -p "$priv_dir"
+    if ! mkdir -p "$priv_dir"; then
+        log "ERROR" "write_priv_secret: cannot create $priv_dir"
+        return 1
+    fi
+
+    # Atomic: write to a tmp file in the SAME directory (so the final
+    # rename is on the same filesystem and therefore atomic) with a
+    # umask that never exposes it at a wider mode than 0600, even for the
+    # instant between creation and the explicit chmod below, then rename
+    # over the real target. A reader (this plugin, or an admin) never
+    # observes a partially-written or wrong-permission file.
     local priv_file="${priv_dir}/${storage_name}.${suffix}"
-    ( umask 0177 && printf '%s\n' "$value" > "$priv_file" )
-    chmod 600 "$priv_file"
+    local tmp_file="${priv_dir}/.${storage_name}.${suffix}.tmp.$$"
+
+    if ! ( umask 0177 && printf '%s\n' "$value" > "$tmp_file" ); then
+        log "ERROR" "write_priv_secret: failed to write $tmp_file"
+        rm -f "$tmp_file" 2>/dev/null
+        return 1
+    fi
+    if ! chmod 600 "$tmp_file"; then
+        log "ERROR" "write_priv_secret: failed to chmod $tmp_file"
+        rm -f "$tmp_file" 2>/dev/null
+        return 1
+    fi
+    if ! mv -f "$tmp_file" "$priv_file"; then
+        log "ERROR" "write_priv_secret: failed to install $priv_file"
+        rm -f "$tmp_file" 2>/dev/null
+        return 1
+    fi
+
+    return 0
 }
 
 # Add storage configuration to storage.cfg
@@ -9841,9 +9874,17 @@ menu_edit_storage() {
         return 1
     fi
 
+    # Write the secret to priv BEFORE publishing storage.cfg, not after: if
+    # this fails partway, storage.cfg must never end up pointing at a key
+    # that was never actually written anywhere. write_priv_secret() itself
+    # writes atomically (tmp file in the same dir, then rename).
+    if ! write_priv_secret "$storage_name" "pw" "$api_key"; then
+        error "Failed to write the API key to /etc/pve/priv/storage - aborting without changing $STORAGE_CFG"
+        return 1
+    fi
+
     # Update configuration (remove old, add new)
     if update_storage_config "$storage_name" "$config"; then
-        write_priv_secret "$storage_name" "pw" "$api_key"
         echo
         success "Storage configuration updated successfully!"
         info "Storage '$storage_name' has been reconfigured"
@@ -10631,21 +10672,36 @@ menu_configure_storage() {
                 ((finalize_errors++))
             fi
 
-            # Step 2: Add storage configuration
+            # Step 2: Write the secret to priv, THEN add the storage
+            # configuration - same atomic, priv-before-publish ordering as
+            # add_storage_config()'s other two callers (see
+            # write_priv_secret()'s own comment for why: a cancelled or
+            # failed step here must never leave a storage.cfg block with no
+            # key anywhere, which is exactly what a raw `echo >>
+            # $STORAGE_CFG` used to do - generate_storage_config() no
+            # longer puts tn_api_key inline at all, so skipping
+            # write_priv_secret left the key nowhere, not just somewhere
+            # less safe).
             if [[ $finalize_errors -eq 0 ]]; then
                 printf "%-30s " "Storage configuration:"
                 start_spinner
-                # Append configuration directly (backup already done)
-                echo "" >> "$STORAGE_CFG" 2>/dev/null
-                echo "$config" >> "$STORAGE_CFG" 2>/dev/null
-                local config_exit=$?
-                stop_spinner
-                if [[ $config_exit -eq 0 ]]; then
-                    echo -e "\r$(printf "%-30s " "Storage configuration:")${c2}✓${c0} Added to storage.cfg"
-                    log "INFO" "Storage configuration added"
-                else
-                    echo -e "\r$(printf "%-30s " "Storage configuration:")${c1}✗${c0} Failed to write"
+                if ! write_priv_secret "$storage_name" "pw" "$api_key"; then
+                    stop_spinner
+                    echo -e "\r$(printf "%-30s " "Storage configuration:")${c1}✗${c0} Failed to write API key to /etc/pve/priv/storage"
                     ((finalize_errors++))
+                else
+                    # Append configuration directly (backup already done)
+                    echo "" >> "$STORAGE_CFG" 2>/dev/null
+                    echo "$config" >> "$STORAGE_CFG" 2>/dev/null
+                    local config_exit=$?
+                    stop_spinner
+                    if [[ $config_exit -eq 0 ]]; then
+                        echo -e "\r$(printf "%-30s " "Storage configuration:")${c2}✓${c0} Added to storage.cfg"
+                        log "INFO" "Storage configuration added"
+                    else
+                        echo -e "\r$(printf "%-30s " "Storage configuration:")${c1}✗${c0} Failed to write"
+                        ((finalize_errors++))
+                    fi
                 fi
             fi
 
@@ -11134,9 +11190,17 @@ menu_configure_storage() {
         return 1
     fi
 
+    # Write the secret to priv BEFORE publishing storage.cfg, not after: if
+    # this fails partway, storage.cfg must never end up pointing at a key
+    # that was never actually written anywhere. write_priv_secret() itself
+    # writes atomically (tmp file in the same dir, then rename).
+    if ! write_priv_secret "$storage_name" "pw" "$api_key"; then
+        error "Failed to write the API key to /etc/pve/priv/storage - aborting without changing $STORAGE_CFG"
+        return 1
+    fi
+
     # Add configuration
     if add_storage_config "$config"; then
-        write_priv_secret "$storage_name" "pw" "$api_key"
         echo
         success "Storage configured successfully!"
         info "You can now use '$storage_name' storage in Proxmox"
@@ -11646,6 +11710,18 @@ remove_storage_config() {
     ' "$STORAGE_CFG" > "$temp_file"
 
     mv "$temp_file" "$STORAGE_CFG"
+
+    # Remove any of the four priv-stored secrets this storage might have
+    # (tn_api_key, tn_chap_password, tn_nvme_dhchap_secret,
+    # tn_nvme_dhchap_ctrl_secret - see TrueNASPlugin.pm's on_delete_hook(),
+    # which this installer bypasses the same way it bypasses on_add_hook).
+    # rm -f: a storage that never migrated, or never set an optional
+    # secret, simply has nothing here to remove.
+    rm -f "/etc/pve/priv/storage/${storage_name}.pw" \
+          "/etc/pve/priv/storage/${storage_name}.chap" \
+          "/etc/pve/priv/storage/${storage_name}.dhchap" \
+          "/etc/pve/priv/storage/${storage_name}.dhchapctrl" 2>/dev/null
+
     success "Storage configuration removed"
     return 0
 }
