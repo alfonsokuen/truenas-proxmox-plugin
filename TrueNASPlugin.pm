@@ -1577,7 +1577,7 @@ sub on_update_hook_full {
         my $key = $sensitive->{tn_api_key};
         if (defined($key) && $key ne '') {
             _tn_set_secret($storeid, 'tn_api_key', $key);
-            _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key', $get_cluster_check->());
+            _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key', $get_cluster_check->(), $key);
         } else {
             # `pvesm set <id> --delete tn_api_key` or an explicit empty
             # value. A TrueNAS storage cannot authenticate without a key at
@@ -1628,7 +1628,7 @@ sub on_update_hook_full {
             my $value = $sensitive->{$opt_key};
             if (defined($value) && $value ne '') {
                 _tn_set_secret($storeid, $opt_key, $value);
-                _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key, $get_cluster_check->());
+                _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key, $get_cluster_check->(), $value);
             } else {
                 # Optional: removing it just disables the corresponding
                 # auth on the next (re)connect, same as it always could.
@@ -1682,16 +1682,36 @@ sub on_update_hook_full {
 # (nothing about cluster readiness changes between two secrets in the
 # same call). Falls back to computing it if omitted, for any other
 # caller.
+#
+# $new_value (optional 5th arg, F1 - QA round 5): the value THIS call is
+# setting $key to, passed only by the two on_update_hook_full() branches
+# that are actually rotating a secret (exists($sensitive->{$key})) - the
+# self-heal branches never pass it, because they are not changing the
+# value, only possibly removing a redundant copy of whatever is already
+# there. Its purpose: on an unconfirmed cluster, this function already
+# kept BOTH copies rather than strip the inline one - but it kept the OLD
+# inline text unchanged, meaning a rotation on a mixed cluster (the
+# NORMAL case for a node-by-node idk20->idk21 upgrade, not an edge case)
+# silently left every node still on idk20 authenticating with the key
+# that was JUST revoked on TrueNAS, since idk20 reads storage.cfg, not
+# priv, and never sees the new value written there. When $new_value is
+# given and differs from what is inline now, this overwrites the inline
+# copy with it - not stripping it, still not safe without cluster
+# confirmation - so every node, upgraded or not, keeps authenticating
+# with whatever is CURRENTLY valid on TrueNAS.
 sub _tn_strip_inline_if_cluster_ready {
-    my ($storeid, $scfg, $key, $cluster_check) = @_;
+    my ($storeid, $scfg, $key, $cluster_check, $new_value) = @_;
     return if !defined($scfg) || !defined($scfg->{$key}) || $scfg->{$key} eq '';
 
     my $check = $cluster_check // __PACKAGE__->_tn_cluster_secrets_ready();
     if (!$check->{ready}) {
-        syslog('warning', "[TrueNAS] Storage '$storeid': keeping $key inline in "
-          . "storage.cfg alongside its priv copy - $check->{reason}. The priv file is "
-          . "what this plugin actually uses; run 'truenas-proxmox-manage migrate-secrets "
-          . "$storeid' once every node is confirmed ready, to remove the inline copy.");
+        if (defined($new_value) && $new_value ne '' && $scfg->{$key} ne $new_value) {
+            $scfg->{$key} = $new_value;
+        }
+        syslog('warning', "[TrueNAS] Storage '$storeid': cluster not confirmed upgraded: kept "
+          . "$key inline in storage.cfg in sync with the current value - $check->{reason}. "
+          . "The priv file is what this plugin actually uses; run 'truenas-proxmox-manage "
+          . "migrate-secrets $storeid' once all nodes run idk21, to remove the inline copy.");
         return;
     }
     delete $scfg->{$key};
@@ -4593,6 +4613,57 @@ sub _tn_cluster_secrets_ready {
 # priv is authoritative (see _tn_read_secret()'s priority rule), so a
 # stale inline copy left over from before a rotation is discarded, not
 # used to silently undo that rotation.
+# F3 (QA round 5): where storage.cfg gets snapshotted before
+# migrate_priv_secrets() ever rewrites it, and where THAT live file
+# actually is. Both overridable only for tests (TRUENAS_TEST_BACKUP_DIR/
+# TRUENAS_TEST_STORAGE_CFG), same pattern as _tn_priv_dir()/
+# _tn_has_corosync_conf(). Deliberately NOT under /etc/pve: that directory
+# is pmxcfs, replicated cluster-wide the instant anything lands there -
+# exactly what a rollback snapshot needs to avoid, since its entire point
+# is to exist locally, untouched, until an operator decides to use it.
+sub _tn_backup_dir {
+    return $ENV{TRUENAS_TEST_BACKUP_DIR} // '/var/lib/truenas-plugin-backups';
+}
+
+sub _tn_storage_cfg_path {
+    return $ENV{TRUENAS_TEST_STORAGE_CFG} // '/etc/pve/storage.cfg';
+}
+
+# Snapshots the live storage.cfg to
+# <backup dir>/storage.cfg.pre-migrate.<epoch>, mode 0600 root-only - it
+# contains the same tn_api_key/tn_chap_password/etc. in the clear that
+# storage.cfg itself did, so it is exactly as sensitive (see
+# wiki/Tools.md's rollback section for the reminder to clean it up once no
+# longer needed). Returns the backup path, or undef if there is nothing to
+# back up yet (storage.cfg does not exist - a fresh install with no
+# storages defined at all). Dies on any other failure: a migration that
+# is about to mutate storage.cfg must never proceed past a backup it
+# asked for and did not get.
+sub _tn_backup_storage_cfg {
+    my $src = _tn_storage_cfg_path();
+    return undef if !-e $src;
+
+    my $dir = _tn_backup_dir();
+    mkdir $dir;
+    chmod 0700, $dir;
+
+    my $dest = $dir . '/storage.cfg.pre-migrate.' . time();
+
+    # A plain read, not PVE::Tools::file_get_contents(): that helper also
+    # doubles as this plugin's own .members reader (see
+    # _tn_cluster_secrets_ready()), and this is a generic file - it has no
+    # reason to go through the same wrapper.
+    my $content;
+    {
+        local $/ = undef;
+        open(my $fh, '<', $src) or die "cannot read $src for backup: $!\n";
+        $content = <$fh>;
+        close($fh);
+    }
+    PVE::Tools::file_set_contents($dest, $content, 0600, 1);
+    return $dest;
+}
+
 sub migrate_priv_secrets {
     my ($class, $storeid, %opts) = @_;
     my $dry_run = $opts{dry_run};
@@ -4624,6 +4695,7 @@ sub migrate_priv_secrets {
         return if $scfg->{type} ne 'truenasplugin';
 
         my $changed = 0;
+        my $backed_up = 0;
         for my $key (sort keys %TN_SENSITIVE_SUFFIX) {
             my $inline = $scfg->{$key};
             next if !defined($inline) || $inline eq '';
@@ -4658,6 +4730,16 @@ sub migrate_priv_secrets {
 
             push @{ $result->{moved} }, $entry;
             next if $dry_run;
+
+            # F3 (QA round 5): snapshot storage.cfg BEFORE the first
+            # mutation this run makes to it - once, not once per secret
+            # (a storage with all four sensitive properties inline would
+            # otherwise overwrite the "pre-migrate" snapshot with an
+            # already-partially-migrated copy on the 2nd/3rd/4th key).
+            if (!$backed_up) {
+                $result->{backup} = _tn_backup_storage_cfg();
+                $backed_up = 1;
+            }
 
             _tn_priv_write($storeid, $suffix, $inline) if $entry->{action} eq 'moved';
             delete $scfg->{$key};
@@ -4743,6 +4825,18 @@ sub migrate_secrets_cli(@argv) {
         ? "Dry run: nothing was written.\n"
         : "Moved " . scalar(@{ $result->{moved} })
             . " secret(s) for '$storeid' into /etc/pve/priv/storage.\n";
+
+    # F3 (QA round 5): a snapshot of storage.cfg taken just before this run
+    # touched it (see _tn_backup_storage_cfg()) - print exactly where it
+    # landed and the one-line reminder that it holds the same secrets in
+    # the clear that storage.cfg did. wiki/Tools.md has the full
+    # step-by-step for actually rolling back to idk20 with it.
+    if (!$dry_run && defined($result->{backup})) {
+        print "Backed up storage.cfg to $result->{backup} (mode 0600, "
+          . "contains the pre-migration secrets in the clear - see "
+          . "wiki/Tools.md#volver-a-idk20--rolling-back for how to use it, "
+          . "and delete it once you no longer need it).\n";
+    }
     return 0;
 }
 

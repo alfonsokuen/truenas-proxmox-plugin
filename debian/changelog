@@ -311,7 +311,105 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
     anterior a este arreglo y en VERDE despues, con la suite completa
     corrida en el nodo real (solo los 13 fallos preexistentes).
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 21:30:00 -0500
+  * Revision de cierre (QA ronda 5, GO condicionado). Contexto real de
+    produccion: 3 nodos en idk20 con `tn_api_key`/`tn_nvme_dhchap_secret`
+    inline en `tn-prod`, upgrade nodo a nodo - el cluster MIXTO durante la
+    migracion es el caso NORMAL, no un borde.
+
+    - F1 (HIGH): en la rama "cluster no confirmado" de
+      `_tn_strip_inline_if_cluster_ready()`, una rotacion (`pvesm set
+      --tn_api_key NUEVA`) escribia la key nueva en priv pero dejaba la
+      copia inline VIEJA sin tocar - los nodos idk20 (que leen
+      `storage.cfg` directo, nunca priv) seguian autenticando con la key
+      que se acababa de REVOCAR en TrueNAS. Ahora
+      `on_update_hook_full()` pasa el valor NUEVO a esa funcion (solo en
+      las dos ramas que de verdad rotan un secreto, nunca en las de
+      autolimpieza que no cambian nada) y, si el cluster no esta
+      confirmado, sobreescribe la copia inline con el valor NUEVO (sigue
+      sin poder eliminarla) - todo nodo, migrado o no, termina
+      autenticando con el secreto vigente. Aviso explicito:
+      "cluster not confirmed upgraded: kept <key> inline in sync...".
+      Invertida la aseveracion de `t/nvme/24-sensitive-secrets.t` (R8) que
+      exigia justo lo contrario, y anadido un test separado que confirma
+      que la rama de autolimpieza (sin valor nuevo) NUNCA resincroniza.
+      `wiki/Configuration.md` actualizado con el porque del cluster mixto
+      como caso normal.
+
+    - F2 (HIGH): `install.sh` edita `storage.cfg` directamente para las
+      tres rutas de creacion/edicion - los hooks del plugin (que aplican
+      F1) nunca corren para un cambio hecho por el instalador.
+      `menu_edit_storage()` regenera la seccion completa de una storage
+      desde cero via `generate_storage_config()`, que por defecto omite
+      `tn_api_key` - sin guarda, cada "Edit storage" en un cluster no
+      confirmado borraba incondicionalmente la unica copia que un nodo
+      idk20 podia leer. Anadidas dos funciones: `storage_has_inline_secret()`
+      (lee la seccion cruda de `storage.cfg`, sin pasar por el helper que
+      ya prefiere priv) y `tn_installer_cluster_ready()` (le hace al
+      plugin, via `perl -e`, la MISMA pregunta que
+      `_tn_cluster_secrets_ready()` se hace a si mismo; falla CERRADO -
+      "no listo" - ante cualquier duda: modulo no instalado, sin entorno
+      perl de PVE, o cualquier error). `generate_storage_config()` gana un
+      14o parametro opcional `inline_api_key`, que solo `menu_edit_storage()`
+      pasa, y solo cuando ambas condiciones se cumplen a la vez - las
+      otras dos rutas (creacion guiada, aprovisionamiento automatizado)
+      nunca lo pasan, porque una storage nueva no tiene copia inline
+      previa de la que ningun nodo dependa. Tests: guarda estatica sobre
+      el cuerpo de `menu_edit_storage()` (igual tecnica que K5/C3) mas
+      cobertura de comportamiento de las dos funciones nuevas y del nuevo
+      parametro, confirmadas en ROJO contra el commit anterior (8
+      fallos) y en VERDE despues.
+
+    - F3 (HIGH): `migrate_priv_secrets()` no dejaba ningun camino de
+      vuelta - si algo salia mal (o si el operador simplemente cambiaba
+      de opinion sobre migrar en un cluster todavia mixto), no habia
+      copia de `storage.cfg` previa a la migracion en ningun lado.
+      Anadido `_tn_backup_storage_cfg()`: antes de la PRIMERA escritura
+      de una corrida (nunca mas de una vez por corrida, aunque una
+      storage tenga los cuatro secretos inline), copia `storage.cfg` a
+      `/var/lib/truenas-plugin-backups/storage.cfg.pre-migrate.<epoch>`,
+      modo 0600 root-only - deliberadamente FUERA de `/etc/pve` (pmxcfs
+      replica cualquier escritura ahi al instante, justo lo que un
+      respaldo de rollback necesita evitar). La ruta queda en
+      `$result->{backup}` y se imprime al final de `migrate-secrets`.
+      `wiki/Tools.md` gana una seccion "Volver a idk20 / Rolling back"
+      con la receta exacta paso a paso (reinsertar los secretos vigentes
+      -leidos de los ficheros priv, no de un backup viejo- en la estanza
+      de `storage.cfg`, luego downgrade del paquete). Tests: backup
+      tomado exactamente una vez por corrida con contenido y ruta
+      correctos, ausencia de backup cuando no hay `storage.cfg` que
+      respaldar (instalacion nueva sin storages) o cuando no hay nada que
+      migrar (idempotencia), confirmados en ROJO contra el commit
+      anterior (el `can()` de la suite fallaba: la funcion no existia) y
+      en VERDE despues.
+
+    - L1: `wiki/Tools.md` advierte que tanto el backup nuevo de F3 como
+      los `/etc/pve/storage.cfg.bak.*` que deja el instalador contienen
+      los secretos EN CLARO, igual que `storage.cfg` antes de migrar -
+      revisarlos y borrarlos una vez terminado el rollback (o en cuanto
+      ya no se necesiten).
+
+    - L2: `pvesh get /storage/<id>` ahora incluye un campo `storeid`
+      (viene de que `check_config()` hace `$opts->{storeid} = $sectionId`
+      para tener el ID de storage disponible en todos los hooks sin
+      pasarlo por ~190 sitios de llamada distintos) - inofensivo, no se
+      serializa mas alla de ese hash en memoria.
+
+    - L3: `wiki/Tools.md` gana una seccion "Orden de upgrade en un
+      cluster": actualizar TODOS los nodos a idk21 antes de rotar keys o
+      migrar storages existentes; crear storages nuevas o correr
+      `migrate-secrets` solo una vez confirmado; usar "Edit storage" del
+      instalador con confianza en un cluster mixto (ya aplica F1/F2
+      automaticamente en vez de asumir que el operador se acuerda).
+
+    Mismo criterio de salida que las rondas anteriores: tests rojo->verde
+    contra el commit previo a cada fix, suite completa corrida en el nodo
+    real 190.160.10.251 dentro de /tmp (nunca /etc/pve ni servicios, y
+    nunca el host 190.160.10.245 - lab e2e de otro agente en curso), solo
+    los 13 fallos preexistentes (`t/nvme/cap-max-io.t` + los 12 de
+    `t/rate-limit/*` que necesitan variables de entorno no disponibles en
+    ese nodo).
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 23:15:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
 

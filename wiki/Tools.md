@@ -189,6 +189,101 @@ Exit codes: `0` done (including "nothing to migrate"), `1` error (storage
 not found, wrong type, cluster not confirmed ready, or the lock/write
 failed).
 
+### Backup taken before migrating
+
+Before `migrate-secrets` writes anything to `storage.cfg` for the first
+time in a given run, it snapshots the file as it was to
+`/var/lib/truenas-plugin-backups/storage.cfg.pre-migrate.<epoch>`, mode
+`0600` root-only. Deliberately **not** under `/etc/pve`: that directory is
+`pmxcfs`, replicated cluster-wide the instant anything is written there -
+a rollback snapshot needs to stay local and untouched until you actually
+decide to use it. The command prints the exact path it used:
+
+```
+$ truenas-proxmox-manage migrate-secrets tn-prod
+tn_api_key           -> /etc/pve/priv/storage/tn-prod.pw
+Moved 1 secret(s) for 'tn-prod' into /etc/pve/priv/storage.
+Backed up storage.cfg to /var/lib/truenas-plugin-backups/storage.cfg.pre-migrate.1758654321 (mode 0600, contains the pre-migration secrets in the clear - see wiki/Tools.md#volver-a-idk20--rolling-back for how to use it, and delete it once you no longer need it).
+```
+
+No backup is taken (and none is mentioned in the output) for `--dry-run`
+(nothing is written, so there is nothing to protect against) or when
+there was nothing to migrate at all.
+
+### Volver a idk20 / Rolling back
+
+`migrate-secrets` (and, on production, the node-by-node package upgrade
+around it) is meant to be a one-way door once every node is confirmed on
+idk21 - but if you need to go back to idk20 on a node, or undo a
+migration you ran before you were ready, here is the exact recipe:
+
+1. **Stop.** Do this on ONE node at a time, the same as the upgrade
+   itself - never downgrade the whole cluster in one step.
+2. **Reinsert the secrets inline in `storage.cfg`.** idk20 reads
+   `tn_api_key`/`tn_chap_password` only from `storage.cfg` itself, never
+   from `/etc/pve/priv/storage` - so before downgrading the package, add
+   them back to the storage's stanza by hand, using the CURRENT values
+   from the priv files (the ones actually in effect - if you rotated a
+   key after migrating, the priv file has the new value, not whatever an
+   old backup remembers):
+
+   ```
+   # For each secret this storage actually has configured:
+   echo "	tn_api_key $(cat /etc/pve/priv/storage/tn-prod.pw)" >> /etc/pve/storage.cfg
+   echo "	tn_chap_password $(cat /etc/pve/priv/storage/tn-prod.chap)" >> /etc/pve/storage.cfg
+   # (tn_nvme_dhchap_secret/tn_nvme_dhchap_ctrl_secret the same way, from
+   # .dhchap/.dhchapctrl, only if this storage actually uses NVMe/TCP CHAP)
+   ```
+
+   Do this as a proper edit to the storage's own stanza (the lines must
+   land inside its `truenasplugin: <id>` block, not appended to the end
+   of the file) - `pvesh get /storage/<id>` or `cat /etc/pve/storage.cfg`
+   first to see exactly where that block is. Alternatively, restore the
+   whole file from the backup `migrate-secrets` took (see above) or from
+   an installer backup (`/etc/pve/storage.cfg.bak.*`) if one exists from
+   before the migration - but check its timestamp and diff it against the
+   current file first: a stale backup can undo OTHER changes made since.
+3. **Downgrade the package** (`apt install truenas-proxmox-plugin=<idk20
+   version>`, or however this node's packages are normally pinned/rolled
+   back).
+4. **Verify** `pvesm status` shows the storage as active on that node
+   before moving on to the next one.
+
+**Warning:** both the `migrate-secrets` backup above and any
+`/etc/pve/storage.cfg.bak.*` left by the installer contain these secrets
+in the clear, exactly like `storage.cfg` itself did before migrating -
+that is the whole point of this whole feature, and it applies to the
+backups just as much. Once you are done with a rollback (or once you are
+confident you will not need one), delete them:
+
+```
+rm -f /var/lib/truenas-plugin-backups/storage.cfg.pre-migrate.*
+rm -f /etc/pve/storage.cfg.bak.*
+```
+
+### Orden de upgrade en un cluster
+
+The safe sequence for a multi-node cluster, end to end:
+
+1. Upgrade the plugin package on **every** node first - `pvesm status`
+   keeps working throughout for any storage that still has its secrets
+   inline, since nothing about reading `storage.cfg` changes until you
+   explicitly migrate.
+2. Only once every node is confirmed on idk21 (or later), start rotating
+   keys and running `migrate-secrets` on existing storages, or use the
+   installer's "Edit storage" / create new storages freely - both now
+   apply the cluster-readiness check automatically and will refuse (or
+   keep the inline copy in sync, for an edit) rather than let an
+   old node silently lose a storage. `--all-nodes-upgraded` exists to
+   skip that check ONLY when you have confirmed it by hand (e.g. no SSH
+   reachability between nodes for the check itself to use) - it is not a
+   shortcut around actually upgrading every node first.
+3. If a node cannot be upgraded yet, leave its cluster's storages
+   unmigrated (inline) until it can be - a mixed cluster keeps working
+   correctly (see "Mixed-version cluster warning" in
+   [Configuration.md](Configuration.md)), it just carries the exposure
+   this whole feature exists to close until the migration is finished.
+
 ---
 
 ## Development Test Suite

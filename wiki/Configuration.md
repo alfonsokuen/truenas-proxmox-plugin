@@ -154,13 +154,24 @@ as shown above - but matters for three things:
   read `/etc/pve/priv/storage` (idk20 and older require `tn_api_key`
   inline and silently **skip** the storage section without it), it keeps
   **both** copies instead of stripping the inline one, and logs a
-  warning - the priv copy is what actually gets used either way, so
-  authentication still rotates correctly; only the inline cleanup is
-  deferred. The same applies to **creating a new storage**: its key is
-  written only to the priv file, so an idk20-or-older node elsewhere in
-  the cluster will not see that storage at all until it is upgraded.
-  Upgrade every node before creating new TrueNAS storages in a
-  cluster, not just before running `migrate-secrets` on existing ones.
+  warning - but, critically, **the inline copy is kept updated to the
+  value you just rotated to, not left at the old one**: a node-by-node
+  upgrade from idk20 to idk21 is the *normal* way this cluster gets
+  updated, not an edge case, so at any point during that upgrade some
+  nodes are still reading `storage.cfg` directly while others already
+  read the priv file - both must end up authenticating with the *same,
+  currently valid* secret. The same policy applies whether you rotate
+  through `pvesm set`, the GUI, or the installer's own "Edit Storage"
+  menu (which edits `storage.cfg` directly and applies this exact check
+  itself before regenerating a storage's section). Once every node is
+  confirmed on idk21, the next update to that storage (or an explicit
+  `migrate-secrets` run) removes the now-redundant inline copy. The same
+  applies to **creating a new storage**: its key is written only to the
+  priv file, so an idk20-or-older node elsewhere in the cluster will not
+  see that storage at all until it is upgraded. Upgrade every node before
+  creating new TrueNAS storages in a cluster, not just before running
+  `migrate-secrets` on existing ones. See "Orden de upgrade en un
+  cluster" in `wiki/Tools.md` for the recommended sequence end to end.
 - **A storage configured before this change**: any of the four still works
   exactly as before, read straight out of `storage.cfg`, for backward
   compatibility. Move them to the priv files with:

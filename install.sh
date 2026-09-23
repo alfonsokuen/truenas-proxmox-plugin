@@ -9514,26 +9514,46 @@ generate_storage_config() {
     local transport_mode="${11:-iscsi}"  # Default to iscsi for backward compatibility
     local hostnqn="${12:-}"
     local nodes="${13:-}"
+    # F2 (QA round 5): non-empty ONLY when the caller (menu_edit_storage,
+    # a RECONFIGURE of an existing storage) determined that (a) this
+    # storage already had tn_api_key inline in storage.cfg AND (b) the
+    # cluster is not yet confirmed to have every node upgraded to a
+    # plugin version that reads priv files - see
+    # tn_installer_cluster_ready() and storage_has_inline_secret(). This
+    # installer edits storage.cfg directly, so TrueNASPlugin.pm's own
+    # on_update_hook_full()/_tn_strip_inline_if_cluster_ready() guard
+    # (F1) never runs for an edit made here; without this parameter,
+    # reconfiguring through this installer on an unconfirmed cluster
+    # would unconditionally drop the ONLY copy an idk20 node can read,
+    # making the storage vanish there. Guided create and automated
+    # provisioning never pass this - a brand-new storage has no pre-
+    # existing inline copy for any node to depend on yet.
+    local inline_api_key="${14:-}"
 
     local api_port="${TN_API_PORT:-443}"
 
-    # tn_api_key is deliberately NOT written into this block: it goes to
-    # /etc/pve/priv/storage/<name>.pw instead. write_priv_secret() must be
-    # called BEFORE the block this function returns is ever published to
-    # $STORAGE_CFG - see each of this function's three call sites (guided
-    # create, automated provisioning, and reconfigure) for exactly where.
-    # Writing it here would
-    # put a FULL_ADMIN TrueNAS credential straight back into storage.cfg -
+    # tn_api_key is deliberately NOT written into this block by default:
+    # it goes to /etc/pve/priv/storage/<name>.pw instead. write_priv_secret()
+    # must be called BEFORE the block this function returns is ever
+    # published to $STORAGE_CFG - see each of this function's three call
+    # sites (guided create, automated provisioning, and reconfigure) for
+    # exactly where. Writing it here unconditionally would put a
+    # FULL_ADMIN TrueNAS credential straight back into storage.cfg -
     # readable via `pvesh get /storage/<id>` by anyone holding
     # Datastore.Allocate, and by the www-data group that owns the file
     # (mode 0640, not world-readable, but still the exact bug this whole
     # file's tn_api_key handling exists to fix). See TrueNASPlugin.pm's
-    # 'sensitive-properties'.
+    # 'sensitive-properties'. The one deliberate exception is
+    # $inline_api_key above.
     cat <<EOF
 truenasplugin: ${name}
 	tn_api_host ${ip}
 	tn_dataset ${dataset}
 EOF
+
+    if [[ -n "$inline_api_key" ]]; then
+        printf '\ttn_api_key %s\n' "$inline_api_key"
+    fi
 
     # Add tn_api_port only when non-default
     if [[ "$api_port" != "443" ]]; then
@@ -9584,6 +9604,53 @@ EOF
 
     # Always add content type
     echo "	content images"
+}
+
+# F2 (QA round 5): does storage.cfg currently carry an inline tn_api_key
+# for this storage? Reconfiguring through this installer (menu_edit_storage)
+# regenerates the entire section from scratch via generate_storage_config(),
+# which by default omits tn_api_key entirely - so without checking this
+# FIRST, a reconfigure would silently remove an inline copy that an idk20
+# node may still be reading, on every single edit, not just an unlucky one.
+storage_has_inline_secret() {
+    local storage_name="$1"
+    local key="$2"
+
+    [[ -f "$STORAGE_CFG" ]] || return 1
+
+    awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^[a-z].*:/{flag=0} flag" "$STORAGE_CFG" \
+        | grep -qE "^[[:space:]]*${key}[[:space:]]"
+}
+
+# Ask TrueNASPlugin.pm the exact same question it asks itself before ever
+# stripping an inline secret out of storage.cfg (see
+# _tn_cluster_secrets_ready()/_tn_strip_inline_if_cluster_ready(), F1 in
+# this same QA round): is every node in this cluster confirmed to run a
+# plugin version that reads priv files? This installer writes storage.cfg
+# directly - on_update_hook_full() never runs for an edit made here - so
+# without asking this explicitly, menu_edit_storage would have no way to
+# know it is about to do exactly what the plugin's own guard exists to
+# prevent.
+#
+# Fails CLOSED - prints "0" (not ready) - on anything that stops this from
+# getting a real answer: the plugin module not being installed/loadable,
+# no PVE perl environment at all, or any perl-side error. Treating "cannot
+# tell" as "keep the inline copy" costs nothing but a redundant line in
+# storage.cfg that migrate-secrets cleans up later; treating it as "safe
+# to strip" risks losing the storage on a node this installer has no way
+# to see from here.
+tn_installer_cluster_ready() {
+    local out
+    out=$(perl -e '
+        use lib "/usr/share/perl5";
+        my $ready = eval {
+            require PVE::Storage::Custom::TrueNASPlugin;
+            PVE::Storage::Custom::TrueNASPlugin::_tn_cluster_secrets_ready()->{ready} ? 1 : 0;
+        };
+        print(defined($ready) ? $ready : 0);
+    ' 2>/dev/null)
+
+    [[ "$out" == "1" ]]
 }
 
 # Write a TrueNAS storage secret (API key or CHAP password) to the same
@@ -9884,6 +9951,23 @@ menu_edit_storage() {
     local nodes=""
     prompt_node_selection nodes "$current_nodes"
 
+    # F2 (QA round 5): decide BEFORE generating the new block whether it
+    # must keep tn_api_key inline. This is a RECONFIGURE - the section
+    # generated below completely replaces whatever is on disk now - so an
+    # inline copy that already exists (an idk20 node may be reading it
+    # right now) and a cluster not yet confirmed to have every node on a
+    # priv-reading plugin version together mean: keep it, and keep it
+    # equal to the (possibly rotated) $api_key being applied, exactly the
+    # same policy TrueNASPlugin.pm's own on_update_hook_full() applies for
+    # an edit made through `pvesm set` (F1, this same round). A storage
+    # that never had an inline copy, or a cluster that IS confirmed ready,
+    # gets no inline copy at all - unchanged from before this fix.
+    local inline_api_key=""
+    if storage_has_inline_secret "$storage_name" "tn_api_key" && ! tn_installer_cluster_ready; then
+        inline_api_key="$api_key"
+        warning "Cluster not confirmed upgraded to idk21 on every node: keeping tn_api_key inline in storage.cfg, in sync with the new value, so idk20 nodes keep working. Run migrate-secrets (or re-edit this storage) once every node is upgraded."
+    fi
+
     # Generate updated configuration
     echo
     info "Updated Configuration Summary:"
@@ -9891,10 +9975,10 @@ menu_edit_storage() {
     local config
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
         local subsystem_nqn="${config_values[subsystem_nqn]}"
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn" "$nodes")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn" "$nodes" "$inline_api_key")
     else
         local target_iqn="${config_values[target_iqn]}"
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target_iqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "" "$nodes")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target_iqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "" "$nodes" "$inline_api_key")
     fi
     echo "$config"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
