@@ -1,3 +1,42 @@
+truenas-proxmox-plugin (2.1.23~beta5) unstable; urgency=medium
+
+  * New feature: import foreign TrueNAS snapshots (PR #110 by Alfonso
+    Kuen). ZFS snapshots created outside PVE (periodic snapshot tasks,
+    replication targets, hand-invoked `zfs snapshot`) are otherwise
+    invisible to PVE, but they already affect it: a TrueNAS snapshot
+    newer than the last PVE snapshot blocks `qm rollback` with "is not
+    most recent snapshot" and rollback destroys them recursively. The
+    new `truenas-proxmox-manage import-snapshots <vmid>` walks the
+    guest's disks on TrueNAS and adopts the missing snapshots into the
+    PVE configuration so they can be listed, rolled back, and deleted
+    by the standard `qm listsnapshot` / `qm rollback` / `qm delsnapshot`
+    workflow. Explicit, per-guest, with `--dry-run` to preview and
+    `--match REGEX` to import only the ones you want. Covers both VMs
+    and LXC containers (rootfs plus additional mountpoints); refuses
+    containers with bind mounts because PVE itself does. Non-import
+    guest state is left alone.
+
+  * Cluster-aware refusal for the importer. `truenas-proxmox-manage
+    import-snapshots <vmid>` invoked on a node that does not own the
+    guest now dies with an explicit "$vmid is a VM/CT on node 'X', not
+    on this one; run import-snapshots there" instead of the generic
+    "Configuration file 'nodes/<node>/qemu-server/<vmid>.conf' does
+    not exist". Root cause was that _tn_guest_config queried
+    PVE::Cluster::get_vmlist() from a fresh Perl process (install.sh's
+    `exec perl -MPVE::Storage::Custom::TrueNASPlugin ...` dispatch is
+    always a fresh process), where the in-process cluster vmlist cache
+    is empty until PVE::Cluster::cfs_update() is called first;
+    get_vmlist() returned {ids => {}} regardless of what pmxcfs had
+    propagated, and $entry stayed undef.
+
+  * Docs: import-snapshots note in wiki/Tools.md explains that adopted
+    snapshots are crash-consistent (no guest-agent fs-freeze, no RAM
+    state), unlike PVE-native `qm snapshot` with the guest agent
+    enabled; points at wiki/Best-Practices.md for when the distinction
+    matters. Also documents `--dry-run` and `--match REGEX` semantics.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Wed, 23 Sep 2026 14:30:00 -0400
+
 truenas-proxmox-plugin (2.1.23~beta4) unstable; urgency=medium
 
   * Packaging (debian/postinst): restart pve-ha-crm and pve-ha-lrm on
