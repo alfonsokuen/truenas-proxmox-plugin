@@ -220,22 +220,23 @@ get_storage_value() {
     local storage_name="$1"
     local param_name="$2"
     local value
-    value=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG" | \
-        grep "^\s*${param_name}" | awk '{print $2}' | head -1 || true)
 
-    # tn_api_key/tn_chap_password moved out of storage.cfg into
-    # /etc/pve/priv/storage/<storeid>.{pw,chap} (see TrueNASPlugin.pm's
-    # on_add_hook/on_update_hook_full and 'sensitive-properties'; this tool
-    # never reads tn_nvme_dhchap_secret/tn_nvme_dhchap_ctrl_secret, so no
-    # fallback is needed for those two). A storage migrated with
-    # `truenas-proxmox-manage migrate-secrets` has nothing left inline, so
-    # this recovery tool needs the same fallback the plugin itself uses, or
-    # every command here would silently see an empty key.
+    # tn_api_key/tn_chap_password may live in /etc/pve/priv/storage instead
+    # of inline in storage.cfg (see TrueNASPlugin.pm's on_add_hook/
+    # on_update_hook_full and 'sensitive-properties'; this tool never reads
+    # tn_nvme_dhchap_secret/tn_nvme_dhchap_ctrl_secret, so no fallback is
+    # needed for those two). Priv wins when both exist - it is what the
+    # plugin itself uses at runtime (_tn_read_secret()'s priority rule), so
+    # a stale inline duplicate left over from before a rotation or a
+    # migration must not shadow it here either.
+    case "$param_name" in
+        tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;
+        tn_chap_password) value=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true) ;;
+    esac
+
     if [[ -z "$value" ]]; then
-        case "$param_name" in
-            tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;
-            tn_chap_password) value=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true) ;;
-        esac
+        value=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG" | \
+            grep "^\s*${param_name}" | awk '{print $2}' | head -1 || true)
     fi
 
     echo "$value"

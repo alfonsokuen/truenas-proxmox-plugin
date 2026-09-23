@@ -373,20 +373,43 @@ get_storage_config() {
 
     local api_host api_key dataset api_insecure
     api_host=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_host" | awk '{print $2}' | head -1)
-    api_key=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_key" | awk '{print $2}' | head -1)
     dataset=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_dataset" | awk '{print $2}' | head -1)
     api_insecure=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_insecure" | awk '{print $2}' | head -1)
+
+    # tn_api_key may live in /etc/pve/priv/storage instead of inline in
+    # storage.cfg (see TrueNASPlugin.pm's on_add_hook/on_update_hook_full
+    # and 'sensitive-properties'). Priv wins when both exist - the same
+    # priority rule the plugin itself uses at runtime
+    # (_tn_read_secret()'s priority rule) - so a stale inline duplicate
+    # left over from before a rotation or a migration must not shadow it
+    # here either.
+    api_key=$(cat "/etc/pve/priv/storage/${storage_id}.pw" 2>/dev/null || true)
+    if [[ -z "$api_key" ]]; then
+        api_key=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_key" | awk '{print $2}' | head -1)
+    fi
 
     echo "$api_host|$api_key|$dataset|$api_insecure"
 }
 
 # WebSocket API helpers using TrueNASPlugin
+#
+# The $scfg built here carries `storeid => $storage_id` (an optional 6th
+# arg, default STORAGE_ID) purely as defense in depth: get_storage_config()
+# above already resolves $api_key with the correct priv-first priority, so
+# $api_key is normally already right by the time it gets here, but
+# TrueNASPlugin.pm's own _tn_api_key()/_tn_read_secret() re-derive the key
+# from $scfg->{storeid}'s priv file FIRST regardless of what
+# $scfg->{tn_api_key} says - so a caller that passes a stale $api_key
+# (e.g. captured before a concurrent rotation) still gets the current key,
+# instead of silently using the stale one because $scfg lacked a storeid to
+# look up.
 tn_api_call() {
     local host="$1"
     local api_key="$2"
     local method="$3"
     local params="${4:-[]}";
     local api_insecure="${5:-0}"
+    local storage_id="${6:-$STORAGE_ID}"
 
     perl -e '
         use strict;
@@ -395,8 +418,9 @@ tn_api_call() {
         use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
-        my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
+        my ($host, $api_key, $method, $params_json, $api_insecure, $storeid) = @ARGV;
         my $scfg = {
+            storeid => $storeid,
             tn_api_host => $host,
             tn_api_key => $api_key,
             tn_api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
@@ -408,7 +432,7 @@ tn_api_call() {
             exit 1;
         }
         print encode_json($result) if defined $result;
-    ' "$host" "$api_key" "$method" "$params" "$api_insecure"
+    ' "$host" "$api_key" "$method" "$params" "$api_insecure" "$storage_id"
 }
 
 tn_api_call_write() {
@@ -417,6 +441,7 @@ tn_api_call_write() {
     local method="$3"
     local params="${4:-[]}";
     local api_insecure="${5:-0}"
+    local storage_id="${6:-$STORAGE_ID}"
 
     perl -e '
         use strict;
@@ -425,8 +450,9 @@ tn_api_call_write() {
         use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
-        my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
+        my ($host, $api_key, $method, $params_json, $api_insecure, $storeid) = @ARGV;
         my $scfg = {
+            storeid => $storeid,
             tn_api_host => $host,
             tn_api_key => $api_key,
             tn_api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
@@ -438,7 +464,7 @@ tn_api_call_write() {
             exit 1;
         }
         print encode_json($result) if defined $result;
-    ' "$host" "$api_key" "$method" "$params" "$api_insecure"
+    ' "$host" "$api_key" "$method" "$params" "$api_insecure" "$storage_id"
 }
 
 # Check for APIVER mismatch between system and plugin
@@ -4998,6 +5024,14 @@ test_dataset_property_inheritance() {
             fi
         fi
     done < "$storage_cfg"
+
+    # tn_api_key may live in /etc/pve/priv/storage instead of, or alongside
+    # a stale duplicate of, an inline value in storage.cfg (see
+    # get_storage_config() above for the full rationale). Priv wins when it
+    # exists - the same priority rule the plugin itself uses at runtime.
+    local priv_api_key
+    priv_api_key=$(cat "/etc/pve/priv/storage/${STORAGE_ID}.pw" 2>/dev/null || true)
+    [[ -n "$priv_api_key" ]] && api_key="$priv_api_key"
 
     if [[ -z "$api_host" ]] || [[ -z "$api_key" ]] || [[ -z "$dataset" ]]; then
         log_error "Could not extract API configuration from storage.cfg"
