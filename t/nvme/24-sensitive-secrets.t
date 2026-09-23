@@ -1,33 +1,41 @@
 #!/usr/bin/perl
-# tn_api_key (a FULL_ADMIN TrueNAS credential) and tn_chap_password used to
-# be plain options in storage.cfg (mode 0644) - readable by anyone with
-# `pvesh get /storage/<id>` access, and tn_api_key was `fixed => 1` on top,
-# so rotating it meant hand-editing storage.cfg on every node. Both are now
-# 'sensitive-properties' (plugindata()): PVE::API2::Storage::Config strips
-# them out of the request before check_config ever sees it and hands them
-# only to on_add_hook / on_update_hook_full / on_delete_hook, which write
-# them to /etc/pve/priv/storage/<storeid>.{pw,chap} (mode 0600) - the same
-# mechanism and directory PVE's own PBSPlugin.pm/CIFSPlugin.pm use.
+# tn_api_key (a FULL_ADMIN TrueNAS credential), tn_chap_password,
+# tn_nvme_dhchap_secret and tn_nvme_dhchap_ctrl_secret used to be plain
+# options in storage.cfg - readable via `pvesh get /storage/<id>` by anyone
+# holding Datastore.Allocate on /storage, and by the www-data group that
+# owns storage.cfg on disk (mode 0640, NOT world-readable - correcting an
+# earlier version of this comment that said 0644). tn_api_key was also
+# `fixed => 1`, so rotating it meant hand-editing storage.cfg on every
+# node. All four are now 'sensitive-properties' (plugindata()):
+# PVE::API2::Storage::Config strips them out of the request before
+# check_config ever sees it and hands them only to on_add_hook /
+# on_update_hook_full / on_delete_hook, which write them to
+# /etc/pve/priv/storage/<storeid>.{pw,chap,dhchap,dhchapctrl} (mode 0600) -
+# the same mechanism and directory PVE's own PBSPlugin.pm/CIFSPlugin.pm use.
 #
 # This file pins:
 #   - the priv-file read/write/delete roundtrip, and its 0600 permissions;
-#   - _tn_api_key()/_tn_chap_password() priority: priv file wins over an
-#     inline scfg value, so a rotated key can't be shadowed by a stale
-#     leftover in storage.cfg;
+#   - _tn_api_key()/_tn_chap_password()/_tn_nvme_dhchap_secret()/
+#     _tn_nvme_dhchap_ctrl_secret() priority: priv file wins over an inline
+#     scfg value, so a rotated secret can't be shadowed by a stale leftover
+#     in storage.cfg;
 #   - _tn_api_key() falls back to scfg for a cluster that has not migrated
 #     yet, and dies with a clear, actionable message when neither exists;
-#   - _tn_chap_password() never dies (CHAP is optional) - absence just
-#     means "no CHAP auth", same as before this file existed;
+#   - the other three never die (all optional) - absence just means "no
+#     CHAP/DHCHAP auth", same as before this file existed;
 #   - on_add_hook() refuses to create a storage with no API key, and stores
-#     one that is given; CHAP password is stored only if present;
+#     one that is given; the three optional secrets are stored only if
+#     present;
 #   - on_update_hook_full() rotates the key, refuses to delete it (a
 #     TrueNAS storage cannot run without one, unlike CIFS's password which
-#     falls back to a guest mount), and allows deleting the CHAP password;
-#   - on_delete_hook() removes both priv files, and is a no-op if they
+#     falls back to a guest mount), and allows deleting any of the three
+#     optional secrets;
+#   - on_delete_hook() removes all four priv files, and is a no-op if they
 #     were never created;
-#   - migrate_priv_secrets()/migrate_api_key_cli(): moves inline secrets to
-#     the priv files, is idempotent, --dry-run never writes, and a
-#     non-truenasplugin storage is refused.
+#   - migrate_priv_secrets()/migrate_secrets_cli(): moves all inline
+#     secrets to the priv files, is idempotent, --dry-run never writes, and
+#     a non-truenasplugin storage is refused; migrate_api_key_cli() is kept
+#     working as a compatibility alias for the same command's old name.
 #
 # Run with:  prove -v t/nvme/24-sensitive-secrets.t
 
@@ -60,8 +68,9 @@ unless (eval { require $PLUGIN; 1 }) {
 my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 
 for my $sub (qw(_tn_priv_file _tn_api_key _tn_chap_password
+                _tn_nvme_dhchap_secret _tn_nvme_dhchap_ctrl_secret
                 on_add_hook on_update_hook_full on_delete_hook
-                migrate_priv_secrets migrate_api_key_cli)) {
+                migrate_priv_secrets migrate_secrets_cli migrate_api_key_cli)) {
     unless ($PKG->can($sub)) {
         plan tests => 1;
         fail("$sub exists");
@@ -75,6 +84,21 @@ my $PRIV_DIR = tempdir(CLEANUP => 1);
 $ENV{TRUENAS_PRIV_DIR} = $PRIV_DIR;
 
 sub call { my ($sub, @args) = @_; no strict 'refs'; return &{"${PKG}::$sub"}(@args); }
+
+# CLI-style wrapper, capturing STDOUT like t/nvme/20's run_cli(). Goes
+# through can() rather than a method call: $PKG->$sub_name(...) would
+# prepend the class name as the first element of @argv (a plain @argv sub,
+# not a method), which would show up as an "unexpected argument" - a bug in
+# the test, not the sub under test.
+sub capture_cli {
+    my ($sub_name, @args) = @_;
+    my $capture;
+    open(my $oldout, '>&', \*STDOUT) or die $!;
+    close(STDOUT); open(STDOUT, '>', \$capture) or die $!;
+    my $rc = eval { $PKG->can($sub_name)->(@args) };
+    close(STDOUT); open(STDOUT, '>&', $oldout) or die $!;
+    return ($rc, $capture);
+}
 
 sub file_mode {
     my ($path) = @_;
@@ -146,6 +170,20 @@ my $ENFORCES_PERMS = do {
         is(file_mode($file), '0600', '  ...mode 0600');
     }
 }
+{
+    # Both DHCHAP secrets (NVMe/TCP) at once, same as CHAP above - and on a
+    # DIFFERENT priv file each, so they cannot clobber one another or 'pw'/'chap'.
+    call('on_add_hook', $PKG, 'tn-dhchap', {},
+        tn_api_key => '1-ghi789',
+        tn_nvme_dhchap_secret      => 'DHHC-1:01:host-secret:',
+        tn_nvme_dhchap_ctrl_secret => 'DHHC-1:01:ctrl-secret:');
+    my $host_file = call('_tn_priv_file', 'tn-dhchap', 'dhchap');
+    my $ctrl_file = call('_tn_priv_file', 'tn-dhchap', 'dhchapctrl');
+    ok(-f $host_file, 'on_add_hook: stores tn_nvme_dhchap_secret');
+    ok(-f $ctrl_file, 'on_add_hook: stores tn_nvme_dhchap_ctrl_secret');
+    isnt($host_file, $ctrl_file, '  ...in two distinct files, not one shared with the other or with CHAP');
+    isnt($host_file, call('_tn_priv_file', 'tn-dhchap', 'chap'), '  ...and distinct from the CHAP suffix too');
+}
 
 # --------------------------------------------------------- _tn_api_key ---
 {
@@ -174,7 +212,7 @@ my $ENFORCES_PERMS = do {
         '_tn_api_key: dies with a clear, storeid-naming message when neither exists');
     like($err, qr/pvesm set tn-missing --tn_api_key/,
         '  ...and gives the exact fix');
-    like($err, qr/migrate-api-key tn-missing/,
+    like($err, qr/migrate-secrets tn-missing/,
         '  ...mentioning the migration command too');
 }
 
@@ -193,6 +231,27 @@ my $ENFORCES_PERMS = do {
     my $scfg = { storeid => 'tn-legacy-chap', tn_chap_password => 'inline-pw' };
     is(call('_tn_chap_password', $scfg), 'inline-pw',
         '_tn_chap_password: falls back to $scfg the same way the API key does');
+}
+
+# ------------------------------------------ _tn_nvme_dhchap_{,ctrl_}secret ---
+{
+    my $scfg = { storeid => 'tn-dhchap' };
+    is(call('_tn_nvme_dhchap_secret', $scfg), 'DHHC-1:01:host-secret:',
+        '_tn_nvme_dhchap_secret: reads back its own priv file');
+    is(call('_tn_nvme_dhchap_ctrl_secret', $scfg), 'DHHC-1:01:ctrl-secret:',
+        '_tn_nvme_dhchap_ctrl_secret: reads back its own priv file, not the host one');
+}
+{
+    my $scfg = { storeid => 'tn-no-dhchap' };
+    is(call('_tn_nvme_dhchap_secret', $scfg), undef,
+        '_tn_nvme_dhchap_secret: never dies (open-access nvme-tcp has none)');
+    is(call('_tn_nvme_dhchap_ctrl_secret', $scfg), undef,
+        '_tn_nvme_dhchap_ctrl_secret: same');
+}
+{
+    my $scfg = { storeid => 'tn-legacy-dhchap', tn_nvme_dhchap_secret => 'inline-dhchap' };
+    is(call('_tn_nvme_dhchap_secret', $scfg), 'inline-dhchap',
+        '_tn_nvme_dhchap_secret: falls back to $scfg for an unmigrated storage');
 }
 
 # --------------------------------------------------------- rotation/update ---
@@ -221,7 +280,26 @@ my $ENFORCES_PERMS = do {
         'on_update_hook_full: DOES allow deleting the CHAP password (optional, unlike the API key)');
 }
 {
-    # A `pvesm set` that never touched either sensitive property must not
+    # DHCHAP host secret rotates like CHAP; the ctrl secret is untouched
+    # since $sensitive does not mention it here.
+    call('on_update_hook_full', $PKG, 'tn-dhchap', { storeid => 'tn-dhchap' },
+        {}, [], { tn_nvme_dhchap_secret => 'DHHC-1:01:rotated:' });
+    is(call('_tn_nvme_dhchap_secret', { storeid => 'tn-dhchap' }), 'DHHC-1:01:rotated:',
+        'on_update_hook_full: rotates tn_nvme_dhchap_secret independently of the ctrl secret');
+    is(call('_tn_nvme_dhchap_ctrl_secret', { storeid => 'tn-dhchap' }), 'DHHC-1:01:ctrl-secret:',
+        '  ...which is untouched');
+}
+{
+    ok(-f call('_tn_priv_file', 'tn-dhchap', 'dhchapctrl'), 'sanity: ctrl-secret file present before delete');
+    call('on_update_hook_full', $PKG, 'tn-dhchap', { storeid => 'tn-dhchap' },
+        {}, ['tn_nvme_dhchap_ctrl_secret'], { tn_nvme_dhchap_ctrl_secret => undef });
+    ok(!-f call('_tn_priv_file', 'tn-dhchap', 'dhchapctrl'),
+        'on_update_hook_full: allows deleting tn_nvme_dhchap_ctrl_secret (optional)');
+    ok(-f call('_tn_priv_file', 'tn-dhchap', 'dhchap'),
+        '  ...without touching the still-present host secret');
+}
+{
+    # A `pvesm set` that never touched any sensitive property must not
     # write or delete anything - $sensitive simply does not mention them.
     call('on_update_hook_full', $PKG, 'tn-new', { storeid => 'tn-new' },
         { nodes => 'pve3' }, [], {});
@@ -238,10 +316,17 @@ my $ENFORCES_PERMS = do {
     my $ok = eval { call('on_delete_hook', $PKG, 'tn-new', { storeid => 'tn-new' }); 1 };
     ok($ok, 'on_delete_hook: a second call (file already gone) does not die');
 }
+{
+    ok(-f call('_tn_priv_file', 'tn-dhchap', 'pw'), 'sanity: tn-dhchap has files before delete');
+    ok(-f call('_tn_priv_file', 'tn-dhchap', 'dhchap'), '  ...including the DHCHAP host secret');
+    call('on_delete_hook', $PKG, 'tn-dhchap', { storeid => 'tn-dhchap' });
+    ok(!-f call('_tn_priv_file', 'tn-dhchap', 'pw'), 'on_delete_hook: removes the API key file too');
+    ok(!-f call('_tn_priv_file', 'tn-dhchap', 'dhchap'), '  ...and the DHCHAP host secret');
+}
 
 # ------------------------------------------------- migrate_priv_secrets ---
 SKIP: {
-    skip 'PVE::Storage not loadable here', 13 unless eval { require PVE::Storage; 1 };
+    skip 'PVE::Storage not loadable here', 19 unless eval { require PVE::Storage; 1 };
 
     my %STORECFG_IDS;
     {
@@ -265,26 +350,36 @@ SKIP: {
         'tn-mig' => {
             type => 'truenasplugin', tn_api_host => 'h', tn_dataset => 'd',
             tn_api_key => '1-inline-key', tn_chap_password => 'inline-chap',
+            tn_nvme_dhchap_secret => 'inline-dhchap',
+            tn_nvme_dhchap_ctrl_secret => 'inline-dhchapctrl',
         },
         'local' => { type => 'dir' },
     );
 
     # --dry-run: reports what would move, writes nothing.
     my $dry = $PKG->migrate_priv_secrets('tn-mig', dry_run => 1);
-    is(scalar(@{ $dry->{moved} }), 2, 'migrate --dry-run: reports both secrets as movable');
+    is(scalar(@{ $dry->{moved} }), 4, 'migrate --dry-run: reports all four secrets as movable');
     ok(exists($STORECFG_IDS{'tn-mig'}{tn_api_key}),
         '  ...and tn_api_key is still inline (nothing written)');
 
     my $real = $PKG->migrate_priv_secrets('tn-mig');
-    is(scalar(@{ $real->{moved} }), 2, 'migrate: moves both secrets');
+    is(scalar(@{ $real->{moved} }), 4, 'migrate: moves all four secrets');
     ok(!exists($STORECFG_IDS{'tn-mig'}{tn_api_key}),
         '  ...tn_api_key removed from the in-memory config');
     ok(!exists($STORECFG_IDS{'tn-mig'}{tn_chap_password}),
         '  ...tn_chap_password removed too');
+    ok(!exists($STORECFG_IDS{'tn-mig'}{tn_nvme_dhchap_secret}),
+        '  ...tn_nvme_dhchap_secret removed too');
+    ok(!exists($STORECFG_IDS{'tn-mig'}{tn_nvme_dhchap_ctrl_secret}),
+        '  ...tn_nvme_dhchap_ctrl_secret removed too');
     is(call('_tn_priv_read', 'tn-mig', 'pw'), '1-inline-key',
         '  ...and the priv file actually has the key');
     is(call('_tn_priv_read', 'tn-mig', 'chap'), 'inline-chap',
         '  ...and the CHAP password');
+    is(call('_tn_priv_read', 'tn-mig', 'dhchap'), 'inline-dhchap',
+        '  ...and the DHCHAP host secret');
+    is(call('_tn_priv_read', 'tn-mig', 'dhchapctrl'), 'inline-dhchapctrl',
+        '  ...and the DHCHAP controller secret');
 
     # Idempotent: nothing left inline, second run moves nothing.
     my $second = $PKG->migrate_priv_secrets('tn-mig');
@@ -299,23 +394,16 @@ SKIP: {
     %STORECFG_IDS = (
         'tn-cli' => { type => 'truenasplugin', tn_api_key => '1-cli-key' },
     );
-    my ($out, $rc);
-    {
-        my $capture;
-        open(my $oldout, '>&', \*STDOUT) or die $!;
-        close(STDOUT); open(STDOUT, '>', \$capture) or die $!;
-        # NOT $PKG->migrate_api_key_cli(...): that method-call form
-        # prepends the class name as the first element of @argv (same
-        # trap run_cli() in t/nvme/20-snapshot-import-config.t avoids by
-        # going through can() instead), which would show up here as an
-        # "unexpected argument 'tn-cli'" - a bug in the test, not the sub.
-        $rc = eval { $PKG->can('migrate_api_key_cli')->('tn-cli', '--dry-run') };
-        close(STDOUT); open(STDOUT, '>&', $oldout) or die $!;
-        $out = $capture;
-    }
-    is($rc, 0, 'migrate_api_key_cli --dry-run: exit 0');
+    my ($rc, $out) = capture_cli('migrate_secrets_cli', 'tn-cli', '--dry-run');
+    is($rc, 0, 'migrate_secrets_cli --dry-run: exit 0');
     like($out, qr/\[dry-run\]/, '  ...marks the output as a dry run');
     ok(exists($STORECFG_IDS{'tn-cli'}{tn_api_key}), '  ...and did not actually move anything');
+
+    # migrate_api_key_cli is the pre-rename name, kept working as a plain
+    # alias - same storage, same flags, same result.
+    my ($rc2, $out2) = capture_cli('migrate_api_key_cli', 'tn-cli', '--dry-run');
+    is($rc2, $rc, 'migrate_api_key_cli (compat alias): same exit code as migrate_secrets_cli');
+    is($out2, $out, '  ...and byte-identical output');
 }
 
 done_testing();
