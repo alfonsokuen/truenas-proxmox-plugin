@@ -84,6 +84,24 @@ use File::Temp qw(tempdir);
 my $PRIV_DIR = tempdir(CLEANUP => 1);
 $ENV{TRUENAS_PRIV_DIR} = $PRIV_DIR;
 
+# This file's job is the real parse_config()/write_config() round-trip -
+# the cluster-readiness guard that gates stripping an inline secret
+# (_tn_cluster_secrets_ready(), called from on_update_hook_full()'s
+# self-heal/rotation path and from migrate_priv_secrets() without
+# --all-nodes-upgraded) is covered exhaustively in
+# t/nvme/24-sensitive-secrets.t instead, with full control over every
+# node/SSH scenario. Stubbed here to always report ready: on a real
+# multi-node cluster (this suite is meant to run on one), leaving it
+# un-stubbed would make on_update_hook_full()'s rotation actually SSH out
+# to the other nodes, turning this file's assertions about what gets
+# stripped from storage.cfg into a coin flip on whether that SSH
+# succeeds - orthogonal to what this file exists to prove.
+{
+    no strict 'refs';
+    no warnings 'redefine';
+    *{"${PKG}::_tn_cluster_secrets_ready"} = sub { return { ready => 1 } };
+}
+
 sub call { my ($sub, @args) = @_; no strict 'refs'; return &{"${PKG}::$sub"}(@args); }
 
 my $BASE = <<'CFG';
