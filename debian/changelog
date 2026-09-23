@@ -409,7 +409,56 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
     `t/rate-limit/*` que necesitan variables de entorno no disponibles en
     ese nodo).
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 23:15:00 -0500
+  * Revision de cierre (QA ronda 6, ultima - 3 MEDIUM de Codex sobre la
+    ronda 5).
+
+    - G1: `tn_installer_cluster_ready()` (install.sh) solo miraba el
+      STDOUT del `perl -e` ("1" == listo), nunca su codigo de salida -
+      un `printf 1; exit 1` (el print corrio, pero algo despues fallo)
+      contaba como READY. Ahora exige AMBOS: `rc -eq 0` Y
+      `"$out" == "1"`. Test cubriendo exactamente ese caso
+      (`perl() { printf 1; exit 1; }`).
+
+    - G2: `_tn_backup_storage_cfg()` nombraba el backup solo con
+      `time()` - dos migraciones de storages DISTINTOS en el mismo
+      segundo (nada improbable: un operador migrando varias storages
+      seguidas, o la propia suite de tests en un bucle) sobreescribian
+      silenciosamente el backup de la primera con el de la segunda,
+      justo el escenario que un respaldo de rollback existe para
+      evitar. Ahora el nombre lleva epoch+pid+sufijo aleatorio de 16
+      bits, y se RECLAMA con `sysopen(... O_CREAT|O_EXCL ...)` - no
+      solo "verificar si existe" (TOCTOU) sino una creacion exclusiva
+      real, reintentando con un sufijo nuevo hasta 20 veces si choca.
+      Test: dos `migrate_priv_secrets()` para dos storages distintas,
+      llamadas una tras otra (mismo segundo en la practica), confirman
+      nombres distintos y que ambos ficheros sobreviven.
+
+    - G3: la receta de rollback en `wiki/Tools.md` usaba
+      `echo "\ttn_api_key ..." >> storage.cfg` - eso APPENDEA al final
+      del fichero, no necesariamente dentro de la estanza de la storage
+      correcta (el formato de PVE es una seccion `<tipo>: <id>` seguida
+      de sus lineas indentadas; un append al final cae en la que sea la
+      ULTIMA seccion del fichero, no en la que se queria editar).
+      Reemplazada por un one-liner `perl -i -pe` que inserta la linea
+      justo despues de la cabecera `truenasplugin: <id>` de ESA storage
+      especificamente (matcheado por `\Q...\E`, nunca sale de esa
+      seccion), con el valor del secreto pasado por variable de entorno
+      (no en el propio codigo perl ni en argv) y evaluado con el
+      modificador `/e` para que un `$` o `\` dentro del propio secreto
+      nunca se interprete como referencia de captura. Verificado a mano
+      con un secreto que contenia `$`, `\` y `"` a la vez, contra un
+      `storage.cfg` con otra storage antes y despues - ninguna corrompe
+      la seccion ajena. (Documentacion; sin test automatizado, ya que
+      `t/installer/` prueba funciones de `install.sh`, no snippets de
+      la wiki - la verificacion fue manual, contra un fichero real,
+      antes de publicar el texto.)
+
+    Mismo criterio de salida: tests rojo->verde contra el commit
+    anterior a cada fix, suite completa corrida en el nodo real
+    190.160.10.251 dentro de /tmp (nunca /etc/pve ni servicios, nunca
+    190.160.10.245), solo los 13 fallos preexistentes.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Thu, 24 Sep 2026 00:20:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
 

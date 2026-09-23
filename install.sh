@@ -9640,7 +9640,7 @@ storage_has_inline_secret() {
 # to strip" risks losing the storage on a node this installer has no way
 # to see from here.
 tn_installer_cluster_ready() {
-    local out
+    local out rc
     out=$(perl -e '
         use lib "/usr/share/perl5";
         my $ready = eval {
@@ -9649,8 +9649,17 @@ tn_installer_cluster_ready() {
         };
         print(defined($ready) ? $ready : 0);
     ' 2>/dev/null)
+    rc=$?
 
-    [[ "$out" == "1" ]]
+    # G1 (QA round 6, Codex): the exit code alone is not enough - Perl
+    # normally exits 0 after printing "0" for "not ready" (that print
+    # succeeded; it's the READINESS that was false, not the perl
+    # invocation). Requiring BOTH rc==0 and stdout=="1" closes the other
+    # direction too: a perl that somehow printed "1" and then still
+    # exited non-zero (e.g. a warning promoted to fatal, or an END block
+    # that fails, after the print already ran) must not be read as ready
+    # just because the string matched.
+    [[ $rc -eq 0 && "$out" == "1" ]]
 }
 
 # Write a TrueNAS storage secret (API key or CHAP password) to the same

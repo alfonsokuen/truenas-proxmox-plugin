@@ -20,6 +20,8 @@ use IO::Socket::SSL;
 use IO::Select;
 use Time::HiRes qw(usleep);
 use POSIX ();
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+use Errno qw(EEXIST);
 use Socket qw(inet_ntoa getaddrinfo getnameinfo AF_INET SOCK_STREAM NI_NUMERICHOST NIx_NOSERV);
 use Cwd qw(abs_path);
 use Sys::Syslog qw(openlog syslog);
@@ -4647,8 +4649,6 @@ sub _tn_backup_storage_cfg {
     mkdir $dir;
     chmod 0700, $dir;
 
-    my $dest = $dir . '/storage.cfg.pre-migrate.' . time();
-
     # A plain read, not PVE::Tools::file_get_contents(): that helper also
     # doubles as this plugin's own .members reader (see
     # _tn_cluster_secrets_ready()), and this is a generic file - it has no
@@ -4660,6 +4660,39 @@ sub _tn_backup_storage_cfg {
         $content = <$fh>;
         close($fh);
     }
+
+    # G2 (QA round 6, Codex): a name unique enough that two backups never
+    # collide, and CLAIMED exclusively rather than merely checked for
+    # existence first (a plain "does this name exist? no -> write it" has
+    # a TOCTOU race between the check and the write). time() alone
+    # collides trivially: two migrate_priv_secrets() calls for two
+    # different storages in the same wall-clock second (concurrent
+    # admin action, or a test suite calling this in a tight loop) would
+    # otherwise silently overwrite the first backup with the second,
+    # exactly the failure mode a rollback snapshot exists to prevent.
+    # Appending $$ still collides if the SAME long-lived process calls
+    # this twice within one second (a single migrate_priv_secrets() run
+    # already takes at most one backup regardless of how many secrets it
+    # moves - see its own caller - but nothing stops two separate CLI
+    # invocations for two different storages from landing in the same
+    # second). A short random suffix, tried a bounded number of times
+    # with a real O_EXCL open, closes both.
+    my $dest;
+    for (1 .. 20) {
+        my $candidate = sprintf('%s/storage.cfg.pre-migrate.%d.%d.%04x',
+            $dir, time(), $$, int(rand(0x10000)));
+        if (sysopen(my $fh, $candidate, O_WRONLY | O_CREAT | O_EXCL, 0600)) {
+            close($fh);
+            $dest = $candidate;
+            last;
+        }
+        die "cannot create backup file $candidate: $!\n" if !$!{EEXIST};
+        # EEXIST: another backup already claimed this exact name - try a
+        # fresh random suffix rather than ever overwrite it.
+    }
+    die "cannot claim a unique backup filename under $dir after 20 attempts\n"
+      if !defined($dest);
+
     PVE::Tools::file_set_contents($dest, $content, 0600, 1);
     return $dest;
 }

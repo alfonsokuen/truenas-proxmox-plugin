@@ -219,30 +219,71 @@ migration you ran before you were ready, here is the exact recipe:
 
 1. **Stop.** Do this on ONE node at a time, the same as the upgrade
    itself - never downgrade the whole cluster in one step.
-2. **Reinsert the secrets inline in `storage.cfg`.** idk20 reads
-   `tn_api_key`/`tn_chap_password` only from `storage.cfg` itself, never
-   from `/etc/pve/priv/storage` - so before downgrading the package, add
-   them back to the storage's stanza by hand, using the CURRENT values
-   from the priv files (the ones actually in effect - if you rotated a
-   key after migrating, the priv file has the new value, not whatever an
-   old backup remembers):
+2. **Reinsert the secrets inline in `storage.cfg`, INSIDE the storage's
+   own stanza.** idk20 reads `tn_api_key`/`tn_chap_password` only from
+   `storage.cfg` itself, never from `/etc/pve/priv/storage` - so before
+   downgrading the package, add them back, using the CURRENT values from
+   the priv files (the ones actually in effect - if you rotated a key
+   after migrating, the priv file has the new value, not whatever an old
+   backup remembers).
 
-   ```
-   # For each secret this storage actually has configured:
-   echo "	tn_api_key $(cat /etc/pve/priv/storage/tn-prod.pw)" >> /etc/pve/storage.cfg
-   echo "	tn_chap_password $(cat /etc/pve/priv/storage/tn-prod.chap)" >> /etc/pve/storage.cfg
-   # (tn_nvme_dhchap_secret/tn_nvme_dhchap_ctrl_secret the same way, from
-   # .dhchap/.dhchapctrl, only if this storage actually uses NVMe/TCP CHAP)
+   **Do not** `echo ... >> /etc/pve/storage.cfg` or anything else that
+   only appends to the end of the file - PVE's config format is one
+   section per `<type>: <id>` header followed by its indented lines, so a
+   line appended at the end of the file lands in whichever section
+   happens to be LAST, not necessarily this storage's own. Either edit
+   the file by hand in a text editor (open it, find the
+   `truenasplugin: <id>` line for this storage, add a tab-indented
+   `tn_api_key <value>` line directly under it, same for any other
+   secret this storage has configured), or, to script it exactly, insert
+   the line right after that specific header with a small `perl -i -pe`
+   that only ever matches inside this storage's own section:
+
+   ```bash
+   STOREID=tn-prod
+
+   # suffix:key pairs - only the ones this storage actually has a priv
+   # file for get reinserted; skip the rest.
+   for pair in pw:tn_api_key chap:tn_chap_password \
+               dhchap:tn_nvme_dhchap_secret dhchapctrl:tn_nvme_dhchap_ctrl_secret; do
+       suffix="${pair%%:*}"; key="${pair##*:}"
+       priv_file="/etc/pve/priv/storage/${STOREID}.${suffix}"
+       [[ -f "$priv_file" ]] || continue
+
+       # Value goes through the environment, not the perl source or the
+       # shell command line - a secret can contain characters ($, \, the
+       # regex's own delimiters) that would otherwise have to be escaped
+       # by hand and are easy to get wrong. The /e modifier evaluates the
+       # replacement as a Perl expression instead of interpolating it as
+       # a literal string, so a `$` or `\` INSIDE the secret's value is
+       # never misread as a capture-group backreference either.
+       STOREID="$STOREID" TN_KEY="$key" TN_VALUE="$(cat "$priv_file")" \
+           perl -i -pe '
+               s{^(truenasplugin:[ \t]+\Q$ENV{STOREID}\E[ \t]*\n)}
+                {"$1\t$ENV{TN_KEY} $ENV{TN_VALUE}\n"}e;
+           ' /etc/pve/storage.cfg
+   done
    ```
 
-   Do this as a proper edit to the storage's own stanza (the lines must
-   land inside its `truenasplugin: <id>` block, not appended to the end
-   of the file) - `pvesh get /storage/<id>` or `cat /etc/pve/storage.cfg`
-   first to see exactly where that block is. Alternatively, restore the
-   whole file from the backup `migrate-secrets` took (see above) or from
-   an installer backup (`/etc/pve/storage.cfg.bak.*`) if one exists from
-   before the migration - but check its timestamp and diff it against the
-   current file first: a stale backup can undo OTHER changes made since.
+   (Matching the header line's own trailing newline explicitly - not `$`
+   - and putting it back verbatim in the replacement avoids a subtlety of
+   Perl's `$` anchor: without `/m`, `$` also matches just before a
+   trailing newline, but `\s*` right before it can swallow that same
+   newline first, since `\s` matches `\n` too - silently producing an
+   extra blank line and losing the line break that should separate the
+   newly inserted secret from whatever came after it. Tested with a
+   secret value containing `$`, `\` and `"` to confirm none of them get
+   misinterpreted by the `/e` evaluation or corrupt a neighboring
+   storage's section.)
+
+   Verify with `cat /etc/pve/storage.cfg` (or `pvesh get
+   /storage/<storeid>`) that the new lines actually landed inside this
+   storage's own stanza, not some other one, before moving on.
+   Alternatively, restore the whole file from the backup `migrate-secrets`
+   took (see above) or from an installer backup
+   (`/etc/pve/storage.cfg.bak.*`) if one exists from before the migration
+   - but check its timestamp and diff it against the current file first:
+   a stale backup can undo OTHER changes made since.
 3. **Downgrade the package** (`apt install truenas-proxmox-plugin=<idk20
    version>`, or however this node's packages are normally pinned/rolled
    back).
