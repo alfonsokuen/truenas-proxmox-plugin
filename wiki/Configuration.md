@@ -145,6 +145,22 @@ as shown above - but matters for three things:
   `tn_nvme_dhchap_secret` and `tn_nvme_dhchap_ctrl_secret` stay optional -
   deleting any of those just turns the corresponding auth off, same as
   before.
+
+  **Mixed-version cluster warning**: rotating (or any update that touches
+  a storage with a stale inline duplicate already in `storage.cfg`) tries
+  to clean up the inline copy the same way `migrate-secrets` does - and
+  applies the exact same cluster-readiness check first. If this node
+  cannot confirm every other cluster node runs a plugin new enough to
+  read `/etc/pve/priv/storage` (idk20 and older require `tn_api_key`
+  inline and silently **skip** the storage section without it), it keeps
+  **both** copies instead of stripping the inline one, and logs a
+  warning - the priv copy is what actually gets used either way, so
+  authentication still rotates correctly; only the inline cleanup is
+  deferred. The same applies to **creating a new storage**: its key is
+  written only to the priv file, so an idk20-or-older node elsewhere in
+  the cluster will not see that storage at all until it is upgraded.
+  Upgrade every node before creating new TrueNAS storages in a
+  cluster, not just before running `migrate-secrets` on existing ones.
 - **A storage configured before this change**: any of the four still works
   exactly as before, read straight out of `storage.cfg`, for backward
   compatibility. Move them to the priv files with:

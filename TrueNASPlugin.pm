@@ -327,12 +327,20 @@ sub _rpc_error_message {
         if (defined $reason && !ref $reason) {
             $reason =~ s/\s+\z//;
             my $name = $data->{errname} // $obj->{code};
+            # Full error payload, redacted the same way as _api_call()'s
+            # request/response logging - an error body can carry the same
+            # fields a successful response would (e.g. an nvmet.host.*
+            # validation error echoing dhchap_key back).
             _log($scfg, 2, 'debug', "[TrueNAS] JSON-RPC error payload: "
-                . (ref $err ? encode_json($err) : $err));
+                . (ref $err ? encode_json(_tn_redact_structure($err)) : _tn_redact_for_log($err)));
             return 'JSON-RPC error' . (defined $name ? " [$name]" : '') . ": $reason";
         }
     }
-    return 'JSON-RPC error: ' . (ref $err ? encode_json($err) : ($err // 'unknown'));
+    # This string becomes the exception callers see (and, ultimately, what
+    # a user or support ticket may end up showing) - redact it the same
+    # way, not just the debug log above.
+    return 'JSON-RPC error: '
+        . (ref $err ? encode_json(_tn_redact_structure($err)) : _tn_redact_for_log($err // 'unknown'));
 }
 
 
@@ -1296,22 +1304,23 @@ sub _tn_priv_file {
     return _tn_priv_dir() . "/${storeid}.${suffix}";
 }
 
-# Process-local cache, so a status()/_api_call() heavy workload (every
-# TrueNAS RPC needs the API key) does not re-read pmxcfs for the same
-# secret on every single call. Keyed on "storeid\0suffix" so tn-a's .pw
-# and tn-b's .pw never collide. Deliberately NOT shared across processes
-# or persisted - a rotation from ANOTHER node, or another process on this
-# one, is picked up next time this process re-execs (every CLI invocation
-# and every pvedaemon worker request is a fresh interpreter in practice;
-# see snapshot_import_cli()'s own comment on that). What this cache
-# guarantees is narrower and easy to reason about: a rotation that
-# happens in THIS process (on_update_hook_full() writing a new value, or
-# migrate_priv_secrets() doing the same) is visible to the very next read
-# in the same process, never masked by a value cached before the write.
-my %_tn_priv_cache;
-
-sub _tn_priv_cache_key { return "$_[0]\0$_[1]"; }
-
+# No process-local cache here, deliberately - a prior version of this file
+# had one, and it was a real regression (QA round 2, Codex+Opus,
+# reproduced against a live node): pvestatd runs for DAYS without forking,
+# and pvedaemon reuses a worker for up to max_requests => 1000 requests
+# before it recycles - a cache keyed only on "have I read this before in
+# this process" never invalidates in either one. Measured effect: after
+# migrate-secrets, long-running processes on every node kept reporting
+# "API key missing" (the cache had memorized the pre-migration "nothing
+# in priv" answer as permanent); a rotation never took effect (the cache
+# kept serving the revoked key); and _tn_read_secret()'s conflict guard in
+# on_update_hook_full() used the cache as proof a priv file existed, which
+# could delete a storage's only inline copy based on a stale cached
+# answer. PBSPlugin.pm has the same shape of problem (a busy pvestatd
+# calling pbs_get_password() constantly) and solves it the same way this
+# file now does: read the file fresh every time. A single
+# PVE::Tools::file_read_firstline() call is cheap; a permanently-wrong
+# in-memory answer is not.
 sub _tn_priv_write {
     my ($storeid, $suffix, $value) = @_;
     die "cannot store secret: no storage ID given\n" if !defined($storeid) || $storeid eq '';
@@ -1319,7 +1328,6 @@ sub _tn_priv_write {
     mkdir $dir;
     my $file = _tn_priv_file($storeid, $suffix);
     PVE::Tools::file_set_contents($file, "$value\n", 0600, 1);
-    $_tn_priv_cache{ _tn_priv_cache_key($storeid, $suffix) } = $value;
     return $file;
 }
 
@@ -1327,7 +1335,6 @@ sub _tn_priv_delete {
     my ($storeid, $suffix) = @_;
     return if !defined($storeid) || $storeid eq '';
     my $file = _tn_priv_file($storeid, $suffix);
-    delete $_tn_priv_cache{ _tn_priv_cache_key($storeid, $suffix) };
     return if !defined($file);
     unlink($file);
     return;
@@ -1337,17 +1344,24 @@ sub _tn_priv_read {
     my ($storeid, $suffix) = @_;
     return undef if !defined($storeid) || $storeid eq '';
 
-    my $key = _tn_priv_cache_key($storeid, $suffix);
-    return $_tn_priv_cache{$key} if exists $_tn_priv_cache{$key};
-
     my $file = _tn_priv_file($storeid, $suffix);
-    my $value;
-    if (defined($file) && -e $file) {
-        my $line = PVE::Tools::file_read_firstline($file);
-        $value = (defined($line) && $line ne '') ? $line : undef;
-    }
-    $_tn_priv_cache{$key} = $value;
-    return $value;
+    return undef if !defined($file) || !-e $file;
+    my $line = PVE::Tools::file_read_firstline($file);
+    return undef if !defined($line) || $line eq '';
+    return $line;
+}
+
+# Real, uncached existence check for a priv file - used where a decision
+# must be based on the file actually being there RIGHT NOW (e.g. "is it
+# safe to delete the only other copy of this secret"), not on whatever
+# _tn_priv_read() last happened to see. Since _tn_priv_read() is itself
+# uncached now, this is equivalent to `defined(_tn_priv_read(...))`, but
+# named separately so a call site reads as a deliberate existence check,
+# not a value read whose result happens to be discarded.
+sub _tn_priv_exists {
+    my ($storeid, $suffix) = @_;
+    my $file = _tn_priv_file($storeid, $suffix);
+    return defined($file) && -e $file;
 }
 
 # Generic set/delete/read-with-fallback over any key in %TN_SENSITIVE_SUFFIX.
@@ -1469,6 +1483,25 @@ sub on_add_hook {
         delete $scfg->{$opt_key};
     }
 
+    # A brand-new storage's key exists ONLY in priv, nothing inline at
+    # all - so an idk20-or-older node elsewhere in the same cluster would
+    # silently SKIP this storage's section entirely the moment it reads
+    # this write (same failure mode R8/H3 guard against on rotation and
+    # migration). Unlike those, creation is not gated on this - refusing
+    # to create a storage because of what some OTHER node might do would
+    # be a much bigger behavior change than this fix warrants, and a
+    # brand-new storage has no working state on old nodes to lose either
+    # way. Best-effort, non-fatal warning only: wrapped in eval so a
+    # failure of the check itself (no cluster, no SSH, whatever) never
+    # blocks a legitimate creation.
+    eval {
+        my $check = __PACKAGE__->_tn_cluster_secrets_ready();
+        syslog('warning', "[TrueNAS] Storage '$storeid': created with its key only in "
+          . "/etc/pve/priv/storage - $check->{reason}. Any such node will not see this "
+          . "storage at all until it runs a plugin that reads priv files.")
+            if !$check->{ready};
+    };
+
     return;
 }
 
@@ -1488,6 +1521,17 @@ sub on_add_hook {
 # the _full path. The new value passed in %sensitive (when the host is new
 # enough to extract it at all) still reaches the priv file correctly
 # either way; only the stale-copy cleanup is what this shape cannot do.
+#
+# Concretely, after a rotation on a host this old: `pvesm set <id>
+# --tn_api_key NEW` writes NEW to the priv file (this always works), but
+# the OLD key is still visible, inline, in storage.cfg - readable via
+# `pvesh get /storage/<id>` exactly like before this whole fix. This is
+# cosmetic, not a functional break: _tn_read_secret()'s priority rule
+# means priv wins, so every actual TrueNAS API call already authenticates
+# with NEW, never with the stale OLD text sitting in storage.cfg. Run
+# `truenas-proxmox-manage migrate-secrets <storeid>` afterward (once every
+# cluster node is confirmed ready - see _tn_cluster_secrets_ready()) to
+# remove the stale OLD text for real.
 sub on_update_hook {
     my ($class, $storeid, $update, %sensitive) = @_;
     return $class->on_update_hook_full($storeid, undef, $update, undef, \%sensitive);
@@ -1512,7 +1556,7 @@ sub on_update_hook_full {
         my $key = $sensitive->{tn_api_key};
         if (defined($key) && $key ne '') {
             _tn_set_secret($storeid, 'tn_api_key', $key);
-            delete $scfg->{tn_api_key} if defined $scfg;
+            _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key');
         } else {
             # `pvesm set <id> --delete tn_api_key` or an explicit empty
             # value. A TrueNAS storage cannot authenticate without a key at
@@ -1522,15 +1566,28 @@ sub on_update_hook_full {
               . "requires an API key at all times. Set a replacement with "
               . "--tn_api_key instead of deleting it.\n";
         }
-    } elsif (defined($scfg) && defined(_tn_priv_read($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key}))) {
+    } elsif (defined($scfg) && defined($scfg->{tn_api_key}) && $scfg->{tn_api_key} ne ''
+             && _tn_priv_exists($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key})) {
         # This particular call did not touch the key, but a priv copy
         # already exists (migrated earlier, or rotated before) and $scfg
-        # still carries a stale inline duplicate (e.g. from hand-editing
+        # still carries an inline duplicate (e.g. from hand-editing
         # storage.cfg after migrating) - self-heal it on any update that
-        # happens to pass through here. Guarded on the priv file actually
-        # existing: never delete the one and only copy of an unmigrated
-        # storage's key just because an unrelated field changed.
-        delete $scfg->{tn_api_key};
+        # happens to pass through here. _tn_priv_exists() is a real,
+        # uncached read of the file done right now: a cached "yes it
+        # exists" answer used to let this branch delete the only copy of
+        # an unmigrated storage's key on a stale premise (QA round 2).
+        my $priv_val = _tn_priv_read($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key});
+        if (defined($priv_val) && $priv_val ne $scfg->{tn_api_key}) {
+            # R9: the two disagree - never discard that silently. priv is
+            # authoritative (see _tn_read_secret()'s priority rule); this
+            # only logs it, the same "which one is actually in effect"
+            # information migrate_priv_secrets()'s conflict-kept-priv
+            # gives an operator running it by hand.
+            syslog('warning', "[TrueNAS] Storage '$storeid': tn_api_key inline in "
+              . "storage.cfg differs from the priv file - the priv file is what this "
+              . "plugin actually uses, the inline copy is stale");
+        }
+        _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key');
     }
 
     for my $opt_key (@TN_OPTIONAL_SECRETS) {
@@ -1539,18 +1596,59 @@ sub on_update_hook_full {
             my $value = $sensitive->{$opt_key};
             if (defined($value) && $value ne '') {
                 _tn_set_secret($storeid, $opt_key, $value);
+                _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key);
             } else {
                 # Optional: removing it just disables the corresponding
                 # auth on the next (re)connect, same as it always could.
+                # No cluster-readiness gate on this branch: an OLDER node
+                # never required this property in the first place (it was
+                # optional even before idk21), so an old node losing the
+                # inline copy of something it already treated as "not
+                # configured" is not the storage-vanishes failure mode
+                # tn_api_key has - see _tn_strip_inline_if_cluster_ready().
                 _tn_delete_secret($storeid, $opt_key);
+                delete $scfg->{$opt_key} if defined($scfg);
             }
-            delete $scfg->{$opt_key} if defined $scfg;
-        } elsif (defined($scfg) && defined(_tn_priv_read($storeid, $suffix))) {
-            delete $scfg->{$opt_key};
+        } elsif (defined($scfg) && defined($scfg->{$opt_key}) && $scfg->{$opt_key} ne ''
+                 && _tn_priv_exists($storeid, $suffix)) {
+            my $priv_val = _tn_priv_read($storeid, $suffix);
+            if (defined($priv_val) && $priv_val ne $scfg->{$opt_key}) {
+                syslog('warning', "[TrueNAS] Storage '$storeid': $opt_key inline in "
+                  . "storage.cfg differs from the priv file - the priv file is what this "
+                  . "plugin actually uses, the inline copy is stale");
+            }
+            _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key);
         }
     }
 
     return;
+}
+
+# R8 (QA round 3): stripping a secret's inline fallback out of storage.cfg
+# is only safe once every cluster node can be confirmed to read priv files
+# - idk20 and older require tn_api_key inline and silently SKIP the whole
+# storage section without it, so an ordinary rotation or self-heal that
+# removed it would make the storage vanish on any node still that old,
+# exactly the failure mode migrate_priv_secrets() already guards against
+# explicitly. This runs inside an ordinary update, not an operator-invoked
+# migration, so there is no --all-nodes-upgraded override here: on an
+# unconfirmed multi-node cluster this simply keeps BOTH copies (priv
+# already wins at runtime - see _tn_read_secret()) and logs why, rather
+# than silently leaving part of the cluster with a broken storage. See
+# wiki/Configuration.md for the operator-facing version of this warning.
+sub _tn_strip_inline_if_cluster_ready {
+    my ($storeid, $scfg, $key) = @_;
+    return if !defined($scfg) || !defined($scfg->{$key}) || $scfg->{$key} eq '';
+
+    my $check = __PACKAGE__->_tn_cluster_secrets_ready();
+    if (!$check->{ready}) {
+        syslog('warning', "[TrueNAS] Storage '$storeid': keeping $key inline in "
+          . "storage.cfg alongside its priv copy - $check->{reason}. The priv file is "
+          . "what this plugin actually uses; run 'truenas-proxmox-manage migrate-secrets "
+          . "$storeid' once every node is confirmed ready, to remove the inline copy.");
+        return;
+    }
+    delete $scfg->{$key};
 }
 
 # Called on deletion of the storage, and also as cleanup if on_add_hook
@@ -1808,7 +1906,13 @@ sub _ws_rpc {
         my $decoded = eval { decode_json($resp) };
         if ($@ || !$decoded) {
             my $len = length($resp // '');
-            my $preview = substr($resp // '', 0, 200);
+            # A response carrying dhchap_key/dhchap_ctrl_key (e.g.
+            # nvmet.host.query) that happens to fail decoding must not put
+            # those in this error-level log either - redact the raw text
+            # the same way the structured logging in _api_call() does for
+            # a successfully decoded one; there is no decoded structure to
+            # walk here, so this goes through the string-level fallback.
+            my $preview = _tn_redact_for_log(substr($resp // '', 0, 200));
             _log(undef, 0, 'err', "[TrueNAS] JSON decode failed (len=$len): $@ Preview: $preview");
             die "JSON-RPC decode failed: $@";
         }
@@ -2631,22 +2735,84 @@ sub _scfg_accept_legacy_keys($scfg) {
 # so without this, turning on verbose debug logging would write those
 # straight to syslog in the clear - the same class of exposure this whole
 # file's 'sensitive-properties' work exists to close, just at the log
-# layer instead of storage.cfg. Same technique
-# tools/truenas-plugin-broker's own logging uses: a regex over the ALREADY
-# JSON-ENCODED string, not a walk of the decoded structure - TrueNAS API
-# params are arbitrarily nested arrays/hashes with no fixed shape, so a
-# walk would still have to match on the same key names at every level;
-# the regex does that once, regardless of nesting depth. Matches only a
-# JSON *key* named exactly one of these (quote-anchored on both sides), so
-# it cannot mis-fire on an unrelated string that merely contains one of
-# these words.
+# layer instead of storage.cfg. Matches a hash key named exactly one of
+# these (case-insensitively), so it cannot mis-fire on an unrelated string
+# that merely contains one of these words.
 my $TN_LOG_REDACT_KEYS = qr/api_key|password|passwd|secret|token|dhchap_key|dhchap_ctrl_key/i;
+
+# Walks a decoded Perl structure (from a TrueNAS API call's params or
+# response - arbitrarily nested arrays/hashes with no fixed shape) and
+# replaces the VALUE of any hash key matching $TN_LOG_REDACT_KEYS,
+# returning a redacted deep copy. Applied to the data BEFORE encode_json(),
+# not to the JSON text afterward with a regex: a regex over already-quoted
+# JSON has to reconstruct exactly what "one JSON string value" looks like
+# (escaped quotes, escaped backslashes, unicode escapes...) or it silently
+# stops at the first escaped quote inside the value and leaves the rest
+# unredacted (found in review: {"password":"a\"SECRET"} leaked SECRET
+# through the previous regex-only version of this function). Walking the
+# actual Perl values never has that problem, because there is no quoting
+# to get wrong - a value is redacted or it isn't, regardless of what
+# characters it contains.
+sub _tn_redact_structure {
+    my ($data) = @_;
+    my $ref = ref($data);
+
+    if ($ref eq 'HASH') {
+        my %out;
+        for my $k (keys %$data) {
+            $out{$k} = ($k =~ /^(?:$TN_LOG_REDACT_KEYS)$/)
+                ? (defined($data->{$k}) ? '<redacted>' : $data->{$k})
+                : _tn_redact_structure($data->{$k});
+        }
+        return \%out;
+    }
+    if ($ref eq 'ARRAY') {
+        return [ map { _tn_redact_structure($_) } @$data ];
+    }
+    # Scalars (and any other ref type JSON::PP can encode, e.g. JSON::PP::
+    # Boolean) pass through unchanged - only a HASH key name decides
+    # whether a value gets redacted.
+    return $data;
+}
+
+# String-level fallback for a caller that only has JSON TEXT already
+# formed (no decoded structure to walk) - e.g. a raw, possibly malformed
+# request line that failed to decode at all. The value pattern matches a
+# complete JSON string body: any run of characters that are neither an
+# unescaped quote nor a backslash, OR a backslash followed by one
+# character (an escaped quote `\"` among them) - the same class of bug
+# noted above for the string case specifically: a naive `[^"]*` stops at
+# the first escaped quote and leaves the remainder of the value exposed.
+my $TN_JSON_STRING_VALUE = qr/(?:[^"\\]|\\.)*+/;
 
 sub _tn_redact_for_log {
     my ($json_text) = @_;
     return $json_text if !defined $json_text;
-    $json_text =~ s/("(?:$TN_LOG_REDACT_KEYS)"\s*:\s*)"[^"]*"/$1"<redacted>"/g;
+    $json_text =~ s/("(?:$TN_LOG_REDACT_KEYS)"\s*:\s*)"$TN_JSON_STRING_VALUE"/$1"<redacted>"/g;
     return $json_text;
+}
+
+# Plain string/argv-shaped secrets, not JSON: PVE::Tools::run_command's own
+# error message (what ends up in $@) typically echoes the FULL argv of the
+# command it tried to run, and iscsiadm/nvme both take a CHAP/DH-HMAC-CHAP
+# secret as a plain command-line argument (`-v <chap_password>`,
+# `--dhchap-secret <secret>`) - so a failed run_command() call for either
+# put the secret straight into whatever logged $@, with no JSON structure
+# to redact by key name at all (found in review: _try_run()'s carp() of a
+# failed iscsiadm CHAP update, and _nvme_connect()'s warning log of a
+# failed `nvme connect --dhchap-secret ...`). Given the literal secret
+# value(s) involved, a plain substring replace is exact - no pattern to
+# get wrong, unlike matching "a JSON string value" or "a shell-quoted
+# argument".
+sub _tn_redact_secrets_in_text {
+    my ($text, $secrets) = @_;
+    return $text if !defined($text) || !$secrets || !@$secrets;
+    for my $s (@$secrets) {
+        next if !defined($s) || $s eq '';
+        my $quoted = quotemeta($s);
+        $text =~ s/$quoted/<redacted>/g;
+    }
+    return $text;
 }
 
 sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
@@ -2655,7 +2821,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
 
     # Level 2: Verbose - log all API calls with parameters
     if ($ws_params && ref($ws_params) eq 'ARRAY' && @$ws_params) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=persistent, params=" . _tn_redact_for_log(encode_json($ws_params)));
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=persistent, params=" . encode_json(_tn_redact_structure($ws_params)));
     } else {
         _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=persistent");
     }
@@ -2682,7 +2848,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
         }
 
         # Level 2: Verbose - log API response
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? _tn_redact_for_log(encode_json($res)) : ($res // 'undef')));
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json(_tn_redact_structure($res)) : ($res // 'undef')));
 
         return $res;
     }, $retry_opts);
@@ -4207,44 +4373,77 @@ sub snapshot_import_cli(@argv) {
 # storage vanish from `pvesm status` on that node the moment the change
 # lands in /etc/pve - a rolling-upgrade footgun, not a hypothetical.
 #
-# Verifies every cluster node either by asking it directly (does its
-# installed plugin have migrate_priv_secrets() at all - the capability
-# that matters, not a version string to parse) over SSH, the same
-# mechanism install.sh already uses to push the plugin to other nodes.
+# Verifies every cluster node by asking it directly (does its installed
+# plugin have migrate_priv_secrets() at all - the capability that matters,
+# not a version string to parse), in-process for the local node and over
+# SSH for the rest, connecting by IP - NOT by node name. A node's own
+# hostname is not guaranteed to resolve anywhere near the cluster network
+# (measured on a real cluster: pve1/pve2/pve3 resolved via the system's
+# DNS/hosts to unrelated Cloudflare IPv6 addresses, not the corosync ring -
+# `ssh root@$name` could never succeed there, so this guard could never
+# approve a migration on that cluster at all). The IP comes from
+# /etc/pve/.members - pmxcfs's own live membership file, always current,
+# the same source install.sh's get_cluster_nodes() reads for the same
+# reason. -o HostKeyAlias=$name still keys host-key verification by name,
+# not IP, so a node whose IP changes later does not look like a new host.
 # Returns 'ready' with no problem nodes, or an explanation of exactly what
-# could not be confirmed - never a silent guess.
+# could not be confirmed - never a silent guess, and never approved on
+# malformed or empty membership data (fails closed).
 sub _tn_cluster_secrets_ready {
     my ($class) = @_;
 
     require PVE::Tools;
 
-    my $nodes_json = '';
-    my $listed = eval {
-        PVE::Tools::run_command(['pvesh', 'get', '/nodes', '--output-format', 'json'],
-            outfunc => sub { $nodes_json .= $_[0] }, timeout => 15);
-        1;
-    };
-    if (!$listed) {
-        return { ready => 0,
-            reason => "could not list cluster nodes ('pvesh get /nodes' failed: $@)" };
+    my $members_file = '/etc/pve/.members';
+    my $raw = eval { PVE::Tools::file_get_contents($members_file) };
+    if (!defined($raw)) {
+        my $err = $@ || 'unknown error';
+        return { ready => 0, reason => "could not read $members_file: $err" };
     }
 
-    my $nodes = eval { decode_json($nodes_json) };
-    if ($@ || ref($nodes) ne 'ARRAY') {
-        return { ready => 0, reason => "could not parse 'pvesh get /nodes' output" };
+    my $members = eval { decode_json($raw) };
+    if ($@ || ref($members) ne 'HASH' || ref($members->{nodelist}) ne 'HASH') {
+        return { ready => 0, reason => "could not parse $members_file" };
     }
 
-    # A standalone host (no corosync cluster) lists only itself - nothing
-    # rolling to guard against.
-    return { ready => 1 } if @$nodes <= 1;
+    my $nodelist = $members->{nodelist};
+    my $local_node = $members->{nodename};
+
+    # Fail closed on data that looks wrong rather than guessing "probably
+    # fine" - an empty nodelist is a parsing/data problem, not evidence of
+    # a genuinely standalone host.
+    my @names = keys %$nodelist;
+    return { ready => 0, reason => "$members_file lists no nodes at all" }
+        if !@names;
+
+    # A GENUINELY standalone host (no corosync cluster) lists only itself,
+    # with a real name - nothing rolling to guard against.
+    return { ready => 1 }
+        if @names == 1 && defined($names[0]) && $names[0] ne '';
 
     my @problem;
-    for my $n (@$nodes) {
-        my $name = $n->{node};
-        next if !defined($name) || $name eq '';
+    for my $name (sort @names) {
+        if (!defined($name) || $name eq '') {
+            push @problem, '(unnamed node entry in cluster membership - cannot verify)';
+            next;
+        }
+        my $n = $nodelist->{$name};
 
-        if (($n->{status} // '') ne 'online') {
+        if (defined($local_node) && $name eq $local_node) {
+            # No need to SSH to ourselves - the answer is right here.
+            push @problem, "$name (this node's own plugin is too old to confirm)"
+                if !__PACKAGE__->can('migrate_priv_secrets');
+            next;
+        }
+
+        if (!$n->{online}) {
             push @problem, "$name (offline, cannot verify)";
+            next;
+        }
+
+        my $ip = $n->{ip};
+        if (!defined($ip) || $ip eq '') {
+            push @problem, "$name (no IP in cluster membership, cannot verify)";
             next;
         }
 
@@ -4252,14 +4451,20 @@ sub _tn_cluster_secrets_ready {
         my $ok = eval {
             PVE::Tools::run_command([
                 'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
-                '-o', 'StrictHostKeyChecking=accept-new', "root\@$name",
+                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', "HostKeyAlias=$name", "root\@$ip",
                 'perl -MPVE::Storage::Custom::TrueNASPlugin -e '
                   . '"print(PVE::Storage::Custom::TrueNASPlugin->can(q(migrate_priv_secrets)) ? 1 : 0)"',
             ], outfunc => sub { $probe_out .= $_[0] }, timeout => 15);
             1;
         };
+        # A bare `eq '1'` would fail on anything SSH itself prints around
+        # the probe's own output - a login banner/MOTD some sshd configs
+        # emit even under BatchMode, or the trailing newline print()
+        # already appends - none of which mean the node answered '0'.
+        # /^1$/m matches '1' alone on any line, tolerant of both.
         push @problem, "$name (unreachable or plugin too old to confirm)"
-            if !$ok || $probe_out ne '1';
+            if !$ok || $probe_out !~ /^1$/m;
     }
 
     return { ready => 1 } if !@problem;
@@ -4973,11 +5178,20 @@ sub _probe_portal($portal) {
 }
 
 # ======== Safe wrappers for external commands ========
+# $redact (optional, 4th arg): an arrayref of literal secret VALUES that
+# might appear in $cmd's argv - PVE::Tools::run_command's own failure
+# message typically echoes the full command line it tried to run, so a
+# failed CHAP/DH-HMAC-CHAP command would otherwise put the secret straight
+# into this carp() (see _tn_redact_secrets_in_text()).
 sub _try_run {
-    my ($cmd, $errmsg) = @_;
+    my ($cmd, $errmsg, $redact) = @_;
     my $ok = 1;
     eval { run_command($cmd, errmsg => $errmsg, outfunc => sub {}, errfunc => sub {}); };
-    if ($@) { carp (($errmsg // 'cmd failed').": $@"); $ok = 0; }
+    if ($@) {
+        my $msg = _tn_redact_secrets_in_text(($errmsg // 'cmd failed') . ": $@", $redact);
+        carp($msg);
+        $ok = 0;
+    }
     return $ok;
 }
 sub _run_lines {
@@ -5091,7 +5305,7 @@ sub _iscsi_discover {
                     ['discovery.sendtargets.auth.password',$chap_password]) {
             _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,
                       '-o','update','-n',$kv->[0],'-v',$kv->[1]],
-                     "iSCSI discoverydb auth update failed ($label)");
+                     "iSCSI discoverydb auth update failed ($label)", [$chap_password]);
         }
         _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,'--discover'],
                  "iSCSI discovery failed ($label)");
@@ -5145,7 +5359,7 @@ sub _iscsi_login_all($scfg) {
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.authmethod','-v','CHAP'],
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{tn_chap_user}],
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$chap_password],
-            ) { _try_run($cmd, "iscsiadm CHAP update failed"); }
+            ) { _try_run($cmd, "iscsiadm CHAP update failed", [$chap_password]); }
         }
         # Skip login if this portal is already connected
         next if _portal_connected($scfg, $portal, \@session_lines);
@@ -6303,7 +6517,13 @@ sub _nvme_connect {
                 next;
             } else {
                 my $detail = $connect_stderr ? " (stderr: $connect_stderr)" : '';
-                _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: failed to connect to portal $portal: $@$detail");
+                # $@ is run_command()'s own failure message, which echoes
+                # the full argv it tried to exec - including
+                # --dhchap-secret/--dhchap-ctrl-secret when either is set
+                # (R10: the same class of leak _try_run() redacts for
+                # iscsiadm CHAP failures).
+                my $failure = _tn_redact_secrets_in_text("$@$detail", [$dhchap_secret, $dhchap_ctrl_secret]);
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: failed to connect to portal $portal: $failure");
                 # time() again, not $now: with several dead portals the loop can
                 # have been running for tens of seconds by here, which would
                 # shorten the effective backoff window.

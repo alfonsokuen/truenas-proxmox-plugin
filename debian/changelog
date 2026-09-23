@@ -109,7 +109,112 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
     (t/installer), la redaccion del log de debug, y el guard de
     actualizacion en marcha de migrate-secrets.
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 15:00:00 -0500
+  * QA ronda 2 (Codex BLOCK, Opus WARNING, ambos con reproduccion real):
+    la cache de proceso introducida en una revision anterior de este
+    mismo cambio era una REGRESION, no una mejora - pvestatd corre dias
+    sin fork y pvedaemon reutiliza un worker hasta max_requests=>1000, asi
+    que una cache que solo sabe "ya lei esto antes en este proceso" nunca
+    se invalida en ninguno de los dos. Efecto medido: tras migrate-secrets
+    los procesos largos de todos los nodos seguian reportando "API key
+    missing" (la cache habia memorizado para siempre la respuesta "nada en
+    priv" de antes de migrar); una rotacion nunca llegaba a tomar efecto
+    (la cache seguia sirviendo la key revocada); y la guarda de
+    autolimpieza usaba la cache como prueba de que existia copia en priv,
+    lo que podia borrar la unica copia de una storage sin migrar sobre una
+    respuesta cacheada y obsoleta. Eliminada por completo - cada lectura
+    va al fichero real, igual que pbs_get_password() de PBSPlugin.pm - y
+    la guarda de autolimpieza ahora comprueba la existencia REAL del
+    fichero priv (lectura sin cache) justo antes de decidir si borra el
+    inline. La key sigue formando parte de la clave de cache de
+    %_ws_connections (sin cambios: ya lo hacia via _tn_api_key()), asi que
+    una rotacion invalida la conexion WS como siempre.
+
+  * La autolimpieza de la copia inline (en rotacion y en cualquier
+    actualizacion que la dispare, no solo en migrate-secrets) aplica ahora
+    la MISMA politica de cluster que migrate-secrets: si hay mas de un
+    nodo y no se puede confirmar que todos corren un plugin que lee
+    /etc/pve/priv/storage, se conservan AMBAS copias (la de priv es la que
+    de verdad se usa en runtime) y se avisa por syslog, en vez de borrar
+    el inline y hacer desaparecer la storage en un nodo idk20 del mismo
+    cluster - incluye la creacion de storages nuevas (aviso no bloqueante:
+    la key ya nace solo en priv). Si la copia inline difiere de la de priv
+    al hacer la autolimpieza, se conserva priv y se registra un aviso
+    explicito (el mismo "conflict-kept-priv" que ya tenia migrate-secrets)
+    en vez de descartar la diferencia en silencio.
+
+  * La guarda de cluster conectaba por NOMBRE de nodo (`ssh
+    root@$nombre`); en un cluster real medido, los nombres resolvian via
+    el DNS del sistema a direcciones IPv6 de Cloudflare, no a la red del
+    cluster - la guarda nunca podia aprobar nada ahi. Ahora usa la IP de
+    `/etc/pve/.members` (el fichero de membresia que pmxcfs ya mantiene
+    vivo, la misma fuente que get_cluster_nodes() de install.sh), con
+    `-o HostKeyAlias=$nombre` para que la verificacion de host key siga
+    indexada por nombre y no por IP; el nodo local se comprueba en
+    proceso (->can), sin SSH a si mismo. La guarda ahora falla cerrado
+    ante un inventario vacio o una entrada sin nombre, en vez de
+    aprobarlos por descarte. La comprobacion del ping SSH tolera un
+    banner/MOTD alrededor de la respuesta (antes exigia igualdad exacta).
+
+  * install.sh: remove_storage_config comprueba el resultado de `mv` antes
+    de borrar los secretos en priv (antes los borraba aunque el mv
+    fallara, dejando la storage sin key en ningun sitio). Corregido
+    "value: unbound variable" en get_storage_config_value al leer una
+    propiedad no sensible bajo `set -u` (variable local sin inicializar).
+    get_all_storage_config_values ya no aborta con `set -euo pipefail` al
+    leer una storage migrada o legacy sin CHAP (un grep sin resultados en
+    un pipeline hacia abortar la funcion entera antes de llegar al
+    fallback de priv); su valor de retorno tampoco depende ya de si
+    `tn_chap_password` esta presente. menu_edit_storage guarda la key
+    previa en priv (o su ausencia) antes de rotar, y la restaura si
+    update_storage_config falla a mitad de camino - sin esto, un update
+    fallido dejaba priv con la key NUEVA y storage.cfg con la
+    configuracion VIEJA.
+
+  * Redaccion de logs: pasaba por una regexp sobre el JSON ya codificado,
+    que se detenia en la primera comilla escapada dentro de un valor y
+    dejaba expuesto el resto (`{"password":"a\"SECRET"}` filtraba
+    SECRET). _api_call() ahora redacta la ESTRUCTURA Perl decodida antes
+    de encode_json(), recorriendo hashes/arrays y sustituyendo el valor de
+    cualquier clave sensible - sin regexp de por medio, no hay comillas
+    que reconstruir mal. El fallback de texto crudo (para cuando no hay
+    estructura decodificada: un decode_json fallido, o
+    tools/truenas-plugin-broker que corre standalone) usa un patron de
+    valor tolerante a comillas escapadas. Ampliados dos puntos de log mas
+    que se habian quedado sin redactar: el preview de 200 bytes cuando
+    falla el decode JSON, y el payload de error completo de
+    _rpc_error_message (incluido el string que termina como mensaje de
+    excepcion visible al usuario, no solo el log de debug).
+    tools/truenas-plugin-broker amplia su propia redaccion de
+    "api_key" a la misma lista de claves que el plugin.
+
+  * _try_run() (usado por las actualizaciones CHAP de iscsiadm) y el log
+    de fallo de `nvme connect --dhchap-secret` redactan ahora el secreto
+    literal antes de loguear el mensaje de error - run_command() de PVE
+    incluye el argv completo del comando fallido en su excepcion, asi que
+    un fallo de iscsiadm/nvme con la contraseña CHAP o el secreto
+    DH-HMAC-CHAP en la linea de comandos la escribia en claro en el
+    journal.
+
+  * Documentado explicitamente que en un host con api()<13 (anterior a
+    libpve-storage-perl 9.0.16) rotar la key deja el valor VIEJO visible
+    inline en storage.cfg (no hay referencia viva a $scfg que limpiar en
+    ese camino) pero el runtime ya usa el de priv - `migrate-secrets`
+    despues de rotar limpia el inline viejo para siempre.
+
+  * Tests: invertido el test de la cache eliminada (ahora demuestra que
+    una rotacion hecha por un SEGUNDO proceso perl real, no un fork, se
+    ve de inmediato); cobertura nueva para la guarda de cluster via
+    /etc/pve/.members (nodo local en proceso, IP en vez de nombre,
+    inventario vacio/entrada sin nombre fallan cerrado, banner SSH
+    tolerado), la autolimpieza con guarda de cluster y aviso de
+    conflicto, la redaccion estructural (incluida la comilla escapada), y
+    los cinco arreglos de install.sh (mv sin comprobar, variable sin
+    inicializar, pipeline que aborta, rollback de rotacion) - cada uno
+    confirmado en ROJO contra el commit anterior a esta ronda y en VERDE
+    despues del arreglo, con la suite completa corrida en el nodo real
+    (solo los 13 fallos preexistentes).
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 18:00:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
 
