@@ -307,6 +307,18 @@ What that means afterwards, and why it is opt-in:
 - A section records the configuration as of the import, not as of the
   snapshot: rolling back to one restores the disks of that moment with
   today's configuration, and without RAM (the VM starts cold).
+- They are **crash-consistent, not application-consistent**. TrueNAS does
+  not know a guest is running on the zvol, so there is no guest-agent
+  `fs-freeze`: rolling back to one is the guest losing power at that
+  instant. Journaling filesystems normally come back clean; databases may
+  need their own recovery. When you need a known-good state, take a PVE
+  snapshot with the QEMU guest agent enabled and treat imported ones as a
+  safety net.
+- PVE only rolls back to the newest snapshot, so importing a periodic one
+  newer than your deliberate PVE snapshot puts it in the way of that
+  rollback (it was already in the way, invisibly, before the import). Use
+  `--match` to adopt only the snapshots you name on purpose, or keep
+  periodic snapshot tasks off the zvols that back PVE guests.
 - Only snapshots present on every disk of the VM, with a name PVE accepts
   (`pve-configid`: `[a-z][a-z0-9_-]+`, at least 2 and at most 40
   characters, and not `vzdump` / `current` / `pending` / `__base__` /

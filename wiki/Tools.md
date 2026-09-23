@@ -47,6 +47,10 @@ into its Proxmox configuration, so the Snapshots tab lists them and
 `qm delsnapshot` / `pct delsnapshot` can remove them. Without it they are invisible to PVE
 and block `qm rollback` with `is not most recent snapshot`.
 
+> **Consistency:** snapshots taken on TrueNAS are crash-consistent (no
+> guest-agent `fs-freeze`, no RAM state). See
+> [Best Practices](Best-Practices.md#snapshots-taken-on-truenas) before adopting periodic ones.
+
 | Flag | Effect |
 |---|---|
 | `--dry-run` | Print the plan, write nothing |
