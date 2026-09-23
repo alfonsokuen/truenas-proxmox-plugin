@@ -117,7 +117,7 @@ sub run_bash_fn {
 
 SKIP: {
     my $bash_ok = eval { system("bash -c 'source \"$SCRIPT\" 2>/dev/null; exit 0'") == 0 };
-    skip 'install.sh cannot be sourced in this shell', 13 unless $bash_ok;
+    skip 'install.sh cannot be sourced in this shell', 29 unless $bash_ok;
 
     my $priv_dir   = tempdir(CLEANUP => 1);
     my $cfg_dir    = tempdir(CLEANUP => 1);
@@ -293,6 +293,69 @@ SKIP: {
         is(call_cat("$priv_dir/tn-r2.pw"), 'SURVIVES',
             '  ...and the priv secret is NOT deleted when storage.cfg could not be updated');
     }
+
+    # ------------------------------------------------------------- F2 ---
+    # generate_storage_config()'s new (optional) 14th argument: only when
+    # a caller passes it non-empty does the generated block carry
+    # tn_api_key inline at all. Every existing call site (guided create,
+    # automated provisioning) never passes it - confirm the default
+    # behavior (omit tn_api_key) is completely unchanged.
+    {
+        my (undef, $out_default) = run_bash_fn($env, $SCRIPT,
+            q{generate_storage_config tn-gen 192.0.2.20 UNUSED tank/pve iqn.test 192.0.2.20:3260});
+        unlike($out_default, qr/^\ttn_api_key\b/m,
+            'F2: generate_storage_config omits tn_api_key by default, same as before this fix');
+
+        my (undef, $out_inline) = run_bash_fn($env, $SCRIPT,
+            q{generate_storage_config tn-gen 192.0.2.20 UNUSED tank/pve iqn.test 192.0.2.20:3260 } .
+            q{16K 1 '' '' iscsi '' '' INLINE-SYNCED-KEY});
+        like($out_inline, qr/^\ttn_api_key INLINE-SYNCED-KEY$/m,
+            'F2: generate_storage_config writes tn_api_key inline when the 14th arg is given '
+          . '(menu_edit_storage on an unready cluster with a pre-existing inline copy)');
+    }
+
+    # storage_has_inline_secret(): does storage.cfg currently carry an
+    # inline copy of a given key for a given storage? This is what
+    # menu_edit_storage() checks BEFORE regenerating a storage's section,
+    # to decide whether the F2 14th argument above is needed at all.
+    {
+        open(my $cfh, '>', $cfg_file) or die $!;
+        print $cfh "truenasplugin: tn-inline\n\ttn_api_host 192.0.2.21\n\ttn_api_key HAS-ONE\n\ttn_dataset tank/pve\n";
+        print $cfh "truenasplugin: tn-noinline\n\ttn_api_host 192.0.2.22\n\ttn_dataset tank/pve\n";
+        close($cfh);
+
+        my ($rc_yes) = run_bash_fn($env, $SCRIPT,
+            q{storage_has_inline_secret tn-inline tn_api_key});
+        is($rc_yes, 0, 'F2: storage_has_inline_secret finds an existing inline tn_api_key');
+
+        my ($rc_no) = run_bash_fn($env, $SCRIPT,
+            q{storage_has_inline_secret tn-noinline tn_api_key});
+        isnt($rc_no, 0, '  ...and reports false for a storage with no inline copy (already migrated)');
+
+        my ($rc_missing) = run_bash_fn($env, $SCRIPT,
+            q{storage_has_inline_secret tn-does-not-exist tn_api_key});
+        isnt($rc_missing, 0, '  ...and false, not a crash, for a storage that does not even exist');
+    }
+
+    # tn_installer_cluster_ready(): shadows `perl` the same way the R2
+    # block above shadows `mv` - install.sh's real perl invocation needs a
+    # live PVE::Storage::Custom::TrueNASPlugin to answer meaningfully,
+    # which this test environment does not have; what matters here is
+    # that the bash wrapper interprets that perl call's stdout correctly,
+    # and fails CLOSED on anything that is not an exact "1".
+    {
+        my $out = `bash -c "$env source '$SCRIPT' >/dev/null 2>/dev/null; perl() { echo 1; }; if tn_installer_cluster_ready; then rc=0; else rc=\\\$?; fi; echo RC=\\\$rc" 2>/dev/null`;
+        my ($rc) = $out =~ /RC=(\d+)/;
+        is($rc, '0', 'F2: tn_installer_cluster_ready is ready when the perl check prints exactly "1"');
+
+        $out = `bash -c "$env source '$SCRIPT' >/dev/null 2>/dev/null; perl() { echo 0; }; if tn_installer_cluster_ready; then rc=0; else rc=\\\$?; fi; echo RC=\\\$rc" 2>/dev/null`;
+        ($rc) = $out =~ /RC=(\d+)/;
+        is($rc, '1', '  ...not ready when the perl check prints "0"');
+
+        $out = `bash -c "$env source '$SCRIPT' >/dev/null 2>/dev/null; perl() { exit 1; }; if tn_installer_cluster_ready; then rc=0; else rc=\\\$?; fi; echo RC=\\\$rc" 2>/dev/null`;
+        ($rc) = $out =~ /RC=(\d+)/;
+        is($rc, '1', '  ...fails CLOSED (not ready) when perl itself fails, instead of dying or defaulting to ready');
+    }
 }
 
 sub call_cat {
@@ -350,6 +413,27 @@ SKIP: {
       . 'instead of deleting the file)');
     like($menu_edit_storage_body, qr/if\s*!\s*previous_key=\$\(cat "\$priv_file"/,
         'C3: reading the previous key failing is checked before the NEW key is ever written (not silently treated as "empty")');
+}
+
+# ------------------------------------------------------------------ F2 ---
+# menu_edit_storage() regenerates a storage's ENTIRE section from
+# scratch. generate_storage_config() by default omits tn_api_key - so
+# without checking, BEFORE generating the new block, whether this storage
+# already has an inline copy AND whether the cluster is confirmed
+# upgraded, every single reconfigure through this installer would
+# unconditionally strip that inline copy, exactly the failure mode
+# TrueNASPlugin.pm's own F1 fix (this same QA round) exists to prevent on
+# the plugin side - except here it would not even be conditional on
+# cluster readiness, it would just always happen.
+SKIP: {
+    skip 'menu_edit_storage() body not extracted above', 3 if !defined($menu_edit_storage_body);
+
+    like($menu_edit_storage_body, qr/storage_has_inline_secret\s+"\$storage_name"\s+"tn_api_key"/,
+        'F2: menu_edit_storage() checks for a pre-existing inline tn_api_key before regenerating the section');
+    like($menu_edit_storage_body, qr/tn_installer_cluster_ready/,
+        '  ...and asks the same cluster-readiness question the plugin itself asks before stripping one');
+    like($menu_edit_storage_body, qr/generate_storage_config\s+"\$storage_name".*"\$inline_api_key"\)/,
+        '  ...and threads the decision through to generate_storage_config() as its 14th argument');
 }
 
 done_testing();

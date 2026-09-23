@@ -84,7 +84,7 @@ for my $sub (qw(_tn_priv_file _tn_api_key _tn_chap_password
                 migrate_priv_secrets migrate_secrets_cli
                 _tn_cluster_secrets_ready _tn_has_corosync_conf
                 _tn_redact_for_log _tn_redact_structure _tn_redact_secrets_in_text
-                _rpc_error_message)) {
+                _rpc_error_message _tn_backup_storage_cfg)) {
     unless ($PKG->can($sub)) {
         plan tests => 1;
         fail("$sub exists");
@@ -340,7 +340,7 @@ my $ENFORCES_PERMS = do {
 
 # ------------------------------------------------- migrate_priv_secrets ---
 SKIP: {
-    skip 'PVE::Storage not loadable here', 60 unless eval { require PVE::Storage; 1 };
+    skip 'PVE::Storage not loadable here', 71 unless eval { require PVE::Storage; 1 };
 
     my %STORECFG_IDS;
     {
@@ -657,12 +657,77 @@ SKIP: {
     like($out, qr/\[dry-run\]/, '  ...marks the output as a dry run');
     ok(exists($STORECFG_IDS{'tn-cli'}{tn_api_key}), '  ...and did not actually move anything');
 
-    # --------------------------- R8: rotation on an unready cluster ---
+    # ------------------------------- F3: backup before migrate ---
+    # migrate_priv_secrets() must snapshot storage.cfg BEFORE the first
+    # write it makes, so a bad migration (or just changing one's mind) has
+    # an exact pre-migration copy to go back to - NOT under /etc/pve
+    # (pmxcfs, cluster-replicated the instant anything lands there).
+    {
+        my $storage_cfg_path = tempdir(CLEANUP => 1) . '/storage.cfg';
+        my $backup_dir = tempdir(CLEANUP => 1) . '/backups';
+        my $fake_cfg_text = "truenasplugin: tn-backup\n\ttn_api_key BACKUP-ME\n";
+        PVE::Tools::file_set_contents($storage_cfg_path, $fake_cfg_text, 0644, 1);
+
+        local $ENV{TRUENAS_TEST_STORAGE_CFG} = $storage_cfg_path;
+        local $ENV{TRUENAS_TEST_BACKUP_DIR} = $backup_dir;
+
+        %STORECFG_IDS = (
+            'tn-backup' => { type => 'truenasplugin', tn_api_key => 'BACKUP-ME' },
+        );
+        my $res = $PKG->migrate_priv_secrets('tn-backup');
+
+        ok(defined($res->{backup}), 'F3: migrate_priv_secrets reports a backup path');
+        ok(-f $res->{backup}, '  ...and the file actually exists');
+        like($res->{backup}, qr/\Q$backup_dir\E\/storage\.cfg\.pre-migrate\.\d+$/,
+            '  ...named storage.cfg.pre-migrate.<epoch> under the backup dir, not /etc/pve');
+        my $backup_content = do {
+            local $/ = undef;
+            open(my $fh, '<', $res->{backup}) or die "cannot read backup: $!\n";
+            <$fh>;
+        };
+        is($backup_content, $fake_cfg_text,
+            '  ...and its content is an exact copy of storage.cfg as it was before migrating');
+        SKIP: {
+            skip 'file mode bits are not meaningful on this platform', 1
+                if $^O =~ /^(?:MSWin32|msys|cygwin)$/;
+            is((stat($res->{backup}))[2] & 07777, 0600, '  ...mode 0600, root-only');
+        }
+
+        # A second migrate_priv_secrets() call on an already-migrated
+        # storage has nothing left to move, so nothing new to back up -
+        # confirms the backup is conditioned on an actual write, not
+        # unconditional on every call.
+        my $res2 = $PKG->migrate_priv_secrets('tn-backup');
+        is(scalar(@{ $res2->{moved} }), 0, '  ...idempotent: second call moves nothing');
+        ok(!defined($res2->{backup}), '  ...and takes no new backup when there is nothing to change');
+    }
+
+    # A storage.cfg that does not exist yet (fresh install, no storages
+    # defined at all) has nothing to back up - migrate_priv_secrets() must
+    # not die trying.
+    {
+        local $ENV{TRUENAS_TEST_STORAGE_CFG} = tempdir(CLEANUP => 1) . '/never-created.cfg';
+        local $ENV{TRUENAS_TEST_BACKUP_DIR} = tempdir(CLEANUP => 1) . '/backups';
+
+        %STORECFG_IDS = (
+            'tn-nobackup' => { type => 'truenasplugin', tn_api_key => 'SOME-KEY' },
+        );
+        my $res = $PKG->migrate_priv_secrets('tn-nobackup');
+        ok(!defined($res->{backup}),
+            'F3: no storage.cfg on disk yet -> migrate_priv_secrets does not fail, reports no backup');
+        is(scalar(@{ $res->{moved} }), 1, '  ...but still migrates the secret itself');
+    }
+
+    # --------------------------- R8/F1: rotation on an unready cluster ---
     # pvesm set --tn_api_key ... (and any other update that would self-heal
     # a stale inline copy) applies the SAME cluster-readiness policy as
     # migrate_priv_secrets(): on an unconfirmed multi-node cluster, keep
     # BOTH copies (priv already wins at runtime) instead of stripping the
-    # inline one and making the storage vanish on an old node.
+    # inline one and making the storage vanish on an old node. F1 (QA
+    # round 5): production upgrades a cluster one node at a time, so
+    # "mixed cluster" is the NORMAL case, not a corner case - the inline
+    # copy that idk20 nodes actually read must track the CURRENT value,
+    # not the one about to be revoked on TrueNAS.
     {
         $MEMBERS_JSON = members_json('pve1',
             pve1 => { online => 1, ip => '10.0.0.1' },
@@ -674,9 +739,10 @@ SKIP: {
         call('on_update_hook_full', $PKG, 'tn-rot', $scfg, {}, [], { tn_api_key => 'NEW-KEY' });
 
         is(call('_tn_priv_read', 'tn-rot', 'pw'), 'NEW-KEY',
-            'R8: rotation on an unready cluster still writes the NEW key to priv');
-        is($scfg->{tn_api_key}, 'OLD-INLINE-KEY',
-            '  ...but keeps the OLD value inline too - never strips it without cluster confirmation');
+            'R8/F1: rotation on an unready cluster still writes the NEW key to priv');
+        is($scfg->{tn_api_key}, 'NEW-KEY',
+            '  ...and keeps the inline copy too, but updated to the NEW value - idk20 nodes '
+              . 'must never keep authenticating with a key that was just revoked');
 
         # Once the cluster IS confirmed ready, the next update (even one
         # that does not touch the key at all) self-heals the leftover
@@ -686,6 +752,30 @@ SKIP: {
         ok(!exists($scfg->{tn_api_key}),
             '  ...and self-heals once the cluster is confirmed ready on a later update');
         is(call('_tn_priv_read', 'tn-rot', 'pw'), 'NEW-KEY', '    ...priv still has the NEW key');
+    }
+
+    # ------------------- F1: self-heal branch never RE-SYNCS a value ---
+    # (only the explicit-rotation branches above pass $new_value to
+    # _tn_strip_inline_if_cluster_ready()). An update that does not touch
+    # tn_api_key at all, on an unready cluster, with a STALE inline value
+    # already sitting in storage.cfg, must keep exactly what was already
+    # there - it has no new value to sync to, and overwriting it with
+    # priv's value here would duplicate what migrate_priv_secrets()'s
+    # explicit conflict handling already owns.
+    {
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => '0');   # unready
+
+        call('on_add_hook', $PKG, 'tn-selfheal', {}, tn_api_key => 'PRIV-VALUE');
+        my $scfg = { storeid => 'tn-selfheal', tn_api_key => 'STALE-INLINE-VALUE' };
+        call('on_update_hook_full', $PKG, 'tn-selfheal', $scfg, { nodes => 'pve3' }, [], {});
+
+        is($scfg->{tn_api_key}, 'STALE-INLINE-VALUE',
+            'F1: an untouched self-heal on an unready cluster does not rewrite the inline value');
+        is(call('_tn_priv_read', 'tn-selfheal', 'pw'), 'PRIV-VALUE', '  ...priv is unchanged');
     }
 
     # ------------------------- R9: differing priv vs inline gets a warning ---
