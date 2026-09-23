@@ -11,7 +11,25 @@ Vcs-Browser: https://github.com/truenas/truenas-proxmox-plugin
 
 Package: truenas-proxmox-plugin
 Architecture: all
-Depends: pve-manager (>= 8.0.0), open-iscsi, multipath-tools, nvme-cli, perl, libio-socket-ssl-perl, liburi-perl, ${misc:Depends}, ${perl:Depends}
+# libpve-storage-perl (>= 8.3.5): the floor 'sensitive-properties'
+# extraction needs at ALL for a create (on_add_hook), verified against
+# upstream's own debian/changelog - "declare which properties are
+# sensitive or not centrally in a plugin" landed in exactly that version.
+# Below it, PVE::API2::Storage::Config never extracts tn_api_key out of
+# the request at all, so without on_add_hook()'s `$sensitive{X} //
+# $scfg->{X}` fallback (see TrueNASPlugin.pm) a plain `pvesm add` would
+# silently put the key straight back into storage.cfg with no warning -
+# the exact bug this whole dependency line exists to prevent. `pve-manager
+# (>= 8.0.0)` alone does not guarantee this (Kimi and Opus both flagged
+# the same gap independently): pve-manager's own version floor tracks
+# neither libpve-storage-perl's real version nor this specific feature.
+# NOT bumped further to libpve-storage-perl (>= 9.0.16), the version that
+# introduced on_update_hook_full: that would exclude most of the currently
+# installed base for a narrower gap - see on_update_hook()'s own comment
+# in TrueNASPlugin.pm for exactly what is and is not lost below 9.0.16
+# (in short: new keys still land in priv correctly; a stale inline copy
+# from before a rotation just cannot be auto-cleaned on that one path).
+Depends: pve-manager (>= 8.0.0), libpve-storage-perl (>= 8.3.5), open-iscsi, multipath-tools, nvme-cli, perl, libio-socket-ssl-perl, liburi-perl, ${misc:Depends}, ${perl:Depends}
 Description: TrueNAS SCALE storage plugin for Proxmox VE
  This package provides the TrueNAS Proxmox storage plugin for shared VM disk
  storage over iSCSI and NVMe/TCP. It integrates with TrueNAS SCALE via

@@ -14,13 +14,88 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
     fichero priv y cae a `storage.cfg` (clusters sin migrar siguen
     funcionando igual).
 
+  * Corregido tras auditoria (Codex BLOCK, Opus WARNING, reproducido con
+    parse_config/write_config reales de PVE): `on_add_hook`/
+    `on_update_hook_full` ahora hacen `delete $scfg->{$k}` de cada secreto
+    que escriben en priv - el core serializa exactamente ese hash tras el
+    hook, asi que sin el delete una rotacion via `pvesm set --tn_api_key
+    NUEVA` dejaba la key VIEJA (no la nueva, la vieja) igual de expuesta
+    en claro en `storage.cfg`. El borrado solo ocurre una vez que hay una
+    copia real en priv (nunca se borra la unica copia de una storage sin
+    migrar por una actualizacion que no toco esa clave).
+
   * `tn_api_key` deja de ser `fixed`: `pvesm set <id> --tn_api_key ...`
     rota la key (antes solo se podia editando `storage.cfg` a mano).
+    Anadido `on_update_hook` (estilo CIFS/PBS) para el host cuyo api()
+    clamped es < 13 (libpve-storage-perl anterior a 9.0.16, que introdujo
+    `on_update_hook_full`): delega en `on_update_hook_full` con
+    $scfg=undef, asi que la key nueva se sigue guardando en priv, pero una
+    copia inline vieja no se puede limpiar en ese host concreto (PVE no le
+    da al hook una referencia viva a la que hacer delete). `on_add_hook`
+    ahora toma `$sensitive{X} // $scfg->{X}`: en libpve-storage-perl
+    anterior a 8.3.5 (verificado contra el changelog real de upstream, no
+    supuesto), la extraccion de 'sensitive-properties' no existe en
+    absoluto, asi que la key llega inline en $scfg en vez de en
+    %sensitive - con el fallback, la creacion queda protegida en
+    cualquier host soportado, no solo en uno con paquete reciente.
+    debian/control sube `libpve-storage-perl` a `>= 8.3.5` (antes solo
+    `pve-manager >= 8.0.0`, que no garantiza nada de esto - hallazgo
+    coincidente de Kimi y Opus); no se sube a 9.0.16 porque eso excluiria
+    la base instalada actual sin necesidad: la unica perdida real por
+    debajo de esa version es la limpieza automatica de una copia inline
+    vieja en la ruta de ACTUALIZACION, documentada en vez de forzada por
+    dependencia.
+
+  * `on_add_hook` borra ahora el fichero priv de cualquier secreto
+    OPCIONAL no pasado en la creacion (evita que un `.chap`/`.dhchap`
+    huerfano de una storage anterior con el mismo id reaparezca al
+    recrearla).
 
   * Nueva subcomanda `truenas-proxmox-manage migrate-secrets <storeid>
-    [--dry-run]` (alias `migrate-api-key`) que mueve los secretos de una
-    storage existente de `storage.cfg` al fichero priv. Nada se migra
-    automaticamente en el postinst.
+    [--dry-run] [--all-nodes-upgraded]` que mueve los secretos de una
+    storage existente de `storage.cfg` al fichero priv. Nunca sobreescribe
+    un fichero priv existente con un valor inline DISTINTO: si priv y
+    linea inline difieren, se conserva priv (es lo que usa el plugin en
+    runtime) y se descarta el inline, avisando; si coinciden, solo se
+    borra el duplicado inline. Se niega a ejecutar (fuera de --dry-run)
+    salvo que confirme que TODOS los nodos del cluster corren un plugin
+    capaz de leer /etc/pve/priv/storage - idk20 y anteriores exigen
+    tn_api_key inline y OMITEN la seccion entera sin ella (medido en un
+    idk20 real); --all-nodes-upgraded salta esa comprobacion cuando no se
+    puede ejecutar aqui pero ya se confirmo a mano. Nada se migra
+    automaticamente en el postinst. No existe alias `migrate-api-key`:
+    el nombre `migrate-secrets` nunca se publico bajo el nombre anterior,
+    asi que no hay compatibilidad que preservar (hallazgo de Kimi).
+
+  * `install.sh`: los TRES flujos de creacion de storage (wizard guiado,
+    aprovisionamiento automatizado, reconfiguracion) escriben ahora el
+    secreto en `/etc/pve/priv/storage` de forma ATOMICA (fichero temporal
+    en el mismo directorio + rename, umask 077) ANTES de publicar el
+    bloque en `storage.cfg`, abortando sin publicar si la escritura falla
+    - el flujo de aprovisionamiento automatizado hacia antes un `echo >>
+    storage.cfg` directo que no escribia el secreto en NINGUN sitio
+    (hallazgo de Kimi, severidad critica). `remove_storage_config` borra
+    los 4 ficheros priv posibles al eliminar una storage.
+    `get_storage_config_value`/`get_all_storage_config_values` (install.sh)
+    y `get_storage_value` (tools/nvme-recovery.sh) invierten la prioridad
+    de lectura a priv-primero-luego-inline (antes era al reves, por lo que
+    una copia inline vieja podia ganarle a una key rotada).
+    tools/dev-truenas-plugin-full-function-test.sh: mismo orden de
+    prioridad en sus dos lectores de secretos, y los $scfg que construye
+    para llamar a _api_call/_api_call_mutate llevan `storeid` (asi el
+    helper interno del plugin puede ir a priv el mismo si el valor que
+    trae el script quedo desactualizado).
+
+  * `tn_debug=2` volcaba parametros y respuesta completos de cada llamada
+    API en el log, incluyendo `dhchap_key`/`dhchap_ctrl_key` en las
+    llamadas nvmet.host.create/update (hallazgo de Kimi). Redactadas antes
+    de loguear, misma tecnica que ya usa tools/truenas-plugin-broker.
+
+  * Corregido un comentario (y la wiki que lo repetia) que decia que
+    `storage.cfg` es "0644, world-readable": en PVE 9 es 0640
+    root:www-data, verificado en un nodo real. El riesgo real es
+    `pvesh get /storage/<id>` (permiso Datastore.Allocate) y el grupo
+    www-data, no "cualquiera en el sistema".
 
   * GUI: cada propiedad del schema lleva `title`, y las de ajuste fino
     (presupuestos, reintentos, timeouts, colas NVMe, by-path) se marcan en
@@ -28,11 +103,13 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
     "GUI Support for Custom Storage Plugins" (pve-devel, v3). Sin esa serie
     las claves se ignoran.
 
-  * Tests: t/nvme/24-sensitive-secrets.t (65 casos: escritura/lectura/
-    borrado priv, prioridad priv sobre scfg, rotacion, migracion
-    idempotente, key ausente = error claro).
+  * Tests: t/nvme/24-sensitive-secrets.t, con parse_config/write_config
+    REALES de PVE::SectionConfig (no stub) para el round-trip y la
+    rotacion; cubre ademas los tres flujos de creacion de install.sh
+    (t/installer), la redaccion del log de debug, y el guard de
+    actualizacion en marcha de migrate-secrets.
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 12:00:00 -0500
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 15:00:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
 

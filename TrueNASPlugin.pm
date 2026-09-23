@@ -1269,7 +1269,7 @@ sub check_config {
 # knows that convention finds it in the expected place.
 #
 # Back-compat: a cluster that has not run
-# `truenas-proxmox-manage migrate-api-key <storeid>` (see below) still has
+# `truenas-proxmox-manage migrate-secrets <storeid>` (see below) still has
 # tn_api_key/tn_chap_password inline in storage.cfg. check_config() does not
 # strip them from a config it merely parsed off disk (only the API layer
 # extracts sensitive params, and only for a genuine add/update call), so
@@ -1296,6 +1296,22 @@ sub _tn_priv_file {
     return _tn_priv_dir() . "/${storeid}.${suffix}";
 }
 
+# Process-local cache, so a status()/_api_call() heavy workload (every
+# TrueNAS RPC needs the API key) does not re-read pmxcfs for the same
+# secret on every single call. Keyed on "storeid\0suffix" so tn-a's .pw
+# and tn-b's .pw never collide. Deliberately NOT shared across processes
+# or persisted - a rotation from ANOTHER node, or another process on this
+# one, is picked up next time this process re-execs (every CLI invocation
+# and every pvedaemon worker request is a fresh interpreter in practice;
+# see snapshot_import_cli()'s own comment on that). What this cache
+# guarantees is narrower and easy to reason about: a rotation that
+# happens in THIS process (on_update_hook_full() writing a new value, or
+# migrate_priv_secrets() doing the same) is visible to the very next read
+# in the same process, never masked by a value cached before the write.
+my %_tn_priv_cache;
+
+sub _tn_priv_cache_key { return "$_[0]\0$_[1]"; }
+
 sub _tn_priv_write {
     my ($storeid, $suffix, $value) = @_;
     die "cannot store secret: no storage ID given\n" if !defined($storeid) || $storeid eq '';
@@ -1303,6 +1319,7 @@ sub _tn_priv_write {
     mkdir $dir;
     my $file = _tn_priv_file($storeid, $suffix);
     PVE::Tools::file_set_contents($file, "$value\n", 0600, 1);
+    $_tn_priv_cache{ _tn_priv_cache_key($storeid, $suffix) } = $value;
     return $file;
 }
 
@@ -1310,6 +1327,7 @@ sub _tn_priv_delete {
     my ($storeid, $suffix) = @_;
     return if !defined($storeid) || $storeid eq '';
     my $file = _tn_priv_file($storeid, $suffix);
+    delete $_tn_priv_cache{ _tn_priv_cache_key($storeid, $suffix) };
     return if !defined($file);
     unlink($file);
     return;
@@ -1317,11 +1335,19 @@ sub _tn_priv_delete {
 
 sub _tn_priv_read {
     my ($storeid, $suffix) = @_;
+    return undef if !defined($storeid) || $storeid eq '';
+
+    my $key = _tn_priv_cache_key($storeid, $suffix);
+    return $_tn_priv_cache{$key} if exists $_tn_priv_cache{$key};
+
     my $file = _tn_priv_file($storeid, $suffix);
-    return undef if !defined($file) || !-e $file;
-    my $line = PVE::Tools::file_read_firstline($file);
-    return undef if !defined($line) || $line eq '';
-    return $line;
+    my $value;
+    if (defined($file) && -e $file) {
+        my $line = PVE::Tools::file_read_firstline($file);
+        $value = (defined($line) && $line ne '') ? $line : undef;
+    }
+    $_tn_priv_cache{$key} = $value;
+    return $value;
 }
 
 # Generic set/delete/read-with-fallback over any key in %TN_SENSITIVE_SUFFIX.
@@ -1398,32 +1424,87 @@ sub _tn_nvme_dhchap_ctrl_secret {
 my @TN_OPTIONAL_SECRETS = qw(tn_chap_password tn_nvme_dhchap_secret tn_nvme_dhchap_ctrl_secret);
 
 # Called once, by PVE::API2::Storage::Config's create handler, before the
-# new section is written to storage.cfg. %sensitive holds exactly the keys
-# declared in plugindata()'s 'sensitive-properties' that were present in the
-# request - never anything else, and never from a config-file parse (that
-# path calls check_config() directly and never reaches this hook).
+# new section is written to storage.cfg. %sensitive holds the keys declared
+# in plugindata()'s 'sensitive-properties' that PVE extracted from the
+# request - on a host new enough to do that extraction at all.
+#
+# On libpve-storage-perl older than 8.3.5 (roughly "PVE before late 8.3"; a
+# concrete version was verified against upstream's own debian/changelog,
+# not guessed - see debian/control), 'sensitive-properties' extraction does
+# not exist: $config/$opts is never stripped, so the raw value arrives as a
+# normal key in $scfg instead, having already passed check_config()
+# unstripped (that validation stopped requiring tn_api_key for exactly this
+# reason - see check_config()'s own comment). `$sensitive{$k} // $scfg->{$k}`
+# takes whichever source actually has it, so creation is protected on every
+# supported host, not just ones running a recent enough package.
+#
+# $scfg is always the live, about-to-be-serialized config on this path (it
+# IS $opts, the value check_config() just returned - see
+# PVE::API2::Storage::Config's create handler: `$cfg->{ids}->{$storeid} =
+# $opts; $returned_config = $plugin->on_add_hook($storeid, $opts, ...)`),
+# so every `delete $scfg->{$k}` below reaches storage.cfg before it is ever
+# written - unlike on_update_hook() further down, which has no such
+# reference to delete from at all on an old host.
 sub on_add_hook {
     my ($class, $storeid, $scfg, %sensitive) = @_;
 
-    my $key = $sensitive{tn_api_key};
+    my $key = $sensitive{tn_api_key} // $scfg->{tn_api_key};
     die "tn_api_key is required\n" if !defined($key) || $key eq '';
     _tn_set_secret($storeid, 'tn_api_key', $key);
+    delete $scfg->{tn_api_key};
 
     for my $opt_key (@TN_OPTIONAL_SECRETS) {
-        my $value = $sensitive{$opt_key};
-        _tn_set_secret($storeid, $opt_key, $value) if defined($value) && $value ne '';
+        my $value = $sensitive{$opt_key} // $scfg->{$opt_key};
+        if (defined($value) && $value ne '') {
+            _tn_set_secret($storeid, $opt_key, $value);
+        } else {
+            # A storeid is free to reuse the instant its storage is
+            # deleted, and on_delete_hook() is not the only way a section
+            # disappears (a hand-edited storage.cfg, for one). Without
+            # this, recreating the same id without this optional secret
+            # would silently inherit whatever an EARLIER storage of the
+            # same name left behind in its priv file.
+            _tn_delete_secret($storeid, $opt_key);
+        }
+        delete $scfg->{$opt_key};
     }
 
     return;
 }
 
+# `truenas-proxmox-manage`/CIFSPlugin.pm-style legacy shape, called instead
+# of on_update_hook_full() below on a host whose clamped api() (see api()
+# above) is < 13 - libpve-storage-perl older than 9.0.16, which introduced
+# on_update_hook_full itself (verified against upstream's changelog, not
+# guessed - see debian/control). $update is only the CHANGED properties,
+# never the current config, and critically PVE hands this shape NO live
+# reference to the real $scfg at all: on_update_hook_full below therefore
+# runs with $scfg=undef here, and every `delete $scfg->{...}` in it is
+# guarded and simply skipped. A stale inline secret already sitting in
+# storage.cfg from before this fix cannot be stripped by an update on a
+# host this old - there is no object to strip it from - it self-heals only
+# once the storage is migrated (migrate_priv_secrets(), which reads and
+# rewrites storage.cfg directly) or edited from a host new enough to take
+# the _full path. The new value passed in %sensitive (when the host is new
+# enough to extract it at all) still reaches the priv file correctly
+# either way; only the stale-copy cleanup is what this shape cannot do.
+sub on_update_hook {
+    my ($class, $storeid, $update, %sensitive) = @_;
+    return $class->on_update_hook_full($storeid, undef, $update, undef, \%sensitive);
+}
+
 # Called once, by PVE::API2::Storage::Config's update handler
-# (`pvesm set`/API/GUI), before the modified section is written back.
-# $scfg here is the CURRENT config (pre-update); $update is only the
-# properties that changed and $delete the ones being removed - neither is
-# used here, since a sensitive property never appears in either (it is
-# routed to $sensitive instead, exists()-checked the same way $delete
-# entries are: undef means "delete this").
+# (`pvesm set`/API/GUI), before the modified section is written back, on a
+# host whose clamped api() is >= 13. $scfg here is the CURRENT, live
+# config - the exact object PVE mutates and serializes right after this
+# hook returns (`for my $k (keys %$opts) { $scfg->{$k} = $opts->{$k}; }`,
+# unconditional on api() version) - so every `delete $scfg->{$k}` below
+# reaches storage.cfg. $update/$delete are not used: a sensitive property
+# never appears in either (it is routed to $sensitive instead,
+# exists()-checked the same way $delete entries are: undef means "delete
+# this"). $scfg is undef when called from on_update_hook() above (a host
+# too old to have on_update_hook_full at all); every scfg mutation here is
+# guarded accordingly.
 sub on_update_hook_full {
     my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
 
@@ -1431,6 +1512,7 @@ sub on_update_hook_full {
         my $key = $sensitive->{tn_api_key};
         if (defined($key) && $key ne '') {
             _tn_set_secret($storeid, 'tn_api_key', $key);
+            delete $scfg->{tn_api_key} if defined $scfg;
         } else {
             # `pvesm set <id> --delete tn_api_key` or an explicit empty
             # value. A TrueNAS storage cannot authenticate without a key at
@@ -1440,17 +1522,31 @@ sub on_update_hook_full {
               . "requires an API key at all times. Set a replacement with "
               . "--tn_api_key instead of deleting it.\n";
         }
+    } elsif (defined($scfg) && defined(_tn_priv_read($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key}))) {
+        # This particular call did not touch the key, but a priv copy
+        # already exists (migrated earlier, or rotated before) and $scfg
+        # still carries a stale inline duplicate (e.g. from hand-editing
+        # storage.cfg after migrating) - self-heal it on any update that
+        # happens to pass through here. Guarded on the priv file actually
+        # existing: never delete the one and only copy of an unmigrated
+        # storage's key just because an unrelated field changed.
+        delete $scfg->{tn_api_key};
     }
 
     for my $opt_key (@TN_OPTIONAL_SECRETS) {
-        next unless exists($sensitive->{$opt_key});
-        my $value = $sensitive->{$opt_key};
-        if (defined($value) && $value ne '') {
-            _tn_set_secret($storeid, $opt_key, $value);
-        } else {
-            # Optional: removing it just disables the corresponding auth on
-            # the next (re)connect, same as it always could.
-            _tn_delete_secret($storeid, $opt_key);
+        my $suffix = $TN_SENSITIVE_SUFFIX{$opt_key};
+        if (exists($sensitive->{$opt_key})) {
+            my $value = $sensitive->{$opt_key};
+            if (defined($value) && $value ne '') {
+                _tn_set_secret($storeid, $opt_key, $value);
+            } else {
+                # Optional: removing it just disables the corresponding
+                # auth on the next (re)connect, same as it always could.
+                _tn_delete_secret($storeid, $opt_key);
+            }
+            delete $scfg->{$opt_key} if defined $scfg;
+        } elsif (defined($scfg) && defined(_tn_priv_read($storeid, $suffix))) {
+            delete $scfg->{$opt_key};
         }
     }
 
@@ -2529,13 +2625,37 @@ sub _scfg_accept_legacy_keys($scfg) {
     return $scfg;
 }
 
+# tn_debug=2 logs the full request/response JSON of every API call - and
+# TrueNAS mutation params for nvmet.host.create/update carry dhchap_key/
+# dhchap_ctrl_key (the DH-HMAC-CHAP secrets, see _nvme_ensure_host_registered),
+# so without this, turning on verbose debug logging would write those
+# straight to syslog in the clear - the same class of exposure this whole
+# file's 'sensitive-properties' work exists to close, just at the log
+# layer instead of storage.cfg. Same technique
+# tools/truenas-plugin-broker's own logging uses: a regex over the ALREADY
+# JSON-ENCODED string, not a walk of the decoded structure - TrueNAS API
+# params are arbitrarily nested arrays/hashes with no fixed shape, so a
+# walk would still have to match on the same key names at every level;
+# the regex does that once, regardless of nesting depth. Matches only a
+# JSON *key* named exactly one of these (quote-anchored on both sides), so
+# it cannot mis-fire on an unrelated string that merely contains one of
+# these words.
+my $TN_LOG_REDACT_KEYS = qr/api_key|password|passwd|secret|token|dhchap_key|dhchap_ctrl_key/i;
+
+sub _tn_redact_for_log {
+    my ($json_text) = @_;
+    return $json_text if !defined $json_text;
+    $json_text =~ s/("(?:$TN_LOG_REDACT_KEYS)"\s*:\s*)"[^"]*"/$1"<redacted>"/g;
+    return $json_text;
+}
+
 sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
     _scfg_accept_legacy_keys($scfg);
     my $retry_opts = $opts && $opts->{retry_opts};
 
     # Level 2: Verbose - log all API calls with parameters
     if ($ws_params && ref($ws_params) eq 'ARRAY' && @$ws_params) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=persistent, params=" . encode_json($ws_params));
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=persistent, params=" . _tn_redact_for_log(encode_json($ws_params)));
     } else {
         _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=persistent");
     }
@@ -2562,7 +2682,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
         }
 
         # Level 2: Verbose - log API response
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? _tn_redact_for_log(encode_json($res)) : ($res // 'undef')));
 
         return $res;
     }, $retry_opts);
@@ -4080,9 +4200,75 @@ sub snapshot_import_cli(@argv) {
     return 0;
 }
 
-# `truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]`
-# (alias: migrate-api-key, kept for compatibility with scripts/muscle memory
-# from before this command covered more than the API key)
+# idk20 and older require tn_api_key inline in storage.cfg and SILENTLY
+# SKIP the whole storage section without it (measured directly against a
+# real idk20 install). Migrating a storage's secrets out of storage.cfg
+# while ANY other cluster node still runs a plugin that old would make the
+# storage vanish from `pvesm status` on that node the moment the change
+# lands in /etc/pve - a rolling-upgrade footgun, not a hypothetical.
+#
+# Verifies every cluster node either by asking it directly (does its
+# installed plugin have migrate_priv_secrets() at all - the capability
+# that matters, not a version string to parse) over SSH, the same
+# mechanism install.sh already uses to push the plugin to other nodes.
+# Returns 'ready' with no problem nodes, or an explanation of exactly what
+# could not be confirmed - never a silent guess.
+sub _tn_cluster_secrets_ready {
+    my ($class) = @_;
+
+    require PVE::Tools;
+
+    my $nodes_json = '';
+    my $listed = eval {
+        PVE::Tools::run_command(['pvesh', 'get', '/nodes', '--output-format', 'json'],
+            outfunc => sub { $nodes_json .= $_[0] }, timeout => 15);
+        1;
+    };
+    if (!$listed) {
+        return { ready => 0,
+            reason => "could not list cluster nodes ('pvesh get /nodes' failed: $@)" };
+    }
+
+    my $nodes = eval { decode_json($nodes_json) };
+    if ($@ || ref($nodes) ne 'ARRAY') {
+        return { ready => 0, reason => "could not parse 'pvesh get /nodes' output" };
+    }
+
+    # A standalone host (no corosync cluster) lists only itself - nothing
+    # rolling to guard against.
+    return { ready => 1 } if @$nodes <= 1;
+
+    my @problem;
+    for my $n (@$nodes) {
+        my $name = $n->{node};
+        next if !defined($name) || $name eq '';
+
+        if (($n->{status} // '') ne 'online') {
+            push @problem, "$name (offline, cannot verify)";
+            next;
+        }
+
+        my $probe_out = '';
+        my $ok = eval {
+            PVE::Tools::run_command([
+                'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+                '-o', 'StrictHostKeyChecking=accept-new', "root\@$name",
+                'perl -MPVE::Storage::Custom::TrueNASPlugin -e '
+                  . '"print(PVE::Storage::Custom::TrueNASPlugin->can(q(migrate_priv_secrets)) ? 1 : 0)"',
+            ], outfunc => sub { $probe_out .= $_[0] }, timeout => 15);
+            1;
+        };
+        push @problem, "$name (unreachable or plugin too old to confirm)"
+            if !$ok || $probe_out ne '1';
+    }
+
+    return { ready => 1 } if !@problem;
+    return { ready => 0,
+        reason => 'node(s) not confirmed to run a plugin new enough to read '
+          . '/etc/pve/priv/storage: ' . join(', ', @problem) };
+}
+
+# `truenas-proxmox-manage migrate-secrets <storeid> [--dry-run] [--all-nodes-upgraded]`
 #
 # Moves the four sensitive properties for one truenasplugin storage out of
 # storage.cfg (readable via `pvesh get /storage/<id>` with Datastore.Allocate,
@@ -4093,21 +4279,40 @@ sub snapshot_import_cli(@argv) {
 # auto-migrating in postinst, deliberately: a background rewrite of
 # storage.cfg on every node during a package upgrade is exactly the kind of
 # surprise that turns into an outage ticket). This is how an operator does
-# it by hand, once, whenever they choose to.
+# it by hand, once, whenever they choose to - but only once every node in
+# the cluster can actually read what this writes (see
+# _tn_cluster_secrets_ready() above); refused otherwise unless
+# opts{all_nodes_upgraded} overrides a check this function could not run.
 #
 # Idempotent: a storage with no inline secrets left (already migrated, or
 # never had any) reports nothing to do and does not touch storage.cfg.
+# Never overwrites an existing priv file with a DIFFERENT inline value -
+# priv is authoritative (see _tn_read_secret()'s priority rule), so a
+# stale inline copy left over from before a rotation is discarded, not
+# used to silently undo that rotation.
 sub migrate_priv_secrets {
     my ($class, $storeid, %opts) = @_;
     my $dry_run = $opts{dry_run};
 
     die "storage ID must not be empty\n" if !defined($storeid) || $storeid eq '';
 
+    if (!$dry_run && !$opts{all_nodes_upgraded}) {
+        my $check = $class->_tn_cluster_secrets_ready();
+        if (!$check->{ready}) {
+            die "migrate-secrets refused: $check->{reason}\n"
+              . "Every cluster node must run a plugin that reads "
+              . "/etc/pve/priv/storage before migrating - see "
+              . "wiki/Tools.md#migrate-secrets. Re-run with "
+              . "--all-nodes-upgraded once you have confirmed this "
+              . "yourself.\n";
+        }
+    }
+
     # Required at run time, not compile time - see import_foreign_snapshots()
     # above for why (loaded on nodes and in tests where it is not present).
     require PVE::Storage;
 
-    my $result = { storeid => $storeid, type => undef, moved => [] };
+    my $result = { storeid => $storeid, type => undef, moved => [], warnings => [] };
 
     PVE::Storage::lock_storage_config(sub {
         my $cfg = PVE::Storage::config();
@@ -4117,15 +4322,41 @@ sub migrate_priv_secrets {
 
         my $changed = 0;
         for my $key (sort keys %TN_SENSITIVE_SUFFIX) {
-            my $value = $scfg->{$key};
-            next if !defined($value) || $value eq '';
+            my $inline = $scfg->{$key};
+            next if !defined($inline) || $inline eq '';
 
             my $suffix = $TN_SENSITIVE_SUFFIX{$key};
             my $file = _tn_priv_file($storeid, $suffix);
-            push @{ $result->{moved} }, { key => $key, file => $file };
+            my $priv_value = _tn_priv_read($storeid, $suffix);
+
+            my $entry = { key => $key, file => $file };
+
+            if (!defined($priv_value)) {
+                # Nothing in priv yet: this inline value is the only copy -
+                # move it there verbatim.
+                $entry->{action} = 'moved';
+            } elsif ($priv_value eq $inline) {
+                # Both copies already agree - just drop the redundant
+                # inline text, priv already has it.
+                $entry->{action} = 'duplicate';
+            } else {
+                # priv and inline DISAGREE. priv is what _tn_read_secret()
+                # actually uses at runtime (priority rule documented
+                # above), so overwriting it with a stale inline value here
+                # would silently UNDO a rotation that happened after
+                # storage.cfg was last in sync with priv. Keep priv,
+                # discard the stale inline text, and say so loudly.
+                $entry->{action} = 'conflict-kept-priv';
+                $entry->{warning} = "$key: priv already has a different "
+                  . "value; kept it and discarded the stale inline copy "
+                  . "instead of overwriting it";
+                push @{ $result->{warnings} }, $entry->{warning};
+            }
+
+            push @{ $result->{moved} }, $entry;
             next if $dry_run;
 
-            _tn_priv_write($storeid, $suffix, $value);
+            _tn_priv_write($storeid, $suffix, $inline) if $entry->{action} eq 'moved';
             delete $scfg->{$key};
             $changed = 1;
         }
@@ -4136,16 +4367,26 @@ sub migrate_priv_secrets {
     return $result;
 }
 
-# `truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]`
+# `truenas-proxmox-manage migrate-secrets <storeid> [--dry-run] [--all-nodes-upgraded]`
 sub migrate_secrets_cli(@argv) {
-    my ($storeid, $dry_run);
+    my ($storeid, $dry_run, $all_nodes_upgraded);
+    my $usage = "Usage: truenas-proxmox-manage migrate-secrets <storeid> "
+      . "[--dry-run] [--all-nodes-upgraded]\n";
 
     while (@argv) {
         my $arg = shift @argv;
         if ($arg eq '--dry-run' || $arg eq '-n') {
             $dry_run = 1;
+        } elsif ($arg eq '--all-nodes-upgraded') {
+            $all_nodes_upgraded = 1;
         } elsif ($arg eq '--help' || $arg eq '-h') {
-            print "Usage: truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]\n";
+            print $usage;
+            print "\nRefuses to run (outside --dry-run) unless every cluster node can be\n"
+              . "confirmed to run a plugin new enough to read /etc/pve/priv/storage -\n"
+              . "idk20 and older require tn_api_key inline and SILENTLY SKIP a storage\n"
+              . "section without it. --all-nodes-upgraded skips that check for when it\n"
+              . "cannot run here (e.g. no SSH to other nodes) but you have confirmed it\n"
+              . "by hand.\n";
             return 0;
         } elsif (!defined($storeid) && $arg !~ /^-/) {
             $storeid = $arg;
@@ -4156,24 +4397,26 @@ sub migrate_secrets_cli(@argv) {
     }
 
     if (!defined($storeid)) {
-        print STDERR "Usage: truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]\n";
+        print STDERR $usage;
         return 1;
     }
 
-    my $result = eval { __PACKAGE__->migrate_priv_secrets($storeid, dry_run => $dry_run) };
+    my $result = eval {
+        __PACKAGE__->migrate_priv_secrets($storeid,
+            dry_run => $dry_run, all_nodes_upgraded => $all_nodes_upgraded);
+    };
     if (my $err = $@) {
         print STDERR "migrate-secrets: $err";
         return 1;
     }
 
-    if (!defined($result->{type})) {
-        print STDERR "migrate-secrets: storage '$storeid' not found\n";
-        return 1;
-    }
     if ($result->{type} ne 'truenasplugin') {
         print STDERR "migrate-secrets: storage '$storeid' is type "
           . "'$result->{type}', not truenasplugin - nothing to do\n";
         return 1;
+    }
+    for my $w (@{ $result->{warnings} }) {
+        print STDERR(($dry_run ? '[dry-run] ' : '') . "WARNING: $w\n");
     }
     if (!@{ $result->{moved} }) {
         print "storage '$storeid': no inline secrets in storage.cfg "
@@ -4182,21 +4425,22 @@ sub migrate_secrets_cli(@argv) {
     }
 
     for my $m (@{ $result->{moved} }) {
-        printf("%s%-20s -> %s\n", $dry_run ? '[dry-run] ' : '', $m->{key}, $m->{file});
+        my $prefix = $dry_run ? '[dry-run] ' : '';
+        if ($m->{action} eq 'conflict-kept-priv') {
+            printf("%s%-20s -> kept existing %s, discarded stale inline copy\n",
+                $prefix, $m->{key}, $m->{file});
+        } elsif ($m->{action} eq 'duplicate') {
+            printf("%s%-20s -> already in %s, removed redundant inline copy\n",
+                $prefix, $m->{key}, $m->{file});
+        } else {
+            printf("%s%-20s -> %s\n", $prefix, $m->{key}, $m->{file});
+        }
     }
     print $dry_run
         ? "Dry run: nothing was written.\n"
         : "Moved " . scalar(@{ $result->{moved} })
             . " secret(s) for '$storeid' into /etc/pve/priv/storage.\n";
     return 0;
-}
-
-# Compatibility alias: this subcommand covered only tn_api_key when it was
-# named migrate-api-key. It now moves all four sensitive properties (see
-# %TN_SENSITIVE_SUFFIX), so migrate-secrets is the name going forward, but
-# scripts/muscle memory built around the old name keep working unchanged.
-sub migrate_api_key_cli(@argv) {
-    return migrate_secrets_cli(@argv);
 }
 
 # List TrueNAS iSCSI targets (array of hashes; each has at least {id, name, ...}).
