@@ -15,9 +15,14 @@ set -euo pipefail
 readonly INSTALLER_VERSION="2.0.0"
 readonly GITHUB_REPO="truenas/truenas-proxmox-plugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
-readonly STORAGE_CFG="/etc/pve/storage.cfg"
-readonly BACKUP_DIR="/var/lib/truenas-plugin-backups"
-readonly LOG_FILE="/var/log/truenas-installer.log"
+# Overridable ONLY for t/installer's offline tests (same pattern as the
+# plugin's own TRUENAS_PRIV_DIR): every production invocation of this
+# script leaves both at their real defaults, never touching anything but
+# /etc/pve.
+readonly STORAGE_CFG="${TRUENAS_TEST_STORAGE_CFG:-/etc/pve/storage.cfg}"
+readonly TRUENAS_PRIV_DIR="${TRUENAS_TEST_PRIV_DIR:-/etc/pve/priv/storage}"
+readonly BACKUP_DIR="${TRUENAS_TEST_BACKUP_DIR:-/var/lib/truenas-plugin-backups}"
+readonly LOG_FILE="${TRUENAS_TEST_LOG_FILE:-/var/log/truenas-installer.log}"
 readonly APT_REPO_URL="https://truenas.github.io/truenas-proxmox-plugin/apt/"
 readonly APT_KEY_URL="https://truenas.github.io/truenas-proxmox-plugin/apt/pubkey.gpg"
 readonly APT_KEYRING_PATH="/etc/apt/keyrings/truenas-proxmox-plugin.gpg"
@@ -4418,8 +4423,8 @@ get_storage_config_value() {
     # duplicate left over from before a rotation or a migration must not
     # shadow it here either.
     case "$param_name" in
-        tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;
-        tn_chap_password) value=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true) ;;
+        tn_api_key)       value=$(cat "${TRUENAS_PRIV_DIR}/${storage_name}.pw" 2>/dev/null || true) ;;
+        tn_chap_password) value=$(cat "${TRUENAS_PRIV_DIR}/${storage_name}.chap" 2>/dev/null || true) ;;
     esac
 
     if [[ -z "$value" ]]; then
@@ -5610,8 +5615,8 @@ get_all_storage_config_values() {
     local inline_key inline_chap priv_key priv_chap
     inline_key=$(grep -E '^tn_api_key=' <<< "$block" | head -1 | cut -d= -f2-)
     inline_chap=$(grep -E '^tn_chap_password=' <<< "$block" | head -1 | cut -d= -f2-)
-    priv_key=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true)
-    priv_chap=$(cat "/etc/pve/priv/storage/${storage_name}.chap" 2>/dev/null || true)
+    priv_key=$(cat "${TRUENAS_PRIV_DIR}/${storage_name}.pw" 2>/dev/null || true)
+    priv_chap=$(cat "${TRUENAS_PRIV_DIR}/${storage_name}.chap" 2>/dev/null || true)
 
     local key="${priv_key:-$inline_key}"
     local chap="${priv_chap:-$inline_chap}"
@@ -9584,7 +9589,7 @@ write_priv_secret() {
 
     [[ -z "$value" ]] && return 0
 
-    local priv_dir="/etc/pve/priv/storage"
+    local priv_dir="$TRUENAS_PRIV_DIR"
     if ! mkdir -p "$priv_dir"; then
         log "ERROR" "write_priv_secret: cannot create $priv_dir"
         return 1
@@ -11717,10 +11722,10 @@ remove_storage_config() {
     # which this installer bypasses the same way it bypasses on_add_hook).
     # rm -f: a storage that never migrated, or never set an optional
     # secret, simply has nothing here to remove.
-    rm -f "/etc/pve/priv/storage/${storage_name}.pw" \
-          "/etc/pve/priv/storage/${storage_name}.chap" \
-          "/etc/pve/priv/storage/${storage_name}.dhchap" \
-          "/etc/pve/priv/storage/${storage_name}.dhchapctrl" 2>/dev/null
+    rm -f "${TRUENAS_PRIV_DIR}/${storage_name}.pw" \
+          "${TRUENAS_PRIV_DIR}/${storage_name}.chap" \
+          "${TRUENAS_PRIV_DIR}/${storage_name}.dhchap" \
+          "${TRUENAS_PRIV_DIR}/${storage_name}.dhchapctrl" 2>/dev/null
 
     success "Storage configuration removed"
     return 0
