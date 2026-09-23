@@ -104,7 +104,7 @@ for my $opt (
     is($out->{shared}, 1, '...and shared is still forced on') if $out;
 }
 
-# The three fields whose absence must still be fatal at creation. If the fix
+# The two fields whose absence must still be fatal at creation. If the fix
 # had simply deleted these checks, this is what would notice.
 #
 # The message comes from PVE::SectionConfig, not from the plugin: options
@@ -113,7 +113,17 @@ for my $opt (
 # create path too. They are left in place as documentation of intent, but this
 # asserts on the behaviour - creation is refused and the error names the field -
 # rather than on which layer produced the wording.
-for my $missing (qw(tn_api_host tn_api_key tn_dataset)) {
+#
+# tn_api_key is NOT in this list anymore (see
+# t/nvme/24-sensitive-secrets.t): it became a 'sensitive-property', which
+# PVE::API2::Storage::Config extracts from the real request BEFORE
+# check_config ever runs - $config here never has it even when a caller
+# supplied a perfectly valid key, on create or on update, so asserting a
+# "missing" error on it here would be asserting on a request shape
+# check_config() never actually sees in production. Its "is it actually
+# there" enforcement moved to on_add_hook(), which is the one place PVE
+# hands the plugin the real value.
+for my $missing (qw(tn_api_host tn_dataset)) {
     my %cfg = %full;
     delete $cfg{$missing};
     my (undef, $err) = try_check(\%cfg, 1);
