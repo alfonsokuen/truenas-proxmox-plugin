@@ -131,9 +131,11 @@ $INC{'PVE/QemuConfig.pm'} = 1;
 # The cluster file system is consulted only to say on WHICH node a guest
 # lives when neither configuration file is here. Stubbed empty, so these
 # tests never depend on what happens to exist in /etc/pve on the machine
-# running them.
+# running them. cfs_update() is a no-op here; the fresh-process-cache test
+# further down replaces both subs locally to prove they're called in order.
 {
     package PVE::Cluster;
+    sub cfs_update { return }
     sub get_vmlist { return { ids => {} } }
 }
 $INC{'PVE/Cluster.pm'} = 1;
@@ -431,6 +433,40 @@ sub refuses {
     eval { $PKG->import_foreign_snapshots($VMID, {}) };
     is($qemu_loads, 0, 'vmid de contenedor: no pasa por PVE::QemuConfig');
     is(scalar(@WRITES), 0, '  ...sin escribir nada');
+}
+
+# -------------------------- 44a-44b. cluster cache in a fresh process ---
+{
+    # install.sh runs the CLI as `exec perl -M... -e '...' -- "$@"`: every
+    # invocation starts a brand-new interpreter, so PVE::Cluster's
+    # in-process vmlist cache is always empty on entry. Found live on a
+    # 3-node cluster: without cfs_update() first, a guest that lives on
+    # another node got the generic "Configuration file does not exist"
+    # instead of the "run it on node X" hint - because get_vmlist() answered
+    # from the stale (empty) cache. Simulate that here: get_vmlist() only
+    # knows about the guest AFTER cfs_update() has been called, exactly as
+    # the real module behaves the first time in a fresh process.
+    no strict 'refs';
+    no warnings 'redefine';
+    # A real PVE node may have an actual /etc/pve/{lxc,qemu-server}/9990.conf
+    # (this is the same $VMID other blocks use) - point both dirs at an
+    # empty tempdir so this test depends only on the cluster stub below,
+    # never on what happens to exist on the machine running the suite.
+    my $empty_dir = tempdir(CLEANUP => 1);
+    local ${"${PKG}::TN_LXC_CONF_DIR"}  = $empty_dir;
+    local ${"${PKG}::TN_QEMU_CONF_DIR"} = $empty_dir;
+    my $updated = 0;
+    local *PVE::Cluster::cfs_update = sub { $updated = 1 };
+    local *PVE::Cluster::get_vmlist = sub {
+        return { ids => {} } unless $updated;
+        return { ids => { $VMID => { node => 'proxmox2', type => 'qemu' } } };
+    };
+    my $guest_config = $PKG->can('_tn_guest_config');
+    my $err = eval { $guest_config->($VMID); 1 } ? '' : $@;
+    like($err,
+        qr/\Q$VMID\E is a VM on node 'proxmox2', not on this one; run import-snapshots there/,
+        '_tn_guest_config: calls cfs_update() before get_vmlist(), so a fresh CLI process still sees a guest on another node');
+    ok($updated, '  ...cfs_update() was actually called, not just get_vmlist()');
 }
 
 # ------------------------------------------------------------ 45-50. CLI ---

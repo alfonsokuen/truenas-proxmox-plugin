@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk19';
+our $VERSION = '2.1.23~alpha1+idk20';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -2985,8 +2985,20 @@ sub _tn_guest_config($vmid) {
     # like the guest is gone. Best effort: the cluster file system may not
     # be available (a single node, a test), and then the old error is still
     # the right one.
+    #
+    # install.sh runs this as `exec perl -M... -e '...'`: every CLI
+    # invocation starts a fresh interpreter, so get_vmlist()'s in-process
+    # cache is always empty on entry. cfs_update() pulls it from pmxcfs
+    # first; without it, a guest that lives on another node reports the
+    # generic "does not exist" instead of this hint, every single time.
     my $entry = eval {
+        local $SIG{__WARN__} = sub { };    # cfs_update() warns on IPCC
+                                            # failure instead of dying; a
+                                            # single node without pmxcfs
+                                            # falls through silently, same
+                                            # as it always did.
         require PVE::Cluster;
+        PVE::Cluster::cfs_update();
         PVE::Cluster::get_vmlist()->{ids}{$vmid};
     };
     if (ref($entry) eq 'HASH' && $entry->{node}) {

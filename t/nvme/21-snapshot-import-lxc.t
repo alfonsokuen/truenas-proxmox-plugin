@@ -158,9 +158,12 @@ $INC{'PVE/QemuConfig.pm'} = 1;
 # The cluster file system is consulted only to say on WHICH node a guest
 # lives when neither configuration file is here. Stubbed empty, so these
 # tests never depend on what happens to exist in /etc/pve on the machine
-# running them.
+# running them. cfs_update() is defined (not just get_vmlist()) so this
+# exercises the real cluster branch, not a swallowed "undefined
+# subroutine" from a stub that happens to look the same to the caller.
 {
     package PVE::Cluster;
+    sub cfs_update { return }
     sub get_vmlist { return { ids => {} } }
 }
 $INC{'PVE/Cluster.pm'} = 1;
