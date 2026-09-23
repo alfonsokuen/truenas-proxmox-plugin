@@ -540,46 +540,56 @@ sub properties {
     return {
         # Transport & connection
         tn_api_host => {
+            title => 'API Host',
             description => "TrueNAS hostname or IP.",
             type => 'string', format => 'pve-storage-server',
         },
         tn_api_key => {
+            title => 'API Key',
             description => "TrueNAS user-linked API key.",
             type => 'string',
         },
         tn_api_scheme => {
+            title => 'API Scheme',
             description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
             type => 'string', optional => 1,
         },
         tn_api_transport => {
+            title => 'API Transport (Legacy)',
             description => "Deprecated legacy transport selector. Ignored; WebSocket is always used.",
             type => 'string', optional => 1,
         },
         tn_api_port => {
+            title => 'API Port',
             description => "TCP port (defaults: 443 for wss, 80 for ws).",
             type => 'integer', optional => 1,
         },
         tn_api_insecure => {
+            title => 'Skip TLS Verification',
             description => "Skip TLS certificate verification.",
             type => 'boolean', optional => 1, default => 0,
         },
         tn_prefer_ipv4 => {
+            title => 'Prefer IPv4',
             description => "Prefer IPv4 (A records) when resolving tn_api_host.",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Placement
         tn_dataset => {
+            title => 'Dataset',
             description => "Parent dataset for zvols (e.g. tank/proxmox).",
             type => 'string',
         },
         tn_zvol_blocksize => {
+            title => 'Zvol Block Size',
             description => "ZVOL volblocksize (e.g. 16K, 64K).",
             type => 'string', optional => 1,
         },
 
         # Transport mode selection
         tn_transport_mode => {
+            title => 'Transport Mode',
             description => "Storage transport protocol: 'iscsi' or 'nvme-tcp'.",
             type => 'string',
             enum => ['iscsi', 'nvme-tcp'],
@@ -589,69 +599,97 @@ sub properties {
 
         # iSCSI target & portals
         tn_target_iqn => {
+            title => 'Target IQN',
             description => "Shared iSCSI Target IQN on TrueNAS (or target's short name) - required for iSCSI transport.",
             type => 'string',
             optional => 1,
         },
         tn_discovery_portal => {
+            title => 'Discovery Portal',
             description => "Primary SendTargets portal (hostname[:port], IP[:port], or [IPv6]:port).",
             type => 'string',
         },
         tn_portals => {
+            title => 'Additional Portals',
             description => "Comma-separated additional portals.",
             type => 'string', optional => 1,
         },
 
         # Initiator pathing
-        tn_use_multipath => { type => 'boolean', optional => 1, default => 1 },
+        tn_use_multipath => {
+            title => 'Use Multipath',
+            description => "Enable multipath for connected block devices.",
+            type => 'boolean', optional => 1, default => 1,
+        },
         tn_force_delete_on_inuse => {
+            title => 'Force Delete When In Use',
             description => 'Temporarily logout the target on this node to force delete when TrueNAS reports "target is in use".',
             type => 'boolean',
             default => 'false',
         },
         tn_logout_on_free => {
+            title => 'Logout Target On Free',
             description => 'After delete, logout the target if no LUNs remain for this node.',
             type => 'boolean',
             default => 'false',
         },
-        tn_use_by_path  => { type => 'boolean', optional => 1, default => 0 },
+        tn_use_by_path => {
+            title => 'Use By-Path Devices',
+            description => "Use /dev/disk/by-path device names instead of /dev/disk/by-id (iSCSI only; ignored in nvme-tcp mode).",
+            type => 'boolean', optional => 1, default => 0,
+        },
         tn_ipv6_by_path => {
+            title => 'IPv6 By-Path Names',
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
             type => 'boolean', optional => 1, default => 0,
         },
 
         # Debug level
         tn_debug => {
+            title => 'Debug Level',
             description => "Debug level: 0=none (errors only), 1=light (function calls), 2=verbose (full trace)",
             type => 'integer', optional => 1, default => 0, minimum => 0, maximum => 2,
         },
 
         # CHAP (optional - iSCSI only)
-        tn_chap_user     => { type => 'string', optional => 1 },
-        tn_chap_password => { type => 'string', optional => 1 },
+        tn_chap_user => {
+            title => 'CHAP User',
+            description => "CHAP username for iSCSI discovery and session authentication.",
+            type => 'string', optional => 1,
+        },
+        tn_chap_password => {
+            title => 'CHAP Password',
+            description => "CHAP password for iSCSI discovery and session authentication.",
+            type => 'string', optional => 1,
+        },
 
         # NVMe/TCP parameters
         tn_subsystem_nqn => {
+            title => 'Subsystem NQN',
             description => "NVMe subsystem NQN - required for nvme-tcp transport.",
             type => 'string',
             optional => 1,
         },
         tn_hostnqn => {
+            title => 'Host NQN',
             description => "NVMe host NQN (optional, auto-generated from /etc/nvme/hostnqn if not specified).",
             type => 'string',
             optional => 1,
         },
         tn_nvme_dhchap_secret => {
+            title => 'DHCHAP Host Secret',
             description => "DH-HMAC-CHAP host authentication key (format: DHHC-1:01:...) - optional.",
             type => 'string',
             optional => 1,
         },
         tn_nvme_dhchap_ctrl_secret => {
+            title => 'DHCHAP Controller Secret',
             description => "DH-HMAC-CHAP controller authentication key for bidirectional auth - optional.",
             type => 'string',
             optional => 1,
         },
         tn_nvme_allow_any_host => {
+            title => 'Allow Any NVMe Host',
             description => "Allow any NVMe host to attach (open access). Default 1 for "
                 . "backward compatibility. Set to 0 to use an explicit host whitelist: "
                 . "the plugin registers each node's host NQN (with DH-HMAC-CHAP keys if "
@@ -665,6 +703,7 @@ sub properties {
 
         # ZFS compression algorithm for new volumes
         tn_compression => {
+            title => 'Compression',
             description => "ZFS compression algorithm for new volumes. When unset, inherits from parent dataset.",
             type => 'string',
             enum => [qw(OFF LZ4 GZIP GZIP-1 GZIP-9 ZSTD ZSTD-1 ZSTD-3 ZSTD-5 ZSTD-7 ZSTD-9 ZLE LZJB)],
@@ -673,42 +712,50 @@ sub properties {
 
         # Thin provisioning toggle (maps to TrueNAS sparse)
         tn_sparse => {
+            title => 'Sparse Volumes',
             description => "Create thin-provisioned zvols on TrueNAS (maps to 'sparse').",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Live snapshot support
         tn_enable_live_snapshots => {
+            title => 'Live Snapshots',
             description => "Enable live snapshots with VM state storage on TrueNAS.",
             type => 'boolean', optional => 1, default => 1,
         },
         # Volume chains for snapshots (enables vmstate support)
         tn_snapshot_volume_chains => {
+            title => 'Snapshot Volume Chains',
             description => "Use volume chains for snapshots (enables vmstate on iSCSI).",
             type => 'boolean', optional => 1, default => 1,
         },
         # vmstate storage location
         tn_vmstate_storage => {
+            title => 'VM State Storage',
             description => "Storage location for vmstate: 'shared' (TrueNAS iSCSI) or 'local' (node filesystem).",
             type => 'string', optional => 1, default => 'local',
         },
 
         # Bulk operations for improved performance
         tn_enable_bulk_operations => {
+            title => 'Bulk Operations',
             description => "Enable bulk API operations for better performance (requires WebSocket transport).",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Retry configuration
         tn_api_retry_max => {
+            title => 'API Retries',
             description => "Maximum number of API call retries on transient failures.",
             type => 'integer', optional => 1, default => 3,
         },
         tn_api_retry_delay => {
+            title => 'API Retry Delay (s)',
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
         tn_status_budget_s => {
+            title => 'Status Budget (s)',
             description => "Wall-clock ceiling, in seconds, for the API probe inside " .
                           "status(). Deliberately much shorter than an operation " .
                           "budget: pvestatd calls status() for every storage on the " .
@@ -719,6 +766,7 @@ sub properties {
             type => 'integer', optional => 1, default => 8, minimum => 1, maximum => 120,
         },
         tn_status_probe_backoff_s => {
+            title => 'Status Probe Backoff (s)',
             description => "After status() fails to reach the array, answer 'inactive' " .
                           "for this many seconds without probing again. An array that " .
                           "just refused will refuse again, and finding that out costs " .
@@ -728,6 +776,7 @@ sub properties {
             type => 'integer', optional => 1, default => 30, minimum => 0, maximum => 600,
         },
         tn_nvme_max_io_kb => {
+            title => 'NVMe Max I/O (KiB)',
             description => "Cap every NVMe-oF namespace of this storage (head and path " .
                           "devices) at this request size, in KiB, when a volume is " .
                           "activated and on every storage poll. TrueNAS SCALE exports " .
@@ -740,6 +789,7 @@ sub properties {
             type => 'integer', optional => 1, default => 1024, minimum => 0, maximum => 32768,
         },
         tn_op_budget_s => {
+            title => 'Operation Budget (s)',
             description => "Wall-clock ceiling, in seconds, for the API calls of one " .
                           "locked storage operation. tn_api_budget_s bounds a single " .
                           "call; an operation that makes several was still unbounded " .
@@ -750,6 +800,7 @@ sub properties {
             type => 'integer', optional => 1, minimum => 0, maximum => 3600,
         },
         tn_api_budget_s => {
+            title => 'API Budget (s)',
             description => "Wall-clock ceiling, in seconds, for one API call including " .
                           "every retry. Counting retries without counting time lets " .
                           "tn_api_retry_max multiply by the per-attempt timeout: with " .
@@ -760,6 +811,7 @@ sub properties {
             type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 900,
         },
         tn_broker_timeout => {
+            title => 'Broker Timeout (s)',
             description => "How long to wait for the session broker to answer one " .
                           "call, in seconds. The broker is told this value and aims " .
                           "to reply just inside it, so raising it here also gives the " .
@@ -768,15 +820,18 @@ sub properties {
             type => 'integer', optional => 1, default => 30, minimum => 5, maximum => 600,
         },
         tn_storage_lock_timeout => {
+            title => 'Storage Lock Timeout (s)',
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120.",
             type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 600,
         },
         tn_device_ready_retries => {
+            title => 'Device Ready Retries',
             description => "Number of 100ms retries waiting for a block device to appear after connect.",
             type => 'integer', optional => 1, default => 200, minimum => 0, maximum => 600,
         },
         tn_nr_io_queues => {
+            title => 'NVMe I/O Queues',
             description => "Number of NVMe/TCP I/O queues per controller. When unset, " .
                           "auto-detected: uses online CPU count when all CPUs are online, " .
                           "or half of possible CPUs when any CPU is offline (avoids kernel " .
@@ -785,6 +840,7 @@ sub properties {
             type => 'integer', optional => 1, minimum => 1, maximum => 256,
         },
         tn_nvme_ctrl_loss_tmo => {
+            title => 'NVMe Ctrl Loss Timeout',
             description => "Seconds the kernel keeps retrying a failed NVMe/TCP controller " .
                           "before giving up and removing it (nvme connect --ctrl-loss-tmo). " .
                           "Use -1 to retry forever. When unset the kernel default of 600 applies, " .
@@ -794,11 +850,13 @@ sub properties {
             type => 'integer', optional => 1, minimum => -1, maximum => 3600,
         },
         tn_nvme_reconnect_delay => {
+            title => 'NVMe Reconnect Delay',
             description => "Seconds between reconnect attempts for a failed NVMe/TCP controller " .
                           "(nvme connect --reconnect-delay). Kernel default is 10.",
             type => 'integer', optional => 1, minimum => 1, maximum => 3600,
         },
         tn_nvme_keep_alive_tmo => {
+            title => 'NVMe Keep-Alive Timeout',
             description => "NVMe/TCP keep-alive timeout in seconds " .
                           "(nvme connect --keep-alive-tmo). Lower values detect a dead path " .
                           "sooner, at the cost of more keep-alive traffic.",
