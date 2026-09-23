@@ -33,9 +33,19 @@
 #   - on_delete_hook() removes all four priv files, and is a no-op if they
 #     were never created;
 #   - migrate_priv_secrets()/migrate_secrets_cli(): moves all inline
-#     secrets to the priv files, is idempotent, --dry-run never writes, and
-#     a non-truenasplugin storage is refused; migrate_api_key_cli() is kept
-#     working as a compatibility alias for the same command's old name.
+#     secrets to the priv files, is idempotent, --dry-run never writes, a
+#     non-truenasplugin storage is refused, a priv value that DIFFERS from
+#     a stale inline duplicate is kept (never overwritten) and reported,
+#     and a real (non---dry-run) migration refuses to run unless every
+#     cluster node can be confirmed to run a plugin that reads priv files -
+#     idk20 and older require tn_api_key inline and silently SKIP the
+#     section without it;
+#   - _tn_redact_for_log() strips known-sensitive JSON keys (api_key,
+#     dhchap_key, dhchap_ctrl_key, ...) before anything reaches the
+#     tn_debug=2 log, the same technique tools/truenas-plugin-broker uses;
+#   - the process-local secret cache: a write in THIS process is visible to
+#     the very next read in the same process, never masked by a value
+#     cached before the write.
 #
 # Run with:  prove -v t/nvme/24-sensitive-secrets.t
 
@@ -45,6 +55,7 @@ use Test::More;
 use FindBin;
 use File::Spec;
 use File::Temp qw(tempdir);
+use JSON::PP qw(encode_json);
 
 my $PLUGIN = File::Spec->rel2abs("$FindBin::Bin/../../TrueNASPlugin.pm");
 plan skip_all => "TrueNASPlugin.pm not found at $PLUGIN" unless -f $PLUGIN;
@@ -69,8 +80,9 @@ my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 
 for my $sub (qw(_tn_priv_file _tn_api_key _tn_chap_password
                 _tn_nvme_dhchap_secret _tn_nvme_dhchap_ctrl_secret
-                on_add_hook on_update_hook_full on_delete_hook
-                migrate_priv_secrets migrate_secrets_cli migrate_api_key_cli)) {
+                on_add_hook on_update_hook on_update_hook_full on_delete_hook
+                migrate_priv_secrets migrate_secrets_cli
+                _tn_cluster_secrets_ready _tn_redact_for_log)) {
     unless ($PKG->can($sub)) {
         plan tests => 1;
         fail("$sub exists");
@@ -326,7 +338,7 @@ my $ENFORCES_PERMS = do {
 
 # ------------------------------------------------- migrate_priv_secrets ---
 SKIP: {
-    skip 'PVE::Storage not loadable here', 19 unless eval { require PVE::Storage; 1 };
+    skip 'PVE::Storage not loadable here', 33 unless eval { require PVE::Storage; 1 };
 
     my %STORECFG_IDS;
     {
@@ -346,6 +358,85 @@ SKIP: {
         };
     }
 
+    # _tn_cluster_secrets_ready() shells out to `pvesh get /nodes` and, per
+    # online node, `ssh ... perl -MPVE::Storage::Custom::TrueNASPlugin -e
+    # ...`. Stub PVE::Tools::run_command so every scenario below controls
+    # exactly what that looks like, without a real cluster or real SSH.
+    # $NODES_JSON drives the 'pvesh get /nodes' answer; $NODE_PROBE_OK maps
+    # node name -> probe output ('1'/'0'/undef for "ssh itself failed").
+    my ($NODES_JSON, %NODE_PROBE_OK);
+    {
+        no strict 'refs';
+        no warnings 'redefine';
+        *{'PVE::Tools::run_command'} = sub {
+            my ($cmd, %opts) = @_;
+            my $out = $opts{outfunc};
+            if ($cmd->[0] eq 'pvesh') {
+                die "pvesh not stubbed for this scenario\n" if !defined $NODES_JSON;
+                $out->($NODES_JSON) if $out;
+                return 0;
+            }
+            if ($cmd->[0] eq 'ssh') {
+                my ($node) = grep { /^root\@/ } @$cmd;
+                ($node) = $node =~ /^root\@(.+)$/;
+                my $answer = $NODE_PROBE_OK{$node};
+                die "ssh to $node refused\n" if !defined $answer;
+                $out->($answer) if $out;
+                return 0;
+            }
+            die "unexpected command in test stub: @$cmd\n";
+        };
+    }
+
+    # ---------------------------------------------- _tn_cluster_secrets_ready ---
+    {
+        # Standalone host: pvesh lists only itself - nothing to verify.
+        $NODES_JSON = encode_json([{ node => 'solo', status => 'online' }]);
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok($r->{ready}, '_tn_cluster_secrets_ready: a single-node "cluster" is always ready');
+    }
+    {
+        $NODES_JSON = encode_json([
+            { node => 'pve1', status => 'online' },
+            { node => 'pve2', status => 'online' },
+        ]);
+        %NODE_PROBE_OK = (pve1 => '1', pve2 => '1');
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok($r->{ready}, '_tn_cluster_secrets_ready: every online node confirms migrate_priv_secrets exists -> ready');
+    }
+    {
+        $NODES_JSON = encode_json([
+            { node => 'pve1', status => 'online' },
+            { node => 'pve2', status => 'online' },
+        ]);
+        # pve2 answers '0': its installed plugin does NOT have
+        # migrate_priv_secrets (idk20 or older).
+        %NODE_PROBE_OK = (pve1 => '1', pve2 => '0');
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready}, '_tn_cluster_secrets_ready: one node too old -> not ready');
+        like($r->{reason}, qr/pve2/, '  ...and names it');
+    }
+    {
+        $NODES_JSON = encode_json([
+            { node => 'pve1', status => 'online' },
+            { node => 'pve3', status => 'offline' },
+        ]);
+        %NODE_PROBE_OK = (pve1 => '1');
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready}, '_tn_cluster_secrets_ready: an offline node cannot be verified -> not ready');
+        like($r->{reason}, qr/pve3/, '  ...and names it');
+    }
+    {
+        $NODES_JSON = undef;   # 'pvesh get /nodes' itself fails
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready}, '_tn_cluster_secrets_ready: cannot even list nodes -> not ready, not a crash');
+    }
+
+    # Every scenario after this point uses a single-node "cluster" so the
+    # guard auto-passes without needing --all-nodes-upgraded - the guard
+    # itself is fully covered above; what follows tests migration logic.
+    $NODES_JSON = encode_json([{ node => 'solo', status => 'online' }]);
+
     %STORECFG_IDS = (
         'tn-mig' => {
             type => 'truenasplugin', tn_api_host => 'h', tn_dataset => 'd',
@@ -356,24 +447,37 @@ SKIP: {
         'local' => { type => 'dir' },
     );
 
-    # --dry-run: reports what would move, writes nothing.
+    # --dry-run: reports what would move, writes nothing, and does not even
+    # need the cluster-readiness check (it never writes).
+    $NODES_JSON = undef;
     my $dry = $PKG->migrate_priv_secrets('tn-mig', dry_run => 1);
     is(scalar(@{ $dry->{moved} }), 4, 'migrate --dry-run: reports all four secrets as movable');
     ok(exists($STORECFG_IDS{'tn-mig'}{tn_api_key}),
         '  ...and tn_api_key is still inline (nothing written)');
+    $NODES_JSON = encode_json([{ node => 'solo', status => 'online' }]);
 
-    my $real = $PKG->migrate_priv_secrets('tn-mig');
-    is(scalar(@{ $real->{moved} }), 4, 'migrate: moves all four secrets');
-    ok(!exists($STORECFG_IDS{'tn-mig'}{tn_api_key}),
-        '  ...tn_api_key removed from the in-memory config');
-    ok(!exists($STORECFG_IDS{'tn-mig'}{tn_chap_password}),
-        '  ...tn_chap_password removed too');
-    ok(!exists($STORECFG_IDS{'tn-mig'}{tn_nvme_dhchap_secret}),
-        '  ...tn_nvme_dhchap_secret removed too');
-    ok(!exists($STORECFG_IDS{'tn-mig'}{tn_nvme_dhchap_ctrl_secret}),
-        '  ...tn_nvme_dhchap_ctrl_secret removed too');
+    # A real (non-dry-run) migration on a multi-node cluster with an
+    # unverifiable node is refused outright - this is the H3 guard exercised
+    # end-to-end through migrate_priv_secrets(), not just the helper above.
+    {
+        $NODES_JSON = encode_json([
+            { node => 'pve1', status => 'online' },
+            { node => 'pve2', status => 'online' },
+        ]);
+        %NODE_PROBE_OK = (pve1 => '1', pve2 => '0');
+        my $err = eval { $PKG->migrate_priv_secrets('tn-mig'); 1 } ? '' : $@;
+        like($err, qr/migrate-secrets refused/, 'migrate_priv_secrets: refuses on an unready cluster');
+        ok(exists($STORECFG_IDS{'tn-mig'}{tn_api_key}), '  ...and writes nothing');
+
+        # --all-nodes-upgraded overrides the refusal.
+        my $forced = $PKG->migrate_priv_secrets('tn-mig', all_nodes_upgraded => 1);
+        is(scalar(@{ $forced->{moved} }), 4,
+            'migrate_priv_secrets: --all-nodes-upgraded bypasses the check and migrates');
+        $NODES_JSON = encode_json([{ node => 'solo', status => 'online' }]);
+    }
+
     is(call('_tn_priv_read', 'tn-mig', 'pw'), '1-inline-key',
-        '  ...and the priv file actually has the key');
+        'migrate: the priv file actually has the key');
     is(call('_tn_priv_read', 'tn-mig', 'chap'), 'inline-chap',
         '  ...and the CHAP password');
     is(call('_tn_priv_read', 'tn-mig', 'dhchap'), 'inline-dhchap',
@@ -390,6 +494,54 @@ SKIP: {
     is($wrong->{type}, 'dir', 'migrate: reports the real type for a non-truenasplugin storage');
     is(scalar(@{ $wrong->{moved} }), 0, '  ...and moves nothing');
 
+    # --------------------------------------------------- H2: priv-vs-inline conflict ---
+    {
+        # 'tn-conflict' already has a priv .pw with a DIFFERENT value than
+        # what is still (stale) inline in storage.cfg - e.g. rotated after
+        # migrating, then storage.cfg was hand-edited back to the old key.
+        call('on_add_hook', $PKG, 'tn-conflict', {}, tn_api_key => 'PRIV-VALUE');
+        %STORECFG_IDS = ('tn-conflict' => {
+            type => 'truenasplugin', tn_api_key => 'STALE-INLINE-VALUE',
+        });
+
+        my $res = $PKG->migrate_priv_secrets('tn-conflict');
+        is($res->{moved}[0]{action}, 'conflict-kept-priv',
+            'migrate: priv and inline disagree -> action is conflict-kept-priv');
+        is(scalar(@{ $res->{warnings} }), 1, '  ...and a warning is recorded');
+        like($res->{warnings}[0], qr/tn_api_key/, '    ...naming the key');
+        is(call('_tn_priv_read', 'tn-conflict', 'pw'), 'PRIV-VALUE',
+            '  ...priv keeps ITS value - never overwritten by the stale inline one');
+        ok(!exists($STORECFG_IDS{'tn-conflict'}{tn_api_key}),
+            '  ...and the stale inline copy is still removed from storage.cfg');
+    }
+    {
+        # 'tn-dup' has a priv .pw whose value is IDENTICAL to the inline
+        # one - just a redundant leftover, not a conflict.
+        call('on_add_hook', $PKG, 'tn-dup', {}, tn_api_key => 'SAME-VALUE');
+        %STORECFG_IDS = ('tn-dup' => {
+            type => 'truenasplugin', tn_api_key => 'SAME-VALUE',
+        });
+
+        my $res = $PKG->migrate_priv_secrets('tn-dup');
+        is($res->{moved}[0]{action}, 'duplicate',
+            'migrate: priv and inline already agree -> action is duplicate');
+        is(scalar(@{ $res->{warnings} }), 0, '  ...no warning, this is not a conflict');
+        is(call('_tn_priv_read', 'tn-dup', 'pw'), 'SAME-VALUE', '  ...priv unchanged');
+        ok(!exists($STORECFG_IDS{'tn-dup'}{tn_api_key}), '  ...inline duplicate removed');
+    }
+    {
+        # --dry-run must report the conflict/duplicate distinction too,
+        # without writing.
+        call('on_add_hook', $PKG, 'tn-conflict2', {}, tn_api_key => 'PRIV-VALUE');
+        %STORECFG_IDS = ('tn-conflict2' => {
+            type => 'truenasplugin', tn_api_key => 'STALE-INLINE-VALUE',
+        });
+        my $res = $PKG->migrate_priv_secrets('tn-conflict2', dry_run => 1);
+        is($res->{moved}[0]{action}, 'conflict-kept-priv',
+            'migrate --dry-run: reports the conflict too');
+        ok(exists($STORECFG_IDS{'tn-conflict2'}{tn_api_key}), '  ...without writing anything');
+    }
+
     # CLI wrapper, capturing STDOUT/STDERR like t/nvme/20's run_cli().
     %STORECFG_IDS = (
         'tn-cli' => { type => 'truenasplugin', tn_api_key => '1-cli-key' },
@@ -398,12 +550,73 @@ SKIP: {
     is($rc, 0, 'migrate_secrets_cli --dry-run: exit 0');
     like($out, qr/\[dry-run\]/, '  ...marks the output as a dry run');
     ok(exists($STORECFG_IDS{'tn-cli'}{tn_api_key}), '  ...and did not actually move anything');
+}
 
-    # migrate_api_key_cli is the pre-rename name, kept working as a plain
-    # alias - same storage, same flags, same result.
-    my ($rc2, $out2) = capture_cli('migrate_api_key_cli', 'tn-cli', '--dry-run');
-    is($rc2, $rc, 'migrate_api_key_cli (compat alias): same exit code as migrate_secrets_cli');
-    is($out2, $out, '  ...and byte-identical output');
+# ---------------------------------------------------- H4: on_update_hook ---
+# Legacy shape (api() < 13): PVE hands this no live $scfg at all, only the
+# CHANGED properties. It must still write the rotated key to priv - it just
+# cannot strip a stale inline copy, since it has nothing to strip it from.
+{
+    call('on_add_hook', $PKG, 'tn-legacy-api', {}, tn_api_key => 'FIRST-KEY');
+    call('on_update_hook', $PKG, 'tn-legacy-api', {}, tn_api_key => 'SECOND-KEY');
+    is(call('_tn_api_key', { storeid => 'tn-legacy-api' }), 'SECOND-KEY',
+        'on_update_hook: delegates to on_update_hook_full with $scfg=undef and still rotates the key');
+}
+
+# ------------------------------------- H4: on_add_hook, pre-8.3.5 fallback ---
+# A host old enough that 'sensitive-properties' extraction does not exist
+# at all never populates %sensitive: the raw value arrives as a plain
+# option in $scfg instead (already having passed check_config()
+# unstripped). on_add_hook must still find it and still keep it out of
+# storage.cfg.
+{
+    my $scfg = { tn_api_key => 'INLINE-ONLY-KEY' };   # nothing in %sensitive
+    call('on_add_hook', $PKG, 'tn-old-host', $scfg);
+    is(call('_tn_api_key', { storeid => 'tn-old-host' }), 'INLINE-ONLY-KEY',
+        'on_add_hook: $scfg->{tn_api_key} fallback works when %sensitive is empty (pre-8.3.5 host)');
+    ok(!exists($scfg->{tn_api_key}),
+        '  ...and it is stripped from $scfg before returning (never reaches storage.cfg)');
+}
+
+# ------------------------------------------------------ K2: log redaction ---
+{
+    my $redacted = call('_tn_redact_for_log',
+        '{"api_key":"1-verysecret","dhchap_key":"DHHC-1:01:xyz:","dhchap_ctrl_key":"DHHC-1:01:abc:","host":"192.0.2.1"}');
+    unlike($redacted, qr/verysecret/, '_tn_redact_for_log: strips api_key');
+    unlike($redacted, qr/DHHC-1:01:xyz/, '  ...strips dhchap_key');
+    unlike($redacted, qr/DHHC-1:01:abc/, '  ...strips dhchap_ctrl_key');
+    like($redacted, qr/"host":"192\.0\.2\.1"/, '  ...and leaves non-sensitive fields alone');
+    like($redacted, qr/"api_key":"<redacted>"/, '  ...replacing with an explicit marker, not deleting the key');
+}
+{
+    is(call('_tn_redact_for_log', undef), undef,
+        '_tn_redact_for_log: passes undef through instead of dying (a non-ref $res can be undef)');
+}
+
+# ---------------------------------------------------- K4: process cache ---
+{
+    call('on_add_hook', $PKG, 'tn-cache', {}, tn_api_key => 'CACHE-V1');
+    my $scfg = { storeid => 'tn-cache' };
+    is(call('_tn_api_key', $scfg), 'CACHE-V1', 'cache: first read gets the value just written');
+
+    # Rewrite the file directly, bypassing _tn_priv_write() - simulates
+    # nothing (this is deliberately NOT how a real rotation happens); the
+    # point is that the cache, once populated, is what a same-process read
+    # returns until something in-process invalidates it.
+    my $file = call('_tn_priv_file', 'tn-cache', 'pw');
+    open(my $fh, '>', $file) or die $!;
+    print $fh "BYPASSED-WRITE\n";
+    close($fh);
+    is(call('_tn_api_key', $scfg), 'CACHE-V1',
+        '  ...a file changed OUTSIDE _tn_priv_write() does not invalidate the cache (documented scope: same-process only)');
+
+    # A rotation THROUGH the plugin's own hook, in the same process, must
+    # be visible on the very next read - this is the actual guarantee K4
+    # asks for.
+    call('on_update_hook_full', $PKG, 'tn-cache', { storeid => 'tn-cache' },
+        {}, [], { tn_api_key => 'CACHE-V2' });
+    is(call('_tn_api_key', $scfg), 'CACHE-V2',
+        'cache: a same-process rotation via the hook is visible on the very next read');
 }
 
 done_testing();
