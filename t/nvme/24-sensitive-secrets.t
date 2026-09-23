@@ -78,11 +78,11 @@ unless (eval { require $PLUGIN; 1 }) {
 
 my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 
-for my $sub (qw(_tn_priv_file _tn_api_key _tn_chap_password
+for my $sub (qw(_tn_priv_file _tn_priv_exists _tn_api_key _tn_chap_password
                 _tn_nvme_dhchap_secret _tn_nvme_dhchap_ctrl_secret
                 on_add_hook on_update_hook on_update_hook_full on_delete_hook
                 migrate_priv_secrets migrate_secrets_cli
-                _tn_cluster_secrets_ready _tn_redact_for_log)) {
+                _tn_cluster_secrets_ready _tn_redact_for_log _tn_redact_structure)) {
     unless ($PKG->can($sub)) {
         plan tests => 1;
         fail("$sub exists");
@@ -338,7 +338,7 @@ my $ENFORCES_PERMS = do {
 
 # ------------------------------------------------- migrate_priv_secrets ---
 SKIP: {
-    skip 'PVE::Storage not loadable here', 33 unless eval { require PVE::Storage; 1 };
+    skip 'PVE::Storage not loadable here', 49 unless eval { require PVE::Storage; 1 };
 
     my %STORECFG_IDS;
     {
@@ -358,29 +358,47 @@ SKIP: {
         };
     }
 
-    # _tn_cluster_secrets_ready() shells out to `pvesh get /nodes` and, per
-    # online node, `ssh ... perl -MPVE::Storage::Custom::TrueNASPlugin -e
-    # ...`. Stub PVE::Tools::run_command so every scenario below controls
-    # exactly what that looks like, without a real cluster or real SSH.
-    # $NODES_JSON drives the 'pvesh get /nodes' answer; $NODE_PROBE_OK maps
-    # node name -> probe output ('1'/'0'/undef for "ssh itself failed").
-    my ($NODES_JSON, %NODE_PROBE_OK);
+    # _tn_cluster_secrets_ready() reads /etc/pve/.members (pmxcfs's own live
+    # membership file - see its own comment for why NOT node names/`pvesh
+    # get /nodes`: on a real cluster, node names resolved via this
+    # system's DNS to unrelated Cloudflare IPv6 addresses, not the
+    # cluster's own network - R7) and, per non-local online node, `ssh
+    # -o HostKeyAlias=<name> root@<ip> perl -MPVE::Storage::Custom::TrueNASPlugin
+    # -e ...`. Stub both PVE::Tools::file_get_contents (the .members read)
+    # and PVE::Tools::run_command (the ssh probe) so every scenario below
+    # controls exactly what that looks like, without a real cluster.
+    # $MEMBERS_JSON drives the .members answer; $NODE_PROBE_OK maps IP ->
+    # probe output ('1'/'0'/undef for "ssh itself failed").
+    my ($MEMBERS_JSON, %NODE_PROBE_OK, @SSH_CMDS);
+
+    # Builds a .members-shaped JSON string. %nodes: name => { online => 0|1,
+    # ip => '...' }. Local defaults to the first name given.
+    sub members_json {
+        my ($local, %nodes) = @_;
+        return encode_json({
+            nodename => $local,
+            nodelist => \%nodes,
+        });
+    }
+
     {
         no strict 'refs';
         no warnings 'redefine';
+        *{'PVE::Tools::file_get_contents'} = sub {
+            my ($path) = @_;
+            die "unexpected file in test stub: $path\n" if $path ne '/etc/pve/.members';
+            die ".members not stubbed for this scenario\n" if !defined $MEMBERS_JSON;
+            return $MEMBERS_JSON;
+        };
         *{'PVE::Tools::run_command'} = sub {
             my ($cmd, %opts) = @_;
             my $out = $opts{outfunc};
-            if ($cmd->[0] eq 'pvesh') {
-                die "pvesh not stubbed for this scenario\n" if !defined $NODES_JSON;
-                $out->($NODES_JSON) if $out;
-                return 0;
-            }
             if ($cmd->[0] eq 'ssh') {
-                my ($node) = grep { /^root\@/ } @$cmd;
-                ($node) = $node =~ /^root\@(.+)$/;
-                my $answer = $NODE_PROBE_OK{$node};
-                die "ssh to $node refused\n" if !defined $answer;
+                push @SSH_CMDS, $cmd;
+                my ($target) = grep { /^root\@/ } @$cmd;
+                my ($ip) = $target =~ /^root\@(.+)$/;
+                my $answer = $NODE_PROBE_OK{$ip};
+                die "ssh to $ip refused\n" if !defined $answer;
                 $out->($answer) if $out;
                 return 0;
             }
@@ -390,52 +408,103 @@ SKIP: {
 
     # ---------------------------------------------- _tn_cluster_secrets_ready ---
     {
-        # Standalone host: pvesh lists only itself - nothing to verify.
-        $NODES_JSON = encode_json([{ node => 'solo', status => 'online' }]);
+        # Standalone host: .members lists only itself - nothing to verify.
+        $MEMBERS_JSON = members_json('solo', solo => { online => 1, ip => '10.0.0.1' });
         my $r = $PKG->_tn_cluster_secrets_ready();
         ok($r->{ready}, '_tn_cluster_secrets_ready: a single-node "cluster" is always ready');
     }
     {
-        $NODES_JSON = encode_json([
-            { node => 'pve1', status => 'online' },
-            { node => 'pve2', status => 'online' },
-        ]);
-        %NODE_PROBE_OK = (pve1 => '1', pve2 => '1');
+        @SSH_CMDS = ();
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => '1');   # pve1 is local, checked in-process
         my $r = $PKG->_tn_cluster_secrets_ready();
-        ok($r->{ready}, '_tn_cluster_secrets_ready: every online node confirms migrate_priv_secrets exists -> ready');
+        ok($r->{ready}, '_tn_cluster_secrets_ready: local node checked in-process, remote confirms -> ready');
+        ok(!(grep { grep { /^root\@10\.0\.0\.1$/ } @$_ } @SSH_CMDS),
+            '  ...and never SSHes to itself');
     }
     {
-        $NODES_JSON = encode_json([
-            { node => 'pve1', status => 'online' },
-            { node => 'pve2', status => 'online' },
-        ]);
+        # R7: connects by IP, not by node NAME - and keys host-key
+        # verification by name via HostKeyAlias, not IP.
+        @SSH_CMDS = ();
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '203.0.113.9' },
+        );
+        %NODE_PROBE_OK = ('203.0.113.9' => '1');
+        $PKG->_tn_cluster_secrets_ready();
+        my ($ssh_cmd) = @SSH_CMDS;
+        ok((grep { $_ eq 'root@203.0.113.9' } @$ssh_cmd),
+            'R7: connects to the IP from .members (root@203.0.113.9), never `root@pve2`');
+        ok(!(grep { /^root\@pve2$/ } @$ssh_cmd), '  ...confirmed: no root@pve2 anywhere in the command');
+        ok((grep { $_ eq 'HostKeyAlias=pve2' } @$ssh_cmd),
+            '  ...but still keys host-key verification by name (HostKeyAlias=pve2)');
+    }
+    {
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
         # pve2 answers '0': its installed plugin does NOT have
         # migrate_priv_secrets (idk20 or older).
-        %NODE_PROBE_OK = (pve1 => '1', pve2 => '0');
+        %NODE_PROBE_OK = ('10.0.0.2' => '0');
         my $r = $PKG->_tn_cluster_secrets_ready();
         ok(!$r->{ready}, '_tn_cluster_secrets_ready: one node too old -> not ready');
         like($r->{reason}, qr/pve2/, '  ...and names it');
     }
     {
-        $NODES_JSON = encode_json([
-            { node => 'pve1', status => 'online' },
-            { node => 'pve3', status => 'offline' },
-        ]);
-        %NODE_PROBE_OK = (pve1 => '1');
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve3 => { online => 0, ip => '10.0.0.3' },
+        );
         my $r = $PKG->_tn_cluster_secrets_ready();
         ok(!$r->{ready}, '_tn_cluster_secrets_ready: an offline node cannot be verified -> not ready');
         like($r->{reason}, qr/pve3/, '  ...and names it');
     }
     {
-        $NODES_JSON = undef;   # 'pvesh get /nodes' itself fails
+        # K8: SSH banners/MOTD or the probe's own trailing newline must not
+        # be mistaken for "answered 0" - only exact '1' alone on a line
+        # counts as confirmed.
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => "Warning: extended attributes not supported\n1\n");
         my $r = $PKG->_tn_cluster_secrets_ready();
-        ok(!$r->{ready}, '_tn_cluster_secrets_ready: cannot even list nodes -> not ready, not a crash');
+        ok($r->{ready}, 'K8: a login banner around the probe output does not look like a "too old" answer');
+    }
+    {
+        $MEMBERS_JSON = undef;   # .members itself is unreadable
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready}, '_tn_cluster_secrets_ready: cannot even read .members -> not ready, not a crash');
+    }
+
+    # --------------------------------------------- R6: fail closed on bad data ---
+    {
+        $MEMBERS_JSON = encode_json({ nodename => 'pve1', nodelist => {} });
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready}, 'R6: an EMPTY nodelist is a data problem, not evidence of a standalone host -> not ready');
+    }
+    {
+        $MEMBERS_JSON = encode_json({
+            nodename => 'pve1',
+            nodelist => { '' => { online => 1, ip => '10.0.0.9' } },
+        });
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready}, 'R6: an unnamed node entry -> not ready (fails closed, not silently skipped)');
+    }
+    {
+        $MEMBERS_JSON = 'not even json';
+        my $r = $PKG->_tn_cluster_secrets_ready();
+        ok(!$r->{ready}, 'R6: unparseable .members -> not ready');
     }
 
     # Every scenario after this point uses a single-node "cluster" so the
     # guard auto-passes without needing --all-nodes-upgraded - the guard
     # itself is fully covered above; what follows tests migration logic.
-    $NODES_JSON = encode_json([{ node => 'solo', status => 'online' }]);
+    $MEMBERS_JSON = members_json('solo', solo => { online => 1, ip => '10.0.0.1' });
 
     %STORECFG_IDS = (
         'tn-mig' => {
@@ -449,22 +518,22 @@ SKIP: {
 
     # --dry-run: reports what would move, writes nothing, and does not even
     # need the cluster-readiness check (it never writes).
-    $NODES_JSON = undef;
+    $MEMBERS_JSON = undef;
     my $dry = $PKG->migrate_priv_secrets('tn-mig', dry_run => 1);
     is(scalar(@{ $dry->{moved} }), 4, 'migrate --dry-run: reports all four secrets as movable');
     ok(exists($STORECFG_IDS{'tn-mig'}{tn_api_key}),
         '  ...and tn_api_key is still inline (nothing written)');
-    $NODES_JSON = encode_json([{ node => 'solo', status => 'online' }]);
+    $MEMBERS_JSON = members_json('solo', solo => { online => 1, ip => '10.0.0.1' });
 
     # A real (non-dry-run) migration on a multi-node cluster with an
     # unverifiable node is refused outright - this is the H3 guard exercised
     # end-to-end through migrate_priv_secrets(), not just the helper above.
     {
-        $NODES_JSON = encode_json([
-            { node => 'pve1', status => 'online' },
-            { node => 'pve2', status => 'online' },
-        ]);
-        %NODE_PROBE_OK = (pve1 => '1', pve2 => '0');
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => '0');
         my $err = eval { $PKG->migrate_priv_secrets('tn-mig'); 1 } ? '' : $@;
         like($err, qr/migrate-secrets refused/, 'migrate_priv_secrets: refuses on an unready cluster');
         ok(exists($STORECFG_IDS{'tn-mig'}{tn_api_key}), '  ...and writes nothing');
@@ -473,7 +542,7 @@ SKIP: {
         my $forced = $PKG->migrate_priv_secrets('tn-mig', all_nodes_upgraded => 1);
         is(scalar(@{ $forced->{moved} }), 4,
             'migrate_priv_secrets: --all-nodes-upgraded bypasses the check and migrates');
-        $NODES_JSON = encode_json([{ node => 'solo', status => 'online' }]);
+        $MEMBERS_JSON = members_json('solo', solo => { online => 1, ip => '10.0.0.1' });
     }
 
     is(call('_tn_priv_read', 'tn-mig', 'pw'), '1-inline-key',
@@ -550,6 +619,75 @@ SKIP: {
     is($rc, 0, 'migrate_secrets_cli --dry-run: exit 0');
     like($out, qr/\[dry-run\]/, '  ...marks the output as a dry run');
     ok(exists($STORECFG_IDS{'tn-cli'}{tn_api_key}), '  ...and did not actually move anything');
+
+    # --------------------------- R8: rotation on an unready cluster ---
+    # pvesm set --tn_api_key ... (and any other update that would self-heal
+    # a stale inline copy) applies the SAME cluster-readiness policy as
+    # migrate_priv_secrets(): on an unconfirmed multi-node cluster, keep
+    # BOTH copies (priv already wins at runtime) instead of stripping the
+    # inline one and making the storage vanish on an old node.
+    {
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => '0');   # pve2 too old to confirm
+
+        my $scfg = { storeid => 'tn-rot', tn_api_host => 'h', tn_api_key => 'OLD-INLINE-KEY' };
+        call('on_update_hook_full', $PKG, 'tn-rot', $scfg, {}, [], { tn_api_key => 'NEW-KEY' });
+
+        is(call('_tn_priv_read', 'tn-rot', 'pw'), 'NEW-KEY',
+            'R8: rotation on an unready cluster still writes the NEW key to priv');
+        is($scfg->{tn_api_key}, 'OLD-INLINE-KEY',
+            '  ...but keeps the OLD value inline too - never strips it without cluster confirmation');
+
+        # Once the cluster IS confirmed ready, the next update (even one
+        # that does not touch the key at all) self-heals the leftover
+        # inline copy.
+        $MEMBERS_JSON = members_json('solo', solo => { online => 1, ip => '10.0.0.1' });
+        call('on_update_hook_full', $PKG, 'tn-rot', $scfg, { nodes => 'pve3' }, [], {});
+        ok(!exists($scfg->{tn_api_key}),
+            '  ...and self-heals once the cluster is confirmed ready on a later update');
+        is(call('_tn_priv_read', 'tn-rot', 'pw'), 'NEW-KEY', '    ...priv still has the NEW key');
+    }
+
+    # ------------------------- R9: differing priv vs inline gets a warning ---
+    {
+        $MEMBERS_JSON = members_json('solo', solo => { online => 1, ip => '10.0.0.1' });
+        call('on_add_hook', $PKG, 'tn-warn', {}, tn_api_key => 'PRIV-VALUE');
+        my $scfg = { storeid => 'tn-warn', tn_api_key => 'DIFFERENT-STALE-VALUE' };
+
+        my @warned;
+        local $SIG{__WARN__} = sub { push @warned, @_ };
+        # syslog() doesn't go through __WARN__, so this only proves the
+        # self-heal branch runs without dying on a differing value; the
+        # actual "conserva priv" outcome is asserted directly below (the
+        # same guarantee migrate's conflict-kept-priv gives, applied here).
+        call('on_update_hook_full', $PKG, 'tn-warn', $scfg, { nodes => 'pve3' }, [], {});
+
+        is(call('_tn_priv_read', 'tn-warn', 'pw'), 'PRIV-VALUE',
+            'R9: priv keeps ITS value when it differs from a stale inline copy - never silently overwritten');
+        ok(!exists($scfg->{tn_api_key}),
+            '  ...and the differing inline copy is still cleaned up (cluster is ready in this scenario)');
+    }
+
+    # --------------------------- K9: on_add_hook warns on a mixed cluster ---
+    {
+        $MEMBERS_JSON = members_json('pve1',
+            pve1 => { online => 1, ip => '10.0.0.1' },
+            pve2 => { online => 1, ip => '10.0.0.2' },
+        );
+        %NODE_PROBE_OK = ('10.0.0.2' => '0');
+
+        my $ok = eval {
+            call('on_add_hook', $PKG, 'tn-newmixed', {}, tn_api_key => 'FRESH-KEY');
+            1;
+        };
+        ok($ok, 'K9: on_add_hook does not refuse creation just because the cluster looks unready')
+            or diag("died with: $@");
+        is(call('_tn_priv_read', 'tn-newmixed', 'pw'), 'FRESH-KEY',
+            '  ...the key is still written to priv normally');
+    }
 }
 
 # ---------------------------------------------------- H4: on_update_hook ---
@@ -593,30 +731,94 @@ SKIP: {
         '_tn_redact_for_log: passes undef through instead of dying (a non-ref $res can be undef)');
 }
 
-# ---------------------------------------------------- K4: process cache ---
+# R5: a naive `[^"]*` value pattern stops at the first escaped quote INSIDE
+# the value and leaves everything after it exposed - found in review:
+# {"password":"a\"SECRET"} leaked SECRET through the previous regex. Same
+# bug applies to both the string-level fallback and would apply to any
+# regex-based approach for the structural path too, which is exactly why
+# _api_call()'s own logging switched to walking the decoded structure
+# instead (tested separately below) - this pins the string-level fallback
+# specifically, since tools/truenas-plugin-broker (K6) has no decoded
+# structure to walk.
+{
+    my $redacted = call('_tn_redact_for_log', qq({"password":"a\\"SECRET","host":"h"}));
+    unlike($redacted, qr/SECRET/, 'R5: an escaped quote inside the value does not stop the redaction early');
+    like($redacted, qr/"host":"h"/, '  ...and a field after it is still left alone');
+}
+
+# ------------------------------------------------- R5: structural redaction ---
+# _api_call()'s own request/response logging walks the DECODED structure
+# and redacts by key before ever calling encode_json() - see
+# _tn_redact_structure()'s own comment for why (a regex over already-quoted
+# JSON has to reconstruct what "one string value" looks like and can get it
+# wrong; walking real Perl values never has that problem).
+{
+    my $redacted = call('_tn_redact_structure', {
+        api_key => '1-verysecret',
+        host    => '192.0.2.1',
+        nested  => { dhchap_key => 'DHHC-1:01:xyz:', label => 'ok' },
+        list    => [ { password => 'a"SECRET' }, { plain => 'value' } ],
+    });
+    is($redacted->{api_key}, '<redacted>', '_tn_redact_structure: redacts a top-level sensitive key');
+    is($redacted->{host}, '192.0.2.1', '  ...leaves a non-sensitive top-level key alone');
+    is($redacted->{nested}{dhchap_key}, '<redacted>', '  ...redacts a sensitive key nested in a hash');
+    is($redacted->{nested}{label}, 'ok', '  ...leaves the rest of that nested hash alone');
+    is($redacted->{list}[0]{password}, '<redacted>',
+        '  ...redacts inside an array of hashes, and the embedded quote is no obstacle at all (no JSON parsing involved)');
+    is($redacted->{list}[1]{plain}, 'value', '  ...leaves an unrelated array entry alone');
+
+    # The original is untouched - this is a redacted COPY, not a mutation,
+    # so the real value is still there for whatever actually needs it
+    # (e.g. the API call itself, which happens before this is ever
+    # called).
+    my $probe = { api_key => 'still-here' };
+    call('_tn_redact_structure', $probe);
+    is($probe->{api_key}, 'still-here', '_tn_redact_structure: does not mutate its argument');
+}
+
+# --------------------------------------------------- R1: no priv cache ---
+# QA round 3 (Codex+Opus, reproduced against a live node): an earlier
+# version of this file HAD a process-local cache here, and it was a real
+# regression, not a hypothetical - pvestatd runs for DAYS without forking,
+# and pvedaemon reuses a worker for up to max_requests => 1000 before
+# recycling, so a cache keyed only on "have I read this before in this
+# process" never invalidates in either one. Measured effects: after
+# migrate-secrets, long-running processes on every node kept reporting
+# "API key missing" (the cache had memorized the pre-migration "nothing in
+# priv" answer as permanent, forever); a rotation never took effect (the
+# cache kept serving the revoked key to every subsequent call in that
+# process); and the H1 self-heal guard used the cache as proof a priv file
+# existed, which could delete a storage's only inline copy on a stale
+# cached answer. Fixed by removing the cache entirely (_tn_priv_read()
+# reads the file fresh every call, same as PBSPlugin.pm's own
+# pbs_get_password()).
+#
+# This proves it with a genuinely SEPARATE, already-running process - not
+# a fork, which would pass this assertion regardless of whether a cache
+# existed (fork() gives the child independent memory immediately, so it
+# proves nothing about THIS process's own cache). The scenario modeled is
+# the real one: pvedaemon handling a concurrent `pvesm set --tn_api_key
+# ...` while THIS process (standing in for pvestatd) is already running
+# and has already read the old key once.
 {
     call('on_add_hook', $PKG, 'tn-cache', {}, tn_api_key => 'CACHE-V1');
     my $scfg = { storeid => 'tn-cache' };
-    is(call('_tn_api_key', $scfg), 'CACHE-V1', 'cache: first read gets the value just written');
-
-    # Rewrite the file directly, bypassing _tn_priv_write() - simulates
-    # nothing (this is deliberately NOT how a real rotation happens); the
-    # point is that the cache, once populated, is what a same-process read
-    # returns until something in-process invalidates it.
-    my $file = call('_tn_priv_file', 'tn-cache', 'pw');
-    open(my $fh, '>', $file) or die $!;
-    print $fh "BYPASSED-WRITE\n";
-    close($fh);
     is(call('_tn_api_key', $scfg), 'CACHE-V1',
-        '  ...a file changed OUTSIDE _tn_priv_write() does not invalidate the cache (documented scope: same-process only)');
+        'sanity: this long-lived process reads the key it just wrote');
 
-    # A rotation THROUGH the plugin's own hook, in the same process, must
-    # be visible on the very next read - this is the actual guarantee K4
-    # asks for.
-    call('on_update_hook_full', $PKG, 'tn-cache', { storeid => 'tn-cache' },
-        {}, [], { tn_api_key => 'CACHE-V2' });
+    # A second, real, independent `perl` process writes the priv file
+    # directly - standing in for another PVE process performing a
+    # rotation via on_update_hook_full() while this one keeps running.
+    my $file = call('_tn_priv_file', 'tn-cache', 'pw');
+    my $writer = tempdir(CLEANUP => 1) . '/writer.pl';
+    open(my $wfh, '>', $writer) or die $!;
+    print $wfh q{open(my $fh, '>', $ARGV[0]) or die $!; print $fh "$ARGV[1]\n"; close($fh);};
+    close($wfh);
+    system($^X, $writer, $file, 'CACHE-V2') == 0
+        or die "setup failed: second perl process could not write $file";
+
     is(call('_tn_api_key', $scfg), 'CACHE-V2',
-        'cache: a same-process rotation via the hook is visible on the very next read');
+        'R1: a rotation made by a DIFFERENT, already-running process is visible on the very next read - nothing left to go stale');
 }
 
 done_testing();

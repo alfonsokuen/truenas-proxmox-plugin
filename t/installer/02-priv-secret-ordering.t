@@ -210,6 +210,122 @@ SKIP: {
                 "remove_storage_config: deletes the .$suffix priv file");
         }
     }
+
+    # --------------------------------------------------------------- R3 ---
+    # get_storage_config_value() declared `local config_block value`
+    # without initializing $value - under `set -u`, that leaves it UNSET
+    # (not empty), and the case statement only assigns $value for
+    # tn_api_key/tn_chap_password, so reading any OTHER property hit
+    # "value: unbound variable" and aborted the whole script.
+    {
+        open(my $cfh, '>', $cfg_file) or die $!;
+        print $cfh "truenasplugin: tn-r3\n\ttn_api_host 192.0.2.9\n\ttn_dataset tank/pve\n";
+        close($cfh);
+
+        my ($rc, $out) = run_bash_fn($env, $SCRIPT,
+            q{get_storage_config_value tn-r3 tn_api_host});
+        chomp $out;
+        is($rc, 0, 'R3: reading a non-secret property does not abort under set -u')
+            or diag("rc=$rc out=$out");
+        is($out, '192.0.2.9', '  ...and returns the right value');
+    }
+
+    # --------------------------------------------------------------- R4 ---
+    # get_all_storage_config_values() piped several greps together under
+    # `set -euo pipefail`; any of them finding no match (exit 1) aborted
+    # the WHOLE function before it ever reached the priv-file fallback -
+    # exactly the case for a migrated storage (no tn_api_key inline at
+    # all) or a legacy one that never configured CHAP.
+    {
+        # (a) migrated: no tn_api_key inline, only in priv.
+        run_bash_fn($env, $SCRIPT, q{write_priv_secret tn-r4a pw MIGRATED-KEY});
+        open(my $cfh, '>', $cfg_file) or die $!;
+        print $cfh "truenasplugin: tn-r4a\n\ttn_api_host 192.0.2.10\n\ttn_dataset tank/pve\n";
+        close($cfh);
+        my ($rc_a, $out_a) = run_bash_fn($env, $SCRIPT, q{get_all_storage_config_values tn-r4a});
+        is($rc_a, 0, 'R4a: a migrated storage (no inline tn_api_key) does not abort') or diag($out_a);
+        like($out_a, qr/^tn_api_key=MIGRATED-KEY$/m, '  ...and the priv key still comes through');
+
+        # (b) legacy, no CHAP ever configured: tn_chap_password absent
+        # both inline and in priv.
+        open($cfh, '>', $cfg_file) or die $!;
+        print $cfh "truenasplugin: tn-r4b\n\ttn_api_host 192.0.2.11\n\ttn_api_key INLINE-B\n\ttn_dataset tank/pve\n";
+        close($cfh);
+        my ($rc_b, $out_b) = run_bash_fn($env, $SCRIPT, q{get_all_storage_config_values tn-r4b});
+        is($rc_b, 0, 'R4b: legacy storage with no CHAP at all does not abort') or diag($out_b);
+        like($out_b, qr/^tn_api_key=INLINE-B$/m, '  ...inline key still comes through');
+        unlike($out_b, qr/tn_chap_password/, '  ...and no tn_chap_password line is fabricated');
+
+        # (c) legacy, everything inline (pre-idk21 storage, never migrated).
+        open($cfh, '>', $cfg_file) or die $!;
+        print $cfh "truenasplugin: tn-r4c\n\ttn_api_host 192.0.2.12\n\ttn_api_key INLINE-C\n"
+          . "\ttn_chap_password CHAP-C\n\ttn_dataset tank/pve\n";
+        close($cfh);
+        my ($rc_c, $out_c) = run_bash_fn($env, $SCRIPT, q{get_all_storage_config_values tn-r4c});
+        is($rc_c, 0, 'R4c: fully legacy (inline) storage does not abort') or diag($out_c);
+        like($out_c, qr/^tn_api_key=INLINE-C$/m, '  ...inline key present');
+        like($out_c, qr/^tn_chap_password=CHAP-C$/m, '  ...inline CHAP present');
+    }
+
+    # --------------------------------------------------------------- R2 ---
+    # remove_storage_config() used to `mv "$temp_file" "$STORAGE_CFG"`
+    # with no error check, then delete the priv secrets regardless of
+    # whether that mv actually succeeded - a failed publish (disk full,
+    # permission issue) still lost the key. Shadow `mv` with a function
+    # that always fails, sourced AFTER install.sh so it overrides the
+    # builtin lookup, and confirm the priv files survive.
+    {
+        run_bash_fn($env, $SCRIPT, q{write_priv_secret tn-r2 pw SURVIVES});
+        open(my $cfh, '>', $cfg_file) or die $!;
+        print $cfh "truenasplugin: tn-r2\n\ttn_api_host 192.0.2.13\n\ttn_dataset tank/pve\n";
+        close($cfh);
+
+        # install.sh runs under `set -euo pipefail`, inherited by this
+        # sourcing shell - a bare `remove_storage_config tn-r2` returning
+        # 1 would abort the whole one-liner before the echo below ever
+        # ran. An if/else condition is exempt from `set -e` (same reason
+        # every other call site in install.sh itself checks this
+        # function's result with `if`/`||`, never bare).
+        my $out = `bash -c "$env source '$SCRIPT' >/dev/null 2>/dev/null; mv() { return 1; }; if remove_storage_config tn-r2; then rc=0; else rc=\\\$?; fi; echo RC=\\\$rc" 2>/dev/null`;
+        my ($rc_line) = $out =~ /RC=(\d+)/;
+        is($rc_line, '1', 'R2: remove_storage_config reports failure when mv fails')
+            or diag("output was: $out");
+        is(call_cat("$priv_dir/tn-r2.pw"), 'SURVIVES',
+            '  ...and the priv secret is NOT deleted when storage.cfg could not be updated');
+    }
+}
+
+sub call_cat {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or return undef;
+    my $line = <$fh>;
+    close($fh);
+    chomp $line if defined $line;
+    return $line;
+}
+
+# ------------------------------------------------------------------ K5 ---
+# menu_edit_storage() writes the NEW key to priv before calling
+# update_storage_config() (H5's ordering). If that update then fails, the
+# rotation must be rolled back - otherwise priv has the NEW key while
+# storage.cfg still describes the OLD configuration, a half-applied edit.
+# Full interactive coverage would need to drive menu_edit_storage()'s TTY
+# prompts; this pins the fix as a static regression guard instead, the
+# same technique the K1 guard above uses.
+{
+    open(my $fh, '<', $SCRIPT) or die "cannot read $SCRIPT: $!";
+    my $body = do { local $/; <$fh> };
+    close($fh);
+
+    if ($body =~ /^menu_edit_storage\(\)\s*\{(.*?)^\}/ms) {
+        my $fn_body = $1;
+        like($fn_body, qr/had_previous_key/,
+            'K5: menu_edit_storage() captures whether a previous priv key existed before rotating');
+        like($fn_body, qr/write_priv_secret "\$storage_name" "pw" "\$previous_key"/,
+            '  ...and restores it specifically on update_storage_config failure');
+    } else {
+        fail('K5: could not find menu_edit_storage() to check for the rollback');
+    }
 }
 
 done_testing();
