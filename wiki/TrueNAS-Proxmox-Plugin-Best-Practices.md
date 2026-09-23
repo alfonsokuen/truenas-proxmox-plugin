@@ -322,8 +322,9 @@ are all `sensitive-properties`, so `pvesm add`/`set`/the GUI write them to
 /storage/<id>` needs only `Datastore.Allocate` to return the config
 verbatim, and www-data reads the file directly (`0640 root:www-data`, not
 world-readable). Migrate an older storage with `truenas-proxmox-manage
-migrate-secrets <storeid>` (`migrate-api-key` also still works, as an
-alias). See [Configuration.md](Configuration.md#tn_api_key).
+migrate-secrets <storeid>` - only once every cluster node runs a plugin
+new enough to read it (the command checks and refuses otherwise; see
+[Tools.md](Tools.md#migrate-secrets)). See [Configuration.md](Configuration.md#tn_api_key).
 
 Key parameters (a subset of the full option set):
 

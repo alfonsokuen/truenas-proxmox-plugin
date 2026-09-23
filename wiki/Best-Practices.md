@@ -401,8 +401,7 @@ PVE 9 is `0640 root:www-data`, not world-readable, but `pvesh get
 no business seeing a FULL_ADMIN TrueNAS credential - and the www-data
 group reads the file directly. A storage configured before idk21 still has
 its secrets inline for backward compatibility; move them with
-`truenas-proxmox-manage migrate-secrets <storeid>` (`migrate-api-key` also
-still works, as an alias). See
+`truenas-proxmox-manage migrate-secrets <storeid>`. See
 [Configuration.md](Configuration.md#tn_api_key) for the full explanation.
 The `tn_api_key_file` lines in the examples below are kept only so this
 page's history is visible in the diff; do not use them in a real

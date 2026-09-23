@@ -147,17 +147,20 @@ as shown above - but matters for three things:
   before.
 - **A storage configured before this change**: any of the four still works
   exactly as before, read straight out of `storage.cfg`, for backward
-  compatibility. Move them to the priv files at your convenience with:
+  compatibility. Move them to the priv files with:
 
   ```
   truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]
   ```
 
-  (`migrate-api-key` is kept working too, as an alias for this command's
-  name before it covered more than the API key.) This is optional and
-  idempotent - not required for the storage to keep working, and safe to
-  run more than once. See
-  [Tools.md](Tools.md#migrate-api-key) for details.
+  Not required for the storage to keep working, and idempotent - safe to
+  run more than once - but **not something to run mid-upgrade on a
+  cluster**: idk20 and older require `tn_api_key` inline and silently
+  **skip** a storage section that lacks it, so migrating while any node
+  still runs a plugin that old would make the storage disappear from
+  `pvesm status` there. The command checks every cluster node itself and
+  refuses to run otherwise; see
+  [Tools.md](Tools.md#migrate-secrets) for details.
 
 ### `tn_target_iqn`
 **Description**: iSCSI target IQN (iSCSI Qualified Name)

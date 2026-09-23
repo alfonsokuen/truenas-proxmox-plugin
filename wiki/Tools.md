@@ -14,7 +14,7 @@ The plugin includes several tools to simplify installation, testing, cluster man
 
 **Subcommands** (via `truenas-proxmox-manage`):
 - **[Import Foreign Snapshots](#import-foreign-snapshots)** - Adopt snapshots taken on TrueNAS into a VM's configuration
-- **[Migrate Secrets](#migrate-secrets)** - Move a storage's `tn_api_key`/`tn_chap_password`/DH-CHAP secrets out of `storage.cfg` into `/etc/pve/priv/storage` (also: `migrate-api-key`, compat alias)
+- **[Migrate Secrets](#migrate-secrets)** - Move a storage's `tn_api_key`/`tn_chap_password`/DH-CHAP secrets out of `storage.cfg` into `/etc/pve/priv/storage`
 
 **Standalone Tools**:
 - **[Development Test Suite](#development-test-suite)** - **Development/testing only** - Comprehensive plugin testing
@@ -111,11 +111,8 @@ container goes through `PVE::LXC::Config` with `rootfs`/`mpN` instead of
 ## Migrate Secrets
 
 ```
-truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]
+truenas-proxmox-manage migrate-secrets <storeid> [--dry-run] [--all-nodes-upgraded]
 ```
-
-`migrate-api-key` also works, as an alias for this command's name from
-before it covered more than the API key.
 
 `tn_api_key`, `tn_chap_password`, `tn_nvme_dhchap_secret` and
 `tn_nvme_dhchap_ctrl_secret` are all `sensitive-properties` (see
@@ -129,9 +126,29 @@ root:www-data` (not world-readable), but `pvesh get /storage/<id>` needs
 only the `Datastore.Allocate` permission to return it verbatim, and
 anything in the `www-data` group reads the file directly.
 
+**Cluster upgrade order matters, this is not "run it whenever":** idk20
+and older require `tn_api_key` inline in `storage.cfg` and **silently
+SKIP** the whole storage section without it (verified against a real
+idk20 install). Migrating while any other cluster node still runs a
+plugin that old makes the storage disappear from `pvesm status` there the
+moment the change lands in `/etc/pve` - every node reads the same shared
+file. The command checks this itself: it asks every online node (over the
+same SSH mechanism `install.sh` uses to push the plugin) whether its
+installed plugin can even read a priv file at all, and refuses to run
+(outside `--dry-run`, which never writes) if any node cannot be
+confirmed - offline, unreachable, or too old. `--all-nodes-upgraded`
+skips that check for when it cannot run here (e.g. no SSH access between
+nodes) but you have confirmed the whole cluster is upgraded yourself. The
+same caution applies to creating a **new** storage in a cluster with mixed
+plugin versions: the new storage's key goes straight to a priv file with
+nothing inline, so an old node in the same cluster would skip it the same
+way - upgrade every node before adding new TrueNAS storages, not just
+before migrating existing ones.
+
 | Flag | Effect |
 |---|---|
-| `--dry-run` | Print what would move, write nothing |
+| `--dry-run` | Print what would move, write nothing (also skips the cluster-readiness check, which is safe since nothing writes) |
+| `--all-nodes-upgraded` | Skip the cluster-readiness check (you have already confirmed it) |
 
 ```
 $ truenas-proxmox-manage migrate-secrets tn-prod --dry-run
@@ -141,6 +158,18 @@ Dry run: nothing was written.
 $ truenas-proxmox-manage migrate-secrets tn-prod
 tn_api_key           -> /etc/pve/priv/storage/tn-prod.pw
 Moved 1 secret(s) for 'tn-prod' into /etc/pve/priv/storage.
+```
+
+If a priv file already exists with a **different** value than the inline
+one (e.g. the storage was rotated after migrating, and then hand-edited
+back), priv wins - it is what the plugin actually uses at runtime - and
+the stale inline copy is discarded with a warning, never silently
+overwritten:
+
+```
+$ truenas-proxmox-manage migrate-secrets tn-prod
+[dry-run] WARNING: tn_api_key: priv already has a different value; kept it and discarded the stale inline copy instead of overwriting it
+tn_api_key           -> kept existing /etc/pve/priv/storage/tn-prod.pw, discarded stale inline copy
 ```
 
 Rules:
@@ -153,11 +182,12 @@ Rules:
 - Not run automatically by the installer or the package's `postinst` on
   upgrade - a background rewrite of every node's `storage.cfg` during a
   package upgrade is not something to do without the operator asking for
-  it. Run it by hand, on any one node, whenever convenient; the priv files
-  live under `/etc/pve`, so they are visible cluster-wide immediately.
+  it, and the cluster-readiness requirement above means it should not run
+  unattended mid-rollout in any case.
 
 Exit codes: `0` done (including "nothing to migrate"), `1` error (storage
-not found, wrong type, or the lock/write failed).
+not found, wrong type, cluster not confirmed ready, or the lock/write
+failed).
 
 ---
 
