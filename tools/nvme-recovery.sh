@@ -225,10 +225,12 @@ get_storage_value() {
 
     # tn_api_key/tn_chap_password moved out of storage.cfg into
     # /etc/pve/priv/storage/<storeid>.{pw,chap} (see TrueNASPlugin.pm's
-    # on_add_hook/on_update_hook_full and 'sensitive-properties'). A storage
-    # migrated with `truenas-proxmox-manage migrate-api-key` has nothing
-    # left inline, so this recovery tool needs the same fallback the plugin
-    # itself uses, or every command here would silently see an empty key.
+    # on_add_hook/on_update_hook_full and 'sensitive-properties'; this tool
+    # never reads tn_nvme_dhchap_secret/tn_nvme_dhchap_ctrl_secret, so no
+    # fallback is needed for those two). A storage migrated with
+    # `truenas-proxmox-manage migrate-secrets` has nothing left inline, so
+    # this recovery tool needs the same fallback the plugin itself uses, or
+    # every command here would silently see an empty key.
     if [[ -z "$value" ]]; then
         case "$param_name" in
             tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;

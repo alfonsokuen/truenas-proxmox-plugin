@@ -764,14 +764,17 @@ COMMANDS:
                         with a name PVE accepts and no dependent clone, are
                         imported.
 
-    migrate-api-key <storeid> [--dry-run]
-                        Move tn_api_key/tn_chap_password for an existing
-                        truenasplugin storage out of storage.cfg (world-
-                        readable) into /etc/pve/priv/storage (root-only).
-                        Storages created or edited after this installer
-                        already store secrets there; this is only needed for
-                        one configured before the upgrade. Safe to run more
-                        than once.
+    migrate-secrets <storeid> [--dry-run]
+                        Move tn_api_key/tn_chap_password/tn_nvme_dhchap_secret/
+                        tn_nvme_dhchap_ctrl_secret for an existing truenasplugin
+                        storage out of storage.cfg (readable via `pvesh get
+                        /storage/<id>` with the Datastore.Allocate permission,
+                        and by the www-data group) into /etc/pve/priv/storage
+                        (root-only). Storages created or edited after this
+                        installer already store secrets there; this is only
+                        needed for one configured before the upgrade. Safe to
+                        run more than once. `migrate-api-key` is kept working
+                        as an alias for this command's pre-idk21 name.
 
 OPTIONS:
     --version           Display installer version
@@ -790,9 +793,9 @@ EXAMPLES:
     # Show what could be imported for VM 100, without writing anything
     truenas-proxmox-manage import-snapshots 100 --dry-run
 
-    # Move an existing storage's tn_api_key out of storage.cfg
-    truenas-proxmox-manage migrate-api-key tn-prod --dry-run
-    truenas-proxmox-manage migrate-api-key tn-prod
+    # Move an existing storage's secrets out of storage.cfg
+    truenas-proxmox-manage migrate-secrets tn-prod --dry-run
+    truenas-proxmox-manage migrate-secrets tn-prod
 
     # Non-interactive APT bootstrap install
     $0 --non-interactive --apt-install --apt-suite trixie
@@ -829,11 +832,21 @@ parse_arguments() {
                     -e 'exit PVE::Storage::Custom::TrueNASPlugin::snapshot_import_cli(@ARGV)' \
                     -- "$@"
                 ;;
-            migrate-api-key)
+            migrate-secrets)
                 # Same rationale as import-snapshots above: dispatched before
                 # the installer proper starts, exec replaces this shell, and
                 # the logic lives in the plugin since it is the only thing
                 # that knows the priv-file layout it itself reads from.
+                shift
+                exec perl -MPVE::Storage::Custom::TrueNASPlugin \
+                    -e 'exit PVE::Storage::Custom::TrueNASPlugin::migrate_secrets_cli(@ARGV)' \
+                    -- "$@"
+                ;;
+            migrate-api-key)
+                # Pre-idk21 name of migrate-secrets, back when it only
+                # covered tn_api_key. Kept as a working alias - dispatches
+                # to the plugin's own compatibility alias sub, not a
+                # duplicate implementation.
                 shift
                 exec perl -MPVE::Storage::Custom::TrueNASPlugin \
                     -e 'exit PVE::Storage::Custom::TrueNASPlugin::migrate_api_key_cli(@ARGV)' \
@@ -4410,10 +4423,13 @@ get_storage_config_value() {
 
     # tn_api_key/tn_chap_password moved out of storage.cfg into
     # /etc/pve/priv/storage/<storeid>.{pw,chap} (see TrueNASPlugin.pm's
-    # on_add_hook/on_update_hook_full and 'sensitive-properties'). Fall back
-    # to the priv file so every caller of this function keeps working for a
-    # storage that has run `truenas-proxmox-manage migrate-api-key`, or was
-    # created after this installer version, with no changes on their end.
+    # on_add_hook/on_update_hook_full and 'sensitive-properties'; the other
+    # two sensitive properties, tn_nvme_dhchap_secret/tn_nvme_dhchap_ctrl_secret,
+    # are not read anywhere in this installer, so they need no fallback
+    # here). Fall back to the priv file so every caller of this function
+    # keeps working for a storage that has run
+    # `truenas-proxmox-manage migrate-secrets`, or was created after this
+    # installer version, with no changes on their end.
     if [[ -z "$value" ]]; then
         case "$param_name" in
             tn_api_key)       value=$(cat "/etc/pve/priv/storage/${storage_name}.pw" 2>/dev/null || true) ;;
@@ -9481,9 +9497,12 @@ generate_storage_config() {
     # every caller of this function right after update_storage_config
     # succeeds - never before, so a cancelled review never leaves an orphan
     # priv file for a storage that was never created). Writing it here would
-    # put a FULL_ADMIN TrueNAS credential straight back into storage.cfg,
-    # which is mode 0644 - the exact bug this whole file's tn_api_key
-    # handling exists to fix. See TrueNASPlugin.pm's 'sensitive-properties'.
+    # put a FULL_ADMIN TrueNAS credential straight back into storage.cfg -
+    # readable via `pvesh get /storage/<id>` by anyone holding
+    # Datastore.Allocate, and by the www-data group that owns the file
+    # (mode 0640, not world-readable, but still the exact bug this whole
+    # file's tn_api_key handling exists to fix). See TrueNASPlugin.pm's
+    # 'sensitive-properties'.
     cat <<EOF
 truenasplugin: ${name}
 	tn_api_host ${ip}
@@ -9547,7 +9566,8 @@ EOF
 # add`/`pvesm set`. This installer edits storage.cfg directly instead of
 # going through the PVE storage API, so those hooks never run for a storage
 # created or edited here - this is what keeps the guided wizard from
-# putting the key right back into a 0644 file. Call ONLY after the
+# putting the key right back where GET /storage/<id> and the www-data
+# group can read it. Call ONLY after the
 # corresponding add_storage_config/update_storage_config has already
 # succeeded, so a cancelled or failed review never leaves an orphan secret
 # file for a storage that was never actually created.
