@@ -1,3 +1,35 @@
+truenas-proxmox-plugin (1:2.1.23~alpha1+idk22) unstable; urgency=medium
+
+  * Seguridad: `tn_nvme_dhchap_secret` y `tn_nvme_dhchap_ctrl_secret`
+    (DH-HMAC-CHAP de NVMe/TCP) tenian la misma exposicion que idk21 arreglo
+    para `tn_api_key`/`tn_chap_password` - vivian en claro en `storage.cfg`
+    y salian por `pvesh get /storage/<id>`. Pasan a 'sensitive-properties'
+    igual que las otras dos, con fichero propio en
+    `/etc/pve/priv/storage/<storeid>.{dhchap,dhchapctrl}` (0600); todas las
+    lecturas en TrueNASPlugin.pm (`_nvme_ensure_host_registered`, el
+    builder de `nvme connect`) pasan por los helpers nuevos
+    `_tn_nvme_dhchap_secret`/`_tn_nvme_dhchap_ctrl_secret`, con el mismo
+    fallback a `$scfg` para clusters no migrados. La subcomanda de
+    migracion se renombra a `truenas-proxmox-manage migrate-secrets
+    <storeid> [--dry-run]` (ya mueve las 4 propiedades sensibles, no solo
+    la API key); `migrate-api-key` queda como alias que sigue funcionando,
+    en Perl (`migrate_api_key_cli` llama a `migrate_secrets_cli`) y en el
+    dispatch de `install.sh`. Revisadas las 46 `properties()` completas:
+    ningun otro campo es un secreto.
+
+  * Correccion (idk21 se equivocaba en esto): el comentario y la wiki
+    decian que `/etc/pve/storage.cfg` es "0644, world-readable" - en PVE 9
+    es `0640 root:www-data`, verificado en un nodo real, no world-readable.
+    El riesgo real que este fix cierra no es "cualquiera en el sistema
+    puede leer el archivo": es que `pvesh get /storage/<id>` (permiso
+    Datastore.Allocate, tipicamente en manos de un admin de storage sin
+    motivo para ver una key FULL_ADMIN de TrueNAS) devuelve el config
+    completo, y que cualquier proceso en el grupo www-data (pveproxy)
+    lee el fichero directamente. Corregido en TrueNASPlugin.pm,
+    install.sh y las 4 paginas de wiki que repetian la cifra equivocada.
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 11:30:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
 
   * Seguridad: `pvesh get /storage/<id>` (y por tanto la API, la GUI y

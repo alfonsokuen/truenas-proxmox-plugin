@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk21';
+our $VERSION = '2.1.23~alpha1+idk22';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -537,13 +537,17 @@ sub plugindata {
         # extracted from the request into a separate %sensitive hash BEFORE
         # check_config ever sees $param, and handed only to on_add_hook /
         # on_update_hook_full. That is what keeps them out of the return
-        # value of `pvesh get /storage/<id>` and out of storage.cfg (0644,
-        # world-readable) - the same mechanism PBSPlugin.pm uses for
-        # `password`/`encryption-key` and CIFSPlugin.pm for `password`. See
-        # _tn_priv_file() below for where they actually live on disk.
+        # value of `pvesh get /storage/<id>` and out of storage.cfg - the
+        # same mechanism PBSPlugin.pm uses for `password`/`encryption-key`
+        # and CIFSPlugin.pm for `password`. See _tn_priv_file() below for
+        # where they actually live on disk, and its header comment for the
+        # real exposure this closes (storage.cfg's own mode is 0640, not
+        # world-readable).
         'sensitive-properties' => {
-            tn_api_key       => 1,
-            tn_chap_password => 1,
+            tn_api_key                 => 1,
+            tn_chap_password           => 1,
+            tn_nvme_dhchap_secret      => 1,
+            tn_nvme_dhchap_ctrl_secret => 1,
         },
     };
 }
@@ -1182,6 +1186,15 @@ sub check_config {
         # DHCHAP secrets only take effect with an explicit host whitelist. With
         # open access (the default), the target accepts any host regardless of
         # any key, so authentication is not actually enforced.
+        #
+        # Like tn_chap_user/tn_chap_password below, this only fires on a
+        # config-file parse where the secret is still inline (pre-migration
+        # back-compat) - both DHCHAP secrets are sensitive-properties now, so
+        # a real `pvesm add`/`set` never puts them in $opts here at all (see
+        # on_add_hook()/on_update_hook_full()). A false negative on a fresh
+        # nvme-tcp storage with allow-any-host left at its default is the
+        # acceptable side effect of not threading %sensitive into
+        # check_config() for the sake of one warning.
         if (($opts->{tn_nvme_dhchap_secret} || $opts->{tn_nvme_dhchap_ctrl_secret})
             && _nvme_allow_any_host($opts)) {
             syslog('warning',
@@ -1216,19 +1229,28 @@ sub check_config {
 }
 
 # ======== Sensitive credential storage (/etc/pve/priv) ========
-# tn_api_key and tn_chap_password are declared in plugindata()'s
+# tn_api_key, tn_chap_password, tn_nvme_dhchap_secret and
+# tn_nvme_dhchap_ctrl_secret are declared in plugindata()'s
 # 'sensitive-properties' (see above), the same mechanism PVE's own
 # PBSPlugin.pm (password, encryption-key, master-pubkey) and CIFSPlugin.pm
 # (password) use. PVE::API2::Storage::Config extracts them from the request
 # before check_config/write_config ever see them and hands them to
 # on_add_hook / on_update_hook_full / on_delete_hook below as a separate
-# %sensitive hash. That keeps them:
-#   - out of storage.cfg, which is mode 0644 (world-readable) by default;
-#   - out of `pvesh get /storage/<id>` and the GUI's storage list, both of
-#     which just serialize storage.cfg's parsed config.
+# %sensitive hash.
+#
+# What this actually fixes: /etc/pve/storage.cfg on PVE 9 is mode 0640,
+# root:www-data - NOT world-readable, and this file never claimed it was
+# after checking it on a live node. The real exposure is narrower but still
+# real: `pvesh get /storage/<id>` (and the GUI's storage list, which calls
+# the same API) requires only the Datastore.Allocate permission on
+# /storage - a role routinely handed to a storage admin who has no business
+# holding a FULL_ADMIN TrueNAS credential - and it serializes whatever is in
+# storage.cfg's parsed config verbatim. Group www-data also reads the file
+# directly: pveproxy and anything else running in that group. Keeping these
+# four properties out of storage.cfg closes both paths at once.
 # They are written to /etc/pve/priv/storage/<storeid>.<suffix> instead - the
 # same directory PBS/CIFS use, mode 0600, readable only by root. The suffix
-# distinguishes the two secrets a single TrueNAS storage can have; 'pw'
+# distinguishes which of the four secrets a file holds; 'pw'
 # matches PBSPlugin.pm's own file for the API key so an admin who already
 # knows that convention finds it in the expected place.
 #
@@ -1242,8 +1264,10 @@ sub check_config {
 # a rotated key to the priv file, a stale copy left behind in storage.cfg
 # (e.g. by an admin who edited the file by hand) must not silently win.
 my %TN_SENSITIVE_SUFFIX = (
-    tn_api_key       => 'pw',
-    tn_chap_password => 'chap',
+    tn_api_key                 => 'pw',
+    tn_chap_password           => 'chap',
+    tn_nvme_dhchap_secret      => 'dhchap',
+    tn_nvme_dhchap_ctrl_secret => 'dhchapctrl',
 );
 
 sub _tn_priv_dir {
@@ -1286,59 +1310,78 @@ sub _tn_priv_read {
     return $line;
 }
 
-sub _tn_set_api_key {
+# Generic set/delete/read-with-fallback over any key in %TN_SENSITIVE_SUFFIX.
+# Introduced at the third and fourth sensitive property (tn_chap_password
+# then the two DHCHAP secrets) so a fifth one is a one-line table entry, not
+# another copy of this logic.
+sub _tn_set_secret {
+    my ($storeid, $key, $value) = @_;
+    my $suffix = $TN_SENSITIVE_SUFFIX{$key} or die "unknown sensitive property '$key'\n";
+    return _tn_priv_write($storeid, $suffix, $value);
+}
+
+sub _tn_delete_secret {
     my ($storeid, $key) = @_;
-    return _tn_priv_write($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key}, $key);
+    my $suffix = $TN_SENSITIVE_SUFFIX{$key} or die "unknown sensitive property '$key'\n";
+    return _tn_priv_delete($storeid, $suffix);
 }
 
-sub _tn_delete_api_key {
-    my ($storeid) = @_;
-    return _tn_priv_delete($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key});
-}
-
-sub _tn_set_chap_password {
-    my ($storeid, $password) = @_;
-    return _tn_priv_write($storeid, $TN_SENSITIVE_SUFFIX{tn_chap_password}, $password);
-}
-
-sub _tn_delete_chap_password {
-    my ($storeid) = @_;
-    return _tn_priv_delete($storeid, $TN_SENSITIVE_SUFFIX{tn_chap_password});
-}
-
-# The only thing that reads $scfg->{tn_api_key} directly anywhere else in
-# this file. Every call site that needs the API key (WebSocket auth, the
-# broker request, the connection-cache key) goes through this instead.
-sub _tn_api_key {
-    my ($scfg) = @_;
+# Priv file wins over a stale inline $scfg value (see header comment above);
+# returns undef if neither exists, never dies - callers that must have a
+# value (only tn_api_key does) enforce that themselves.
+sub _tn_read_secret {
+    my ($scfg, $key) = @_;
+    my $suffix = $TN_SENSITIVE_SUFFIX{$key} or die "unknown sensitive property '$key'\n";
     my $storeid = $scfg->{storeid};
 
-    if (defined(my $key = _tn_priv_read($storeid, $TN_SENSITIVE_SUFFIX{tn_api_key}))) {
+    if (defined(my $v = _tn_priv_read($storeid, $suffix))) {
+        return $v;
+    }
+    my $inline = $scfg->{$key};
+    return (defined($inline) && $inline ne '') ? $inline : undef;
+}
+
+# Every call site that needs the API key (WebSocket auth, the broker
+# request, the connection-cache key) goes through this instead of reading
+# $scfg->{tn_api_key} - _tn_read_secret() above is the only place left that
+# does, and only as the documented back-compat fallback.
+sub _tn_api_key {
+    my ($scfg) = @_;
+
+    if (defined(my $key = _tn_read_secret($scfg, 'tn_api_key'))) {
         return $key;
     }
-    if (defined($scfg->{tn_api_key}) && $scfg->{tn_api_key} ne '') {
-        return $scfg->{tn_api_key};
-    }
 
+    my $storeid = $scfg->{storeid};
     my $id = (defined($storeid) && $storeid ne '') ? $storeid : '(unknown storage)';
     die "TrueNAS API key missing for storage '$id'. Set one with "
       . "'pvesm set $id --tn_api_key <key>', or if this storage was "
       . "configured before the plugin moved keys to /etc/pve/priv/storage, "
-      . "run 'truenas-proxmox-manage migrate-api-key $id'.\n";
+      . "run 'truenas-proxmox-manage migrate-secrets $id'.\n";
 }
 
-# CHAP is optional per-storage (iSCSI only), so unlike _tn_api_key() this
-# never dies for a missing password - absence just means "no CHAP auth",
-# exactly as it did before this file existed.
+# CHAP and both DHCHAP secrets are optional per-storage, so unlike
+# _tn_api_key() these never die for a missing value - absence just means
+# "no CHAP/DHCHAP auth", exactly as it did before this file existed.
 sub _tn_chap_password {
     my ($scfg) = @_;
-    my $storeid = $scfg->{storeid};
-
-    if (defined(my $pw = _tn_priv_read($storeid, $TN_SENSITIVE_SUFFIX{tn_chap_password}))) {
-        return $pw;
-    }
-    return $scfg->{tn_chap_password};
+    return _tn_read_secret($scfg, 'tn_chap_password');
 }
+
+sub _tn_nvme_dhchap_secret {
+    my ($scfg) = @_;
+    return _tn_read_secret($scfg, 'tn_nvme_dhchap_secret');
+}
+
+sub _tn_nvme_dhchap_ctrl_secret {
+    my ($scfg) = @_;
+    return _tn_read_secret($scfg, 'tn_nvme_dhchap_ctrl_secret');
+}
+
+# Every sensitive property except tn_api_key: optional, and deleting one is
+# allowed (it just turns the corresponding auth off). Shared by
+# on_add_hook() and on_update_hook_full() below.
+my @TN_OPTIONAL_SECRETS = qw(tn_chap_password tn_nvme_dhchap_secret tn_nvme_dhchap_ctrl_secret);
 
 # Called once, by PVE::API2::Storage::Config's create handler, before the
 # new section is written to storage.cfg. %sensitive holds exactly the keys
@@ -1350,11 +1393,11 @@ sub on_add_hook {
 
     my $key = $sensitive{tn_api_key};
     die "tn_api_key is required\n" if !defined($key) || $key eq '';
-    _tn_set_api_key($storeid, $key);
+    _tn_set_secret($storeid, 'tn_api_key', $key);
 
-    my $chap = $sensitive{tn_chap_password};
-    if (defined($chap) && $chap ne '') {
-        _tn_set_chap_password($storeid, $chap);
+    for my $opt_key (@TN_OPTIONAL_SECRETS) {
+        my $value = $sensitive{$opt_key};
+        _tn_set_secret($storeid, $opt_key, $value) if defined($value) && $value ne '';
     }
 
     return;
@@ -1373,7 +1416,7 @@ sub on_update_hook_full {
     if (exists($sensitive->{tn_api_key})) {
         my $key = $sensitive->{tn_api_key};
         if (defined($key) && $key ne '') {
-            _tn_set_api_key($storeid, $key);
+            _tn_set_secret($storeid, 'tn_api_key', $key);
         } else {
             # `pvesm set <id> --delete tn_api_key` or an explicit empty
             # value. A TrueNAS storage cannot authenticate without a key at
@@ -1385,14 +1428,15 @@ sub on_update_hook_full {
         }
     }
 
-    if (exists($sensitive->{tn_chap_password})) {
-        my $chap = $sensitive->{tn_chap_password};
-        if (defined($chap) && $chap ne '') {
-            _tn_set_chap_password($storeid, $chap);
+    for my $opt_key (@TN_OPTIONAL_SECRETS) {
+        next unless exists($sensitive->{$opt_key});
+        my $value = $sensitive->{$opt_key};
+        if (defined($value) && $value ne '') {
+            _tn_set_secret($storeid, $opt_key, $value);
         } else {
-            # CHAP is optional: removing it just disables CHAP auth on the
-            # next iSCSI (re)discovery/login, same as it always could.
-            _tn_delete_chap_password($storeid);
+            # Optional: removing it just disables the corresponding auth on
+            # the next (re)connect, same as it always could.
+            _tn_delete_secret($storeid, $opt_key);
         }
     }
 
@@ -1405,8 +1449,7 @@ sub on_update_hook_full {
 sub on_delete_hook {
     my ($class, $storeid, $scfg) = @_;
 
-    _tn_delete_api_key($storeid);
-    _tn_delete_chap_password($storeid);
+    _tn_delete_secret($storeid, $_) for keys %TN_SENSITIVE_SUFFIX;
 
     return;
 }
@@ -4023,10 +4066,13 @@ sub snapshot_import_cli(@argv) {
     return 0;
 }
 
-# `truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]`
+# `truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]`
+# (alias: migrate-api-key, kept for compatibility with scripts/muscle memory
+# from before this command covered more than the API key)
 #
-# Moves tn_api_key/tn_chap_password for one truenasplugin storage out of
-# storage.cfg (mode 0644, world-readable) into /etc/pve/priv/storage
+# Moves the four sensitive properties for one truenasplugin storage out of
+# storage.cfg (readable via `pvesh get /storage/<id>` with Datastore.Allocate,
+# and by the www-data group) into /etc/pve/priv/storage
 # (mode 0600, root-only) - the same files on_add_hook()/on_update_hook_full()
 # above write for a storage created or edited after this fix. Existing
 # clusters were never migrated automatically on upgrade (see NOT
@@ -4071,12 +4117,13 @@ sub migrate_priv_secrets {
         }
 
         PVE::Storage::write_config($cfg) if $changed;
-    }, "migrate-api-key failed for '$storeid'");
+    }, "migrate-secrets failed for '$storeid'");
 
     return $result;
 }
 
-sub migrate_api_key_cli(@argv) {
+# `truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]`
+sub migrate_secrets_cli(@argv) {
     my ($storeid, $dry_run);
 
     while (@argv) {
@@ -4084,7 +4131,7 @@ sub migrate_api_key_cli(@argv) {
         if ($arg eq '--dry-run' || $arg eq '-n') {
             $dry_run = 1;
         } elsif ($arg eq '--help' || $arg eq '-h') {
-            print "Usage: truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]\n";
+            print "Usage: truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]\n";
             return 0;
         } elsif (!defined($storeid) && $arg !~ /^-/) {
             $storeid = $arg;
@@ -4095,22 +4142,22 @@ sub migrate_api_key_cli(@argv) {
     }
 
     if (!defined($storeid)) {
-        print STDERR "Usage: truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]\n";
+        print STDERR "Usage: truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]\n";
         return 1;
     }
 
     my $result = eval { __PACKAGE__->migrate_priv_secrets($storeid, dry_run => $dry_run) };
     if (my $err = $@) {
-        print STDERR "migrate-api-key: $err";
+        print STDERR "migrate-secrets: $err";
         return 1;
     }
 
     if (!defined($result->{type})) {
-        print STDERR "migrate-api-key: storage '$storeid' not found\n";
+        print STDERR "migrate-secrets: storage '$storeid' not found\n";
         return 1;
     }
     if ($result->{type} ne 'truenasplugin') {
-        print STDERR "migrate-api-key: storage '$storeid' is type "
+        print STDERR "migrate-secrets: storage '$storeid' is type "
           . "'$result->{type}', not truenasplugin - nothing to do\n";
         return 1;
     }
@@ -4128,6 +4175,14 @@ sub migrate_api_key_cli(@argv) {
         : "Moved " . scalar(@{ $result->{moved} })
             . " secret(s) for '$storeid' into /etc/pve/priv/storage.\n";
     return 0;
+}
+
+# Compatibility alias: this subcommand covered only tn_api_key when it was
+# named migrate-api-key. It now moves all four sensitive properties (see
+# %TN_SENSITIVE_SUFFIX), so migrate-secrets is the name going forward, but
+# scripts/muscle memory built around the old name keep working unchanged.
+sub migrate_api_key_cli(@argv) {
+    return migrate_secrets_cli(@argv);
 }
 
 # List TrueNAS iSCSI targets (array of hashes; each has at least {id, name, ...}).
@@ -5140,8 +5195,8 @@ sub _nvme_ensure_host_registered {
     my $hostnqn = _nvme_get_hostnqn($scfg);
     die "nvme_ensure_host: could not determine host NQN\n" if !$hostnqn;
 
-    my $secret      = $scfg->{tn_nvme_dhchap_secret};
-    my $ctrl_secret = $scfg->{tn_nvme_dhchap_ctrl_secret};
+    my $secret      = _tn_nvme_dhchap_secret($scfg);
+    my $ctrl_secret = _tn_nvme_dhchap_ctrl_secret($scfg);
 
     # Find or create the host record for this node's NQN.
     my $hosts = _api_call($scfg, 'nvmet.host.query', [[["hostnqn", "=", $hostnqn]]]) // [];
@@ -5892,8 +5947,8 @@ sub _nvme_connect {
         . scalar(@connect_list) . ' missing path(s)') if $live;
 
     my $hostnqn = _nvme_untaint_cli_nqn(_nvme_get_hostnqn($scfg), 'NVMe host NQN', 0);
-    my $dhchap_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_secret}, 'NVMe DH-HMAC secret');
-    my $dhchap_ctrl_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_ctrl_secret}, 'NVMe controller DH-HMAC secret');
+    my $dhchap_secret = _nvme_untaint_cli_secret(_tn_nvme_dhchap_secret($scfg), 'NVMe DH-HMAC secret');
+    my $dhchap_ctrl_secret = _nvme_untaint_cli_secret(_tn_nvme_dhchap_ctrl_secret($scfg), 'NVMe controller DH-HMAC secret');
     my $connected_count = 0;
     my $refused_count   = 0;
 
