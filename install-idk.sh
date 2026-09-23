@@ -43,7 +43,7 @@ set -euo pipefail
 # Bump on every change that is meant to reach a node. raw.githubusercontent
 # caches aggressively, so the only way to know which script is running is
 # for the script to say so.
-INSTALLER_VERSION='idk21'
+INSTALLER_VERSION='idk21.0'
 PKG_NAME='truenas-proxmox-plugin'
 BASE_VERSION='2.1.23-alpha1'
 GH_API_BASE="${IDK_GH_API_BASE:-https://api.github.com}"
