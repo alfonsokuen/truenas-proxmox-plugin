@@ -118,31 +118,45 @@ Generate in TrueNAS: **Credentials** → **Local Users** → **Edit User** → *
 tn_api_key 1-your-api-key-here
 ```
 
-**Where it actually lives**: `tn_api_key` and `tn_chap_password` (see
-[`tn_chap_password`](#tn_chap_password)) are `sensitive-properties` - the
-same mechanism Proxmox's own PBS and CIFS storage plugins use for their
-credentials. `pvesm add`/`pvesm set`/the GUI never write them into
-`/etc/pve/storage.cfg` (mode `0644`, world-readable, and the source of
-`pvesh get /storage/<id>` and the storage list in the GUI); instead they go
-to `/etc/pve/priv/storage/<storeid>.pw` / `.chap` (mode `0600`, root only).
-This is transparent to normal use - configure the key exactly as shown
-above - but matters for two things:
+**Where it actually lives**: `tn_api_key`, [`tn_chap_password`](#tn_chap_password),
+[`tn_nvme_dhchap_secret`](#tn_nvme_dhchap_secret) and
+[`tn_nvme_dhchap_ctrl_secret`](#tn_nvme_dhchap_ctrl_secret) are all
+`sensitive-properties` - the same mechanism Proxmox's own PBS and CIFS
+storage plugins use for their credentials. `pvesm add`/`pvesm set`/the GUI
+never write them into `/etc/pve/storage.cfg`; instead they go to
+`/etc/pve/priv/storage/<storeid>.{pw,chap,dhchap,dhchapctrl}` (mode `0600`,
+root only). This is transparent to normal use - configure the key exactly
+as shown above - but matters for three things:
 
+- **The actual exposure this closes**: `/etc/pve/storage.cfg` on PVE 9 is
+  mode `0640 root:www-data` - not world-readable. The real risk is that
+  `pvesh get /storage/<id>` (and the storage list in the GUI, which calls
+  the same API) needs only the `Datastore.Allocate` permission on
+  `/storage` to return the parsed config verbatim, including these fields
+  when they were plain options - a permission routinely held by a storage
+  admin with no business holding a FULL_ADMIN TrueNAS credential. Any
+  process in the `www-data` group (`pveproxy`, notably) also reads the
+  file directly.
 - **Rotating the key**: `pvesm set <storeid> --tn_api_key <new-key>` now
   works (it used to be `fixed`, so the only way to rotate a key was editing
   `storage.cfg` by hand). Removing it entirely
   (`pvesm set <storeid> --delete tn_api_key`) is refused: a TrueNAS storage
-  cannot authenticate without one.
-- **A storage configured before this change**: the key still works exactly
-  as before, read straight out of `storage.cfg`, for backward
-  compatibility. Move it to the priv file at your convenience with:
+  cannot authenticate without one. `tn_chap_password`,
+  `tn_nvme_dhchap_secret` and `tn_nvme_dhchap_ctrl_secret` stay optional -
+  deleting any of those just turns the corresponding auth off, same as
+  before.
+- **A storage configured before this change**: any of the four still works
+  exactly as before, read straight out of `storage.cfg`, for backward
+  compatibility. Move them to the priv files at your convenience with:
 
   ```
-  truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]
+  truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]
   ```
 
-  This is optional and idempotent - not required for the storage to keep
-  working, and safe to run more than once. See
+  (`migrate-api-key` is kept working too, as an alias for this command's
+  name before it covered more than the API key.) This is optional and
+  idempotent - not required for the storage to keep working, and safe to
+  run more than once. See
   [Tools.md](Tools.md#migrate-api-key) for details.
 
 ### `tn_target_iqn`
@@ -510,7 +524,11 @@ nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
 - In whitelist mode ([`tn_nvme_allow_any_host`](#tn_nvme_allow_any_host) `0`) the plugin
   provisions this secret onto the TrueNAS host record automatically — no manual setup.
 - Only enforced in whitelist mode; with open access (the default) the secret is unused.
-- Secrets are stored in `/etc/pve/storage.cfg` (cluster-wide sync — a single shared key for all nodes)
+- Stored in `/etc/pve/priv/storage/<storeid>.dhchap` (`sensitive-property`,
+  see [tn_api_key](#tn_api_key) for why) rather than inline in
+  `storage.cfg`; `/etc/pve/priv` is synced cluster-wide the same way
+  `/etc/pve/storage.cfg` is, so this is still a single shared secret for
+  all nodes.
 - See [NVMe-Setup.md - DH-CHAP Authentication](NVMe-Setup.md#dh-chap-authentication-setup) for complete setup
 
 ### `tn_nvme_dhchap_ctrl_secret`
@@ -572,8 +590,10 @@ This is what makes DH-CHAP authentication actually enforced — in open mode the
 sit unused on the initiator. You no longer need to run the manual `nvmet.host` /
 `host_subsys` API calls previously documented in NVMe-Setup.md; the plugin does it.
 
-**Cluster note:** `storage.cfg` is shared cluster-wide, so `tn_nvme_dhchap_secret`
-is a **single shared key** across all nodes. Each node registers its **own** NQN
+**Cluster note:** `/etc/pve/priv/storage` (where `tn_nvme_dhchap_secret` is
+now stored, see above) is shared cluster-wide the same way `storage.cfg`
+is, so it is still a **single shared key** across all nodes. Each node
+registers its **own** NQN
 (so leave `tn_hostnqn` unset on multi-node clusters — see [`tn_hostnqn`](#tn_hostnqn)),
 but all nodes authenticate with that one shared secret. Per-node distinct keys are
 not expressible in cluster-wide config. Switching an existing subsystem from open to

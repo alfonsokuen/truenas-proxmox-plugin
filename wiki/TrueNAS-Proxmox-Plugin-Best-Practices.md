@@ -313,13 +313,17 @@ truenasplugin: truenas-nvme
     shared 1
 ```
 
-**Update (idk21):** `tn_api_key_file` was never implemented by this
-plugin. As of idk21 the plugin fixes the underlying leak itself:
-`tn_api_key` is a `sensitive-property`, so `pvesm add`/`set`/the GUI write
-it to `/etc/pve/priv/storage/<storeid>.pw` (root-only, `0600`) instead of
-into `storage.cfg` (`0644`, world-readable) - no key-file option needed.
-Migrate an older storage with `truenas-proxmox-manage migrate-api-key
-<storeid>`. See [Configuration.md](Configuration.md#tn_api_key).
+**Update (idk21/idk22):** `tn_api_key_file` was never implemented by this
+plugin. The plugin fixes the underlying leak itself now: `tn_api_key`,
+`tn_chap_password`, `tn_nvme_dhchap_secret` and `tn_nvme_dhchap_ctrl_secret`
+are all `sensitive-properties`, so `pvesm add`/`set`/the GUI write them to
+`/etc/pve/priv/storage/<storeid>.*` (root-only, `0600`) instead of into
+`storage.cfg` - no key-file option needed. The real exposure: `pvesh get
+/storage/<id>` needs only `Datastore.Allocate` to return the config
+verbatim, and www-data reads the file directly (`0640 root:www-data`, not
+world-readable). Migrate an older storage with `truenas-proxmox-manage
+migrate-secrets <storeid>` (`migrate-api-key` also still works, as an
+alias). See [Configuration.md](Configuration.md#tn_api_key).
 
 Key parameters (a subset of the full option set):
 

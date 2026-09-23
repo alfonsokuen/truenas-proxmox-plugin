@@ -14,7 +14,7 @@ The plugin includes several tools to simplify installation, testing, cluster man
 
 **Subcommands** (via `truenas-proxmox-manage`):
 - **[Import Foreign Snapshots](#import-foreign-snapshots)** - Adopt snapshots taken on TrueNAS into a VM's configuration
-- **[Migrate API Key](#migrate-api-key)** - Move a storage's `tn_api_key`/`tn_chap_password` out of `storage.cfg` into `/etc/pve/priv/storage`
+- **[Migrate Secrets](#migrate-secrets)** - Move a storage's `tn_api_key`/`tn_chap_password`/DH-CHAP secrets out of `storage.cfg` into `/etc/pve/priv/storage` (also: `migrate-api-key`, compat alias)
 
 **Standalone Tools**:
 - **[Development Test Suite](#development-test-suite)** - **Development/testing only** - Comprehensive plugin testing
@@ -108,30 +108,37 @@ container goes through `PVE::LXC::Config` with `rootfs`/`mpN` instead of
 
 ---
 
-## Migrate API Key
+## Migrate Secrets
 
 ```
-truenas-proxmox-manage migrate-api-key <storeid> [--dry-run]
+truenas-proxmox-manage migrate-secrets <storeid> [--dry-run]
 ```
 
-`tn_api_key` and `tn_chap_password` are `sensitive-properties` (see
+`migrate-api-key` also works, as an alias for this command's name from
+before it covered more than the API key.
+
+`tn_api_key`, `tn_chap_password`, `tn_nvme_dhchap_secret` and
+`tn_nvme_dhchap_ctrl_secret` are all `sensitive-properties` (see
 [Configuration.md](Configuration.md#tn_api_key)): a storage created or
 edited with a current plugin already has them in
-`/etc/pve/priv/storage/<storeid>.{pw,chap}` (root-only, `0600`), never in
-`storage.cfg`. This command is for a storage that predates that change and
-still has one or both inline in `storage.cfg` (mode `0644`, readable by
-anyone with API/GUI access to `/storage`).
+`/etc/pve/priv/storage/<storeid>.{pw,chap,dhchap,dhchapctrl}` (root-only,
+`0600`), never in `storage.cfg`. This command is for a storage that
+predates that change and still has one or more inline in `storage.cfg`.
+The actual risk that closes: `/etc/pve/storage.cfg` on PVE 9 is `0640
+root:www-data` (not world-readable), but `pvesh get /storage/<id>` needs
+only the `Datastore.Allocate` permission to return it verbatim, and
+anything in the `www-data` group reads the file directly.
 
 | Flag | Effect |
 |---|---|
 | `--dry-run` | Print what would move, write nothing |
 
 ```
-$ truenas-proxmox-manage migrate-api-key tn-prod --dry-run
+$ truenas-proxmox-manage migrate-secrets tn-prod --dry-run
 [dry-run] tn_api_key           -> /etc/pve/priv/storage/tn-prod.pw
 Dry run: nothing was written.
 
-$ truenas-proxmox-manage migrate-api-key tn-prod
+$ truenas-proxmox-manage migrate-secrets tn-prod
 tn_api_key           -> /etc/pve/priv/storage/tn-prod.pw
 Moved 1 secret(s) for 'tn-prod' into /etc/pve/priv/storage.
 ```

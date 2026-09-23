@@ -387,15 +387,22 @@ Do not give the plugin's API key `Full Admin`. See
 minimum role set. The plugin's audit is what the file records; do not
 grant beyond it.
 
-**Update (idk21):** `tn_api_key_file` below was never implemented by this
-plugin - it silently did nothing, leaving the key inline regardless. As of
-this version the plugin fixes the underlying problem itself: `tn_api_key`
-(and `tn_chap_password`) are `sensitive-properties`, so `pvesm
-add`/`set`/the GUI now write them to `/etc/pve/priv/storage/<storeid>.pw`
-(root-only, `0600`) instead of into `storage.cfg` (`0644`, world-readable)
-- no separate key-file option needed. A storage configured before idk21
-still has the key inline for backward compatibility; move it with
-`truenas-proxmox-manage migrate-api-key <storeid>`. See
+**Update (idk21/idk22):** `tn_api_key_file` below was never implemented by
+this plugin - it silently did nothing, leaving the key inline regardless.
+As of these versions the plugin fixes the underlying problem itself:
+`tn_api_key`, `tn_chap_password`, `tn_nvme_dhchap_secret` and
+`tn_nvme_dhchap_ctrl_secret` are all `sensitive-properties`, so `pvesm
+add`/`set`/the GUI now write them to `/etc/pve/priv/storage/<storeid>.*`
+(root-only, `0600`) instead of into `storage.cfg` - no separate key-file
+option needed. The real exposure this closes: `/etc/pve/storage.cfg` on
+PVE 9 is `0640 root:www-data`, not world-readable, but `pvesh get
+/storage/<id>` (and the GUI's storage list) needs only the
+`Datastore.Allocate` permission - routinely held by a storage admin with
+no business seeing a FULL_ADMIN TrueNAS credential - and the www-data
+group reads the file directly. A storage configured before idk21 still has
+its secrets inline for backward compatibility; move them with
+`truenas-proxmox-manage migrate-secrets <storeid>` (`migrate-api-key` also
+still works, as an alias). See
 [Configuration.md](Configuration.md#tn_api_key) for the full explanation.
 The `tn_api_key_file` lines in the examples below are kept only so this
 page's history is visible in the diff; do not use them in a real
