@@ -9922,7 +9922,16 @@ menu_edit_storage() {
     local previous_key=""
     if [[ -f "$priv_file" ]]; then
         had_previous_key=true
-        previous_key=$(cat "$priv_file" 2>/dev/null || true)
+        # Read failure is NOT the same as "the file is empty" - if this
+        # cannot be read (permission, I/O error), there is no way to
+        # guarantee a safe rollback if the update below fails, so abort
+        # HERE, before the NEW key is ever written, rather than risk
+        # silently no-op'ing the restore later and leaving the NEW key in
+        # place with no way back to whatever was actually there before.
+        if ! previous_key=$(cat "$priv_file" 2>/dev/null); then
+            error "Failed to read the existing API key in /etc/pve/priv/storage before rotating - aborting without changing anything"
+            return 1
+        fi
     fi
 
     if ! write_priv_secret "$storage_name" "pw" "$api_key"; then
@@ -9946,8 +9955,17 @@ menu_edit_storage() {
         error "Failed to update configuration"
         # Roll back the priv write above: storage.cfg was NOT changed, so
         # priv must not end up rotated either - restore whatever was
-        # there when this call started.
-        if [[ "$had_previous_key" == true ]]; then
+        # there when this call started. Restoring to "there was no usable
+        # previous key" means DELETING the file, not calling
+        # write_priv_secret() with an empty value - that function treats
+        # an empty value as "nothing to do" and returns success without
+        # writing (by design, for callers that mean "no secret given,
+        # leave whatever is there alone"), which here would have quietly
+        # left the NEW (rotated) key in place while claiming success.
+        # Covers both "there was never a file" (had_previous_key=false)
+        # and "there was a file but it was empty" (had_previous_key=true,
+        # previous_key="") - either way, "restore" means "no priv file".
+        if [[ "$had_previous_key" == true && -n "$previous_key" ]]; then
             write_priv_secret "$storage_name" "pw" "$previous_key" || \
                 error "Additionally failed to restore the previous API key in /etc/pve/priv/storage - it is currently set to the NEW value even though storage.cfg was not updated"
         else
