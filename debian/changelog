@@ -1,6 +1,6 @@
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
 
-  * `import-snapshots`: en un clusters de varios nodos, el aviso "esta VM
+  * `import-snapshots`: en un cluster de varios nodos, el aviso "esta VM
     vive en el nodo X, corre el comando ahi" nunca se disparaba para un
     invitado de otro nodo - salia el error generico "Configuration file
     does not exist", que suena a que la VM no existe. Causa: `install.sh`
@@ -14,7 +14,7 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
     t/nvme/20-snapshot-import-config.t simulando la cache "vacia hasta
     que se actualiza" del proceso recien arrancado.
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 04:35:00 -0500
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Tue, 22 Sep 2026 23:40:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk19) unstable; urgency=medium
 

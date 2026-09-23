@@ -161,10 +161,15 @@ $INC{'PVE/QemuConfig.pm'} = 1;
 # running them. cfs_update() is defined (not just get_vmlist()) so this
 # exercises the real cluster branch, not a swallowed "undefined
 # subroutine" from a stub that happens to look the same to the caller.
+# Assigned at RUN time, not declared with `sub`: on a PVE node the
+# `require PVE::Storage` near the top loads the real PVE::Cluster, which
+# would redefine compile-time stubs and let the suite read the live
+# cluster vmlist - a guest with the test VMID on another node then
+# kills the whole file. A glob assignment here runs after that require.
 {
-    package PVE::Cluster;
-    sub cfs_update { return }
-    sub get_vmlist { return { ids => {} } }
+    no warnings qw(redefine once);
+    *PVE::Cluster::cfs_update = sub { return };
+    *PVE::Cluster::get_vmlist = sub { return { ids => {} } };
 }
 $INC{'PVE/Cluster.pm'} = 1;
 

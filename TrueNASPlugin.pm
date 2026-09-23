@@ -2993,10 +2993,10 @@ sub _tn_guest_config($vmid) {
     # generic "does not exist" instead of this hint, every single time.
     my $entry = eval {
         local $SIG{__WARN__} = sub { };    # cfs_update() warns on IPCC
-                                            # failure instead of dying; a
-                                            # single node without pmxcfs
-                                            # falls through silently, same
-                                            # as it always did.
+                                            # failure instead of dying; with
+                                            # pmxcfs unreachable (or no
+                                            # PVE::Cluster at all) this falls
+                                            # through silently, as it did.
         require PVE::Cluster;
         PVE::Cluster::cfs_update();
         PVE::Cluster::get_vmlist()->{ids}{$vmid};

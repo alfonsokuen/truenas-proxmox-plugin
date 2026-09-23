@@ -133,10 +133,15 @@ $INC{'PVE/QemuConfig.pm'} = 1;
 # tests never depend on what happens to exist in /etc/pve on the machine
 # running them. cfs_update() is a no-op here; the fresh-process-cache test
 # further down replaces both subs locally to prove they're called in order.
+# Assigned at RUN time, not declared with `sub`: on a PVE node the
+# `require PVE::Storage` near the top loads the real PVE::Cluster, which
+# would redefine compile-time stubs and let the suite read the live
+# cluster vmlist - a guest with the test VMID on another node then
+# kills the whole file. A glob assignment here runs after that require.
 {
-    package PVE::Cluster;
-    sub cfs_update { return }
-    sub get_vmlist { return { ids => {} } }
+    no warnings qw(redefine once);
+    *PVE::Cluster::cfs_update = sub { return };
+    *PVE::Cluster::get_vmlist = sub { return { ids => {} } };
 }
 $INC{'PVE/Cluster.pm'} = 1;
 
@@ -467,6 +472,26 @@ sub refuses {
         qr/\Q$VMID\E is a VM on node 'proxmox2', not on this one; run import-snapshots there/,
         '_tn_guest_config: calls cfs_update() before get_vmlist(), so a fresh CLI process still sees a guest on another node');
     ok($updated, '  ...cfs_update() was actually called, not just get_vmlist()');
+}
+{
+    # pmxcfs unreachable: the real cfs_update() does not die, it warns and
+    # empties its vmlist. That must stay quiet (no stray IPCC noise in the
+    # CLI) and fall back to plain "it is a VM here", exactly like before.
+    no strict 'refs';
+    no warnings 'redefine';
+    my $empty_dir = tempdir(CLEANUP => 1);
+    local ${"${PKG}::TN_LXC_CONF_DIR"}  = $empty_dir;
+    local ${"${PKG}::TN_QEMU_CONF_DIR"} = $empty_dir;
+    local *PVE::Cluster::cfs_update = sub {
+        warn "ipcc_send_rec[1] failed: Connection refused\n";
+    };
+    local *PVE::Cluster::get_vmlist = sub { return { ids => {} } };
+    my @leaked;
+    local $SIG{__WARN__} = sub { push @leaked, @_ };
+    my $guest = eval { $PKG->can('_tn_guest_config')->($VMID) };
+    is(ref($guest) && $guest->{kind}, 'qemu',
+        '_tn_guest_config: cfs_update() failing falls back to the local VM default');
+    is(scalar(@leaked), 0, '  ...without leaking the IPCC warning to the user');
 }
 
 # ------------------------------------------------------------ 45-50. CLI ---
