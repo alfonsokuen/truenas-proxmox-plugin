@@ -1,0 +1,20 @@
+Origin: IDKMANAGER truenas-proxmox-plugin fork
+Label: truenas-proxmox-plugin (IDK fork)
+Suite: bookworm
+Codename: bookworm
+Date: Wed, 23 Sep 2026 17:39:41 UTC
+Architectures: amd64
+Components: main
+Description: IDKMANAGER fork of the TrueNAS Proxmox VE storage plugin (bookworm)
+MD5Sum:
+ cf45899af2647b3957c96865fee7a8ec 961 main/binary-amd64/Packages
+ 36157917f3d9567585b52b5977800266 598 main/binary-amd64/Packages.gz
+ 9c1c51a5a0e7eaf34edc2c93024a8eb8 223 main/binary-amd64/Release
+SHA1:
+ ef5dc4617ed0db046d55d7c46635c3effaa883de 961 main/binary-amd64/Packages
+ 053fdb03a3995238414f2f9923c13da406612ef8 598 main/binary-amd64/Packages.gz
+ 01b9201cca195ea48e9598ab42692c01b4ecb48a 223 main/binary-amd64/Release
+SHA256:
+ b65d5599c18c6b6b79f20edfa7803f2f576327e05625cbed26a2facc6cad54a5 961 main/binary-amd64/Packages
+ 777d57b867bdd331468ea8b61edf297da35b068251bb597d84249a6744501b2c 598 main/binary-amd64/Packages.gz
+ 8a6041f134cd6449501c450ad38350a298b6b82ffb1c12a2f3c0879ea192702f 223 main/binary-amd64/Release

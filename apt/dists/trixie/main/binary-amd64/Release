@@ -1,0 +1,6 @@
+Archive: trixie
+Component: main
+Origin: IDKMANAGER truenas-proxmox-plugin fork
+Label: truenas-proxmox-plugin (IDK fork)
+Architecture: amd64
+Description: IDKMANAGER fork of the TrueNAS Proxmox VE storage plugin (trixie)

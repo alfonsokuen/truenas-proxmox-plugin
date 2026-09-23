@@ -1,0 +1,20 @@
+Origin: IDKMANAGER truenas-proxmox-plugin fork
+Label: truenas-proxmox-plugin (IDK fork)
+Suite: trixie
+Codename: trixie
+Date: Wed, 23 Sep 2026 17:39:42 UTC
+Architectures: amd64
+Components: main
+Description: IDKMANAGER fork of the TrueNAS Proxmox VE storage plugin (trixie)
+MD5Sum:
+ cf45899af2647b3957c96865fee7a8ec 961 main/binary-amd64/Packages
+ 36157917f3d9567585b52b5977800266 598 main/binary-amd64/Packages.gz
+ 8cc9439af27e2c45c1f26b9f2350c953 219 main/binary-amd64/Release
+SHA1:
+ ef5dc4617ed0db046d55d7c46635c3effaa883de 961 main/binary-amd64/Packages
+ 053fdb03a3995238414f2f9923c13da406612ef8 598 main/binary-amd64/Packages.gz
+ 567c8dc5356ac923f1509810017a8c3754d8563a 219 main/binary-amd64/Release
+SHA256:
+ b65d5599c18c6b6b79f20edfa7803f2f576327e05625cbed26a2facc6cad54a5 961 main/binary-amd64/Packages
+ 777d57b867bdd331468ea8b61edf297da35b068251bb597d84249a6744501b2c 598 main/binary-amd64/Packages.gz
+ f95074073a8b399ed6f65a856b5b0f65df1616c1b3dc11a0b91ccef4b84b1537 219 main/binary-amd64/Release
