@@ -43,6 +43,19 @@ use warnings;
 use Test::More;
 use FindBin;
 
+# Mark PVE::Storage.pm as already loaded BEFORE requiring anything else,
+# same trick this PR's own repro.pl uses. Requiring PVE::Storage::DirPlugin
+# below pulls in PVE::Storage for real unless this is set first - and on at
+# least one real node that chain reaches PVE::GuestImport::OVF, which fails
+# to compile there (an unrelated, pre-existing environment gap, not
+# something this file is testing). With $INC pre-poisoned, every later
+# `require PVE::Storage;` (including the one inside
+# TrueNASPlugin.pm::migrate_priv_secrets()) is a silent no-op, which is
+# fine: every PVE::Storage::* sub this file needs is either irrelevant
+# (write_config()/parse_config() are PVE::Storage::Plugin methods, not
+# PVE::Storage's) or stubbed explicitly further down before it is called.
+BEGIN { $INC{'PVE/Storage.pm'} = 1; }
+
 my $PLUGIN = "$FindBin::Bin/../../TrueNASPlugin.pm";
 unless (eval { require $PLUGIN; 1 }) {
     plan skip_all => "cannot load TrueNASPlugin.pm (needs PVE perl modules): $@";
@@ -52,6 +65,14 @@ my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 
 unless (eval {
     require PVE::Storage::Plugin;
+    # write_config() dies "unknown section type" for any section whose
+    # type has no registered plugin - and, unlike check_config() alone
+    # (which is all t/nvme/09-check-config-update.t needs), this file
+    # calls write_config() for real, so at least one other type needs to
+    # be registered alongside ours for PVE::Storage::Plugin->init() to
+    # settle correctly (confirmed empirically, and matches repro.pl).
+    require PVE::Storage::DirPlugin;
+    PVE::Storage::DirPlugin->register();
     $PKG->register();
     PVE::Storage::Plugin->init();
     1;
