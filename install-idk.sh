@@ -43,14 +43,14 @@ set -euo pipefail
 # Bump on every change that is meant to reach a node. raw.githubusercontent
 # caches aggressively, so the only way to know which script is running is
 # for the script to say so.
-INSTALLER_VERSION='idk19.3'
+INSTALLER_VERSION='idk20.1'
 PKG_NAME='truenas-proxmox-plugin'
 BASE_VERSION='2.1.23-alpha1'
 GH_API_BASE="${IDK_GH_API_BASE:-https://api.github.com}"
 GH_REPO="${IDK_GH_REPO:-alfonsokuen/truenas-proxmox-plugin}"
 DOWNLOAD_BASE="${IDK_DOWNLOAD_BASE:-}"
 APT_BASE_URL="${IDK_APT_BASE_URL:-https://alfonsokuen.github.io/truenas-proxmox-plugin/apt}"
-APT_KEY_FPR="${IDK_APT_KEY_FPR:-1B44882462A1200EFFCFAEFC79E67ECFB42EE1CC}"
+APT_KEY_FPR="${IDK_APT_KEY_FPR:-C0C4BFA34273A80B1E92D71201B2C346EEC7ECF8}"
 APT_SOURCES_FILE="${IDK_APT_SOURCES_FILE:-/etc/apt/sources.list.d/truenas-proxmox-plugin-idk.sources}"
 APT_KEYRING_FILE="${IDK_APT_KEYRING_FILE:-/usr/share/keyrings/truenas-proxmox-plugin-idk.gpg}"
 SERVICES='truenas-plugin-broker pvedaemon pvestatd pveproxy'

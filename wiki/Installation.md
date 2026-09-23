@@ -129,7 +129,7 @@ expires 2031-09-18).
 curl -fsSL https://alfonsokuen.github.io/truenas-proxmox-plugin/apt/KEY.gpg \
   -o /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
 gpg --show-keys --with-colons /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg |
-  grep '^fpr:' | grep 1B44882462A1200EFFCFAEFC79E67ECFB42EE1CC
+  grep '^fpr:' | grep C0C4BFA34273A80B1E92D71201B2C346EEC7ECF8
 
 cat >/etc/apt/sources.list.d/truenas-proxmox-plugin-idk.sources <<'EOF'
 Types: deb

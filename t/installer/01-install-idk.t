@@ -45,7 +45,7 @@ my $DEB_VERSION  = '1:2.1.23~alpha1+idk18';
 my $DEB_ORIGINAL = 'truenas-proxmox-plugin_2.1.23~alpha1+idk18_all.deb';
 my $DEB_SERVED   = 'truenas-proxmox-plugin_2.1.23.alpha1+idk18_all.deb';
 my $REPO         = 'alfonsokuen/truenas-proxmox-plugin';
-my $KEY_FPR      = '1B44882462A1200EFFCFAEFC79E67ECFB42EE1CC';
+my $KEY_FPR      = 'C0C4BFA34273A80B1E92D71201B2C346EEC7ECF8';
 my $APT_HOST     = 'apt.example.invalid';
 
 my $root = tempdir(CLEANUP => 1);

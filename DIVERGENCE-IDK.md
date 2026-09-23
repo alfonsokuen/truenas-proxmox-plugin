@@ -90,7 +90,7 @@ los dos sirve al fork (el `install.sh` de upstream usa los nombres de campo pre-
 - `tools/publish-apt.sh` + `apt/`: repo APT firmado publicado en la rama huerfana `gh-pages`
   (GitHub Pages) en `https://alfonsokuen.github.io/truenas-proxmox-plugin/apt`. Esa rama era una
   copia del `gh-pages` de upstream (2.1.17 con la firma de upstream) y se reemplazo entera.
-  Clave de firma `1B44882462A1200EFFCFAEFC79E67ECFB42EE1CC` (RSA 4096, caduca 2031-09-18), privada
+  Clave de firma `C0C4BFA34273A80B1E92D71201B2C346EEC7ECF8` (RSA 4096, caduca 2031-09-22; rotada el 23-sep-2026 porque la anterior, 1B44882462A1200EFFCFAEFC79E67ECFB42EE1CC, se perdio), privada
   solo en la boveda SOPS bajo `apt_signing_truenas_plugin`.
 - Limite conocido: `reprepro` 5.3.1 (bookworm Y trixie) no tiene campo `Limit`, asi que cada suite
   sirve UNA version, la mas nueva. Las anteriores siguen instalables con `--version idkNN`.
