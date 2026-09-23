@@ -317,6 +317,26 @@ sub _is_auth_error {
 # Die with [errname]: reason, keep the payload at debug level.
 sub _rpc_error_message {
     my ($err, $scfg) = @_;
+
+    # C5 (QA round 4, Kimi): $reason/$name below are TrueNAS's own
+    # free-text error message - a rejected-value validation error can
+    # quote the value back (e.g. "Invalid dhchap_key format: <value>").
+    # _tn_redact_structure()/_tn_redact_for_log() only catch a value
+    # sitting behind a JSON key of the right name; neither helps for a
+    # secret embedded in ordinary prose. Best-effort literal substitution
+    # of whatever secrets this storage actually has instead - every
+    # lookup wrapped in eval, since e.g. _tn_api_key() DIES when no key is
+    # configured at all, and error-formatting code must never become a
+    # new way to fail.
+    my @known_secrets;
+    if (ref($scfg) eq 'HASH') {
+        for my $getter (\&_tn_api_key, \&_tn_chap_password,
+                         \&_tn_nvme_dhchap_secret, \&_tn_nvme_dhchap_ctrl_secret) {
+            my $v = eval { $getter->($scfg) };
+            push @known_secrets, $v if defined($v) && $v ne '';
+        }
+    }
+
     my $obj = $err;
     if (defined $obj && !ref $obj && $obj =~ /^\s*\{/) {
         $obj = eval { decode_json($obj) } // $err;
@@ -333,14 +353,16 @@ sub _rpc_error_message {
             # validation error echoing dhchap_key back).
             _log($scfg, 2, 'debug', "[TrueNAS] JSON-RPC error payload: "
                 . (ref $err ? encode_json(_tn_redact_structure($err)) : _tn_redact_for_log($err)));
-            return 'JSON-RPC error' . (defined $name ? " [$name]" : '') . ": $reason";
+            my $msg = 'JSON-RPC error' . (defined $name ? " [$name]" : '') . ": $reason";
+            return _tn_redact_secrets_in_text($msg, \@known_secrets);
         }
     }
     # This string becomes the exception callers see (and, ultimately, what
     # a user or support ticket may end up showing) - redact it the same
     # way, not just the debug log above.
-    return 'JSON-RPC error: '
+    my $msg = 'JSON-RPC error: '
         . (ref $err ? encode_json(_tn_redact_structure($err)) : _tn_redact_for_log($err // 'unknown'));
+    return _tn_redact_secrets_in_text($msg, \@known_secrets);
 }
 
 
@@ -1539,11 +1561,23 @@ sub on_update_hook {
 sub on_update_hook_full {
     my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
 
+    # C4 (QA round 4, Kimi): computed at most ONCE per hook call, not once
+    # per secret - see _tn_strip_inline_if_cluster_ready()'s own comment.
+    # A lexical local to this single call, NOT a process-level cache (that
+    # was R1's regression in an earlier round of this same fix): a
+    # concurrent `pvesm set` on the same storage gets its own fresh call
+    # and its own fresh check.
+    my $cluster_check;
+    my $get_cluster_check = sub {
+        $cluster_check //= __PACKAGE__->_tn_cluster_secrets_ready();
+        return $cluster_check;
+    };
+
     if (exists($sensitive->{tn_api_key})) {
         my $key = $sensitive->{tn_api_key};
         if (defined($key) && $key ne '') {
             _tn_set_secret($storeid, 'tn_api_key', $key);
-            _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key');
+            _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key', $get_cluster_check->());
         } else {
             # `pvesm set <id> --delete tn_api_key` or an explicit empty
             # value. A TrueNAS storage cannot authenticate without a key at
@@ -1584,7 +1618,7 @@ sub on_update_hook_full {
                   . "storage.cfg differs from the priv file - the priv file is what this "
                   . "plugin actually uses, the inline copy is stale");
             }
-            _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key');
+            _tn_strip_inline_if_cluster_ready($storeid, $scfg, 'tn_api_key', $get_cluster_check->());
         }
     }
 
@@ -1594,7 +1628,7 @@ sub on_update_hook_full {
             my $value = $sensitive->{$opt_key};
             if (defined($value) && $value ne '') {
                 _tn_set_secret($storeid, $opt_key, $value);
-                _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key);
+                _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key, $get_cluster_check->());
             } else {
                 # Optional: removing it just disables the corresponding
                 # auth on the next (re)connect, same as it always could.
@@ -1618,7 +1652,7 @@ sub on_update_hook_full {
                       . "storage.cfg differs from the priv file - the priv file is what this "
                       . "plugin actually uses, the inline copy is stale");
                 }
-                _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key);
+                _tn_strip_inline_if_cluster_ready($storeid, $scfg, $opt_key, $get_cluster_check->());
             }
         }
     }
@@ -1638,11 +1672,21 @@ sub on_update_hook_full {
 # already wins at runtime - see _tn_read_secret()) and logs why, rather
 # than silently leaving part of the cluster with a broken storage. See
 # wiki/Configuration.md for the operator-facing version of this warning.
+# $cluster_check (optional 4th arg): a result already returned by
+# _tn_cluster_secrets_ready(), so a caller handling several secrets in one
+# hook invocation (on_update_hook_full() can reach this up to 4 times: the
+# key plus three optional secrets) computes the cluster state ONCE and
+# reuses it, instead of one full SSH round to every node PER secret -
+# C4, QA round 4 (Kimi): this runs synchronously inside pvesm add/set,
+# so 4x the SSH cost was 4x the operator's wait time for no benefit
+# (nothing about cluster readiness changes between two secrets in the
+# same call). Falls back to computing it if omitted, for any other
+# caller.
 sub _tn_strip_inline_if_cluster_ready {
-    my ($storeid, $scfg, $key) = @_;
+    my ($storeid, $scfg, $key, $cluster_check) = @_;
     return if !defined($scfg) || !defined($scfg->{$key}) || $scfg->{$key} eq '';
 
-    my $check = __PACKAGE__->_tn_cluster_secrets_ready();
+    my $check = $cluster_check // __PACKAGE__->_tn_cluster_secrets_ready();
     if (!$check->{ready}) {
         syslog('warning', "[TrueNAS] Storage '$storeid': keeping $key inline in "
           . "storage.cfg alongside its priv copy - $check->{reason}. The priv file is "
@@ -4452,9 +4496,18 @@ sub _tn_cluster_secrets_ready {
 
     # A single-node CLUSTER (nodelist present, one real entry) - as
     # opposed to a host that never joined one at all, handled above -
-    # still has nothing rolling to guard against.
+    # still has nothing rolling to guard against, PROVIDED that one entry
+    # is actually THIS node. C6 (QA round 4, Kimi): the earlier version of
+    # this shortcut approved on entry count alone, without checking WHICH
+    # node that single entry named - a nodelist briefly showing a single
+    # entry that is some OTHER node (not this one) would have been
+    # approved with zero verification of anything. If it is not the local
+    # node, fall through to the normal per-node loop below, which will
+    # correctly probe that one remote node over SSH (or fail closed if it
+    # cannot be reached) instead of skipping verification entirely.
     return { ready => 1 }
-        if @names == 1 && defined($names[0]) && $names[0] ne '';
+        if @names == 1 && defined($names[0]) && $names[0] ne ''
+        && defined($local_node) && $names[0] eq $local_node;
 
     my @problem;
     for my $name (sort @names) {
@@ -4482,15 +4535,25 @@ sub _tn_cluster_secrets_ready {
             next;
         }
 
+        # C4 (QA round 4, Kimi): this runs synchronously inside
+        # pvesm add/set, so its cost is directly the operator's wait time.
+        # ConnectTimeout=5 bounds the SSH connect phase; the overall
+        # `timeout => 10` bounds connect + the remote one-liner running,
+        # so ONE probe never blocks longer than ~10s even against a host
+        # that accepts TCP but never completes the SSH handshake. Callers
+        # memoize this whole function's result per hook invocation (see
+        # on_update_hook_full()'s $get_cluster_check), so a single
+        # `pvesm set` costs at most (nodes to probe) x ~10s once, not
+        # once per secret touched.
         my $probe_out = '';
         my $ok = eval {
             PVE::Tools::run_command([
-                'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+                'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
                 '-o', 'StrictHostKeyChecking=accept-new',
                 '-o', "HostKeyAlias=$name", "root\@$ip",
                 'perl -MPVE::Storage::Custom::TrueNASPlugin -e '
                   . '"print(PVE::Storage::Custom::TrueNASPlugin->can(q(migrate_priv_secrets)) ? 1 : 0)"',
-            ], outfunc => sub { $probe_out .= $_[0] }, timeout => 15);
+            ], outfunc => sub { $probe_out .= $_[0] }, timeout => 10);
             1;
         };
         # A bare `eq '1'` would fail on anything SSH itself prints around

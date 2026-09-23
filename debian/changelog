@@ -267,7 +267,51 @@ truenas-proxmox-plugin (1:2.1.23~alpha1+idk21) unstable; urgency=medium
     en VERDE despues, con la suite completa corrida en el nodo real (solo
     los 13 fallos preexistentes).
 
- -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 20:00:00 -0500
+  * QA ronda 3, hallazgos de Kimi:
+
+    - La comprobacion de cluster hacia SSH sincrono a cada nodo DENTRO de
+      `pvesm add`/`set`, hasta 4 veces por actualizacion (la key mas
+      hasta tres secretos opcionales, cada uno con su propia decision de
+      "¿limpio el inline?"). Calculada ahora UNA sola vez por invocacion
+      del hook (variable local a esa llamada, NO cache de proceso - esa
+      confusion fue precisamente la regresion de la ronda 2), reutilizada
+      para las hasta 4 decisiones dentro de esa misma llamada.
+      `ConnectTimeout` baja de 8s a 5s y el timeout total de la sonda SSH
+      de 15s a 10s, documentado: el coste maximo de una sola `pvesm set`
+      es ahora (nodos a sondear) x ~10s, una vez, no multiplicado por
+      cuantos secretos toque esa actualizacion.
+
+    - `_rpc_error_message()` redactaba el payload completo en el log de
+      debug pero no el string que de verdad se devuelve como mensaje de
+      la excepcion (lo que ve el llamador, y en ultima instancia un
+      usuario o un ticket de soporte) - el "reason" de TrueNAS es texto
+      libre, no JSON, y puede citar el valor rechazado tal cual (p.ej.
+      "Invalid value: '<secret>' is not valid"). Ni la redaccion
+      estructural ni la de JSON por clave sirven ahi (no hay clave JSON
+      de la que colgar el valor en texto libre), asi que se anade un
+      paso de sustitucion literal de los secretos que la storage tenga
+      configurados - cada lectura envuelta en eval, ya que p.ej.
+      _tn_api_key() muere si no hay key configurada y este es codigo de
+      manejo de errores: nunca debe convertirse el mismo en una forma
+      nueva de fallar.
+
+    - El atajo de "un solo nodo en la lista" aprobaba por CANTIDAD de
+      entradas, sin comprobar cual era esa unica entrada - una lista con
+      una sola entrada que nombrara a OTRO nodo (no este proceso) se
+      aprobaba sin verificar nada en absoluto. Ahora exige que esa unica
+      entrada sea el nodo local; si no lo es, cae al bucle normal, que sí
+      sondea ese nodo remoto por SSH (o falla cerrado si no responde).
+
+    Tests: cobertura para las tres correcciones - una sola lectura de
+    `/etc/pve/.members` por invocacion del hook aunque se autolimpien dos
+    secretos a la vez, redaccion de un secreto incrustado en texto libre
+    en ambos caminos de retorno de `_rpc_error_message()`, y una lista de
+    un solo nodo remoto (no local) que se sondea de verdad en vez de
+    aprobarse por descarte - confirmadas en ROJO contra el commit
+    anterior a este arreglo y en VERDE despues, con la suite completa
+    corrida en el nodo real (solo los 13 fallos preexistentes).
+
+ -- Alfonso Kuen <gerencia@idkmanager.com>  Wed, 23 Sep 2026 21:30:00 -0500
 
 truenas-proxmox-plugin (1:2.1.23~alpha1+idk20) unstable; urgency=medium
 
