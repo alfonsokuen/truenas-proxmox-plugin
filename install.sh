@@ -4411,7 +4411,12 @@ menu_health_check() {
 get_storage_config_value() {
     local storage_name="$1"
     local param_name="$2"
-    local config_block value
+    # Explicitly initialized: under `set -u`, a `local` declaration alone
+    # leaves the variable UNSET, not empty - the case statement below only
+    # assigns $value for tn_api_key/tn_chap_password, so reading any other
+    # property (tn_api_host, tn_dataset, ...) hit "value: unbound
+    # variable" and aborted the whole script.
+    local config_block value=""
 
     # tn_api_key/tn_chap_password may live in /etc/pve/priv/storage instead
     # of inline in storage.cfg (see TrueNASPlugin.pm's on_add_hook/
@@ -4430,7 +4435,11 @@ get_storage_config_value() {
     if [[ -z "$value" ]]; then
         # Extract only the configuration block for this storage (stop at next storage entry)
         config_block=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG")
-        value=$(echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1)
+        # `|| true`: under set -euo pipefail, grep finding no match (any
+        # optional property that is simply absent) would otherwise abort
+        # this function instead of returning an empty value - same class
+        # of bug as R4 in get_all_storage_config_values().
+        value=$(echo "$config_block" | grep "^\s*${param_name}" | awk '{print $2}' | head -1 || true)
     fi
 
     echo "$value"
@@ -5604,7 +5613,11 @@ get_all_storage_config_values() {
         awk '{print $1 "=" $2}')
 
     # Everything except the two sensitive keys emitted below, unchanged.
-    grep -v -E '^(tn_api_key|tn_chap_password)=' <<< "$block"
+    # `|| true`: under set -e, grep -v returning 1 because EVERY line
+    # matched the excluded pattern (a minimal/migrated section) would
+    # otherwise abort this function before it ever reaches the priv-file
+    # fallback below.
+    grep -v -E '^(tn_api_key|tn_chap_password)=' <<< "$block" || true
 
     # tn_api_key/tn_chap_password may live in /etc/pve/priv/storage instead
     # of, or alongside a stale duplicate of, an inline value in
@@ -5612,9 +5625,15 @@ get_all_storage_config_values() {
     # plugin itself uses at runtime (_tn_read_secret()) - so a caller
     # building config_values[] from this output (e.g. menu_edit_storage)
     # never has a stale inline copy shadow a rotated/migrated value.
+    # `|| true` on each grep: under `set -euo pipefail`, grep finding no
+    # match (exit 1) inside one of these pipelines aborts the WHOLE
+    # function right here for a migrated storage (no tn_api_key inline at
+    # all anymore) or a legacy one with no CHAP configured - never
+    # reaching the priv-file reads that follow. Absence of an inline value
+    # is an expected, non-error outcome here, not a real failure.
     local inline_key inline_chap priv_key priv_chap
-    inline_key=$(grep -E '^tn_api_key=' <<< "$block" | head -1 | cut -d= -f2-)
-    inline_chap=$(grep -E '^tn_chap_password=' <<< "$block" | head -1 | cut -d= -f2-)
+    inline_key=$(grep -E '^tn_api_key=' <<< "$block" | head -1 | cut -d= -f2- || true)
+    inline_chap=$(grep -E '^tn_chap_password=' <<< "$block" | head -1 | cut -d= -f2- || true)
     priv_key=$(cat "${TRUENAS_PRIV_DIR}/${storage_name}.pw" 2>/dev/null || true)
     priv_chap=$(cat "${TRUENAS_PRIV_DIR}/${storage_name}.chap" 2>/dev/null || true)
 
@@ -5622,6 +5641,14 @@ get_all_storage_config_values() {
     local chap="${priv_chap:-$inline_chap}"
     [[ -n "$key"  ]] && echo "tn_api_key=${key}"
     [[ -n "$chap" ]] && echo "tn_chap_password=${chap}"
+
+    # Explicit success: without this, the function's own return status is
+    # whatever the `[[ -n "$chap" ]] && echo ...` line above happened to
+    # exit with - 1 whenever $chap is empty (no CHAP configured, the
+    # common case), even though the function did exactly what it was
+    # asked and printed correct output. A caller checking the exit code
+    # (found while testing R4) would see a false failure.
+    return 0
 }
 
 # Validate IP address format
@@ -9883,6 +9910,21 @@ menu_edit_storage() {
     # this fails partway, storage.cfg must never end up pointing at a key
     # that was never actually written anywhere. write_priv_secret() itself
     # writes atomically (tmp file in the same dir, then rename).
+    #
+    # This is a RECONFIGURE (an existing storage), so there may already be
+    # a different key in priv - capture it first, so a failed
+    # update_storage_config() below can be rolled back to it instead of
+    # leaving the rotated (NEW) key in priv while storage.cfg still
+    # describes the OLD configuration (found in review: a half-applied
+    # edit that rotated the key without applying anything else).
+    local priv_file="${TRUENAS_PRIV_DIR}/${storage_name}.pw"
+    local had_previous_key=false
+    local previous_key=""
+    if [[ -f "$priv_file" ]]; then
+        had_previous_key=true
+        previous_key=$(cat "$priv_file" 2>/dev/null || true)
+    fi
+
     if ! write_priv_secret "$storage_name" "pw" "$api_key"; then
         error "Failed to write the API key to /etc/pve/priv/storage - aborting without changing $STORAGE_CFG"
         return 1
@@ -9902,6 +9944,15 @@ menu_edit_storage() {
         read -rp "Press Enter to continue..."
     else
         error "Failed to update configuration"
+        # Roll back the priv write above: storage.cfg was NOT changed, so
+        # priv must not end up rotated either - restore whatever was
+        # there when this call started.
+        if [[ "$had_previous_key" == true ]]; then
+            write_priv_secret "$storage_name" "pw" "$previous_key" || \
+                error "Additionally failed to restore the previous API key in /etc/pve/priv/storage - it is currently set to the NEW value even though storage.cfg was not updated"
+        else
+            rm -f "$priv_file"
+        fi
         return 1
     fi
 
@@ -11714,7 +11765,11 @@ remove_storage_config() {
         !skip { print }
     ' "$STORAGE_CFG" > "$temp_file"
 
-    mv "$temp_file" "$STORAGE_CFG"
+    if ! mv "$temp_file" "$STORAGE_CFG"; then
+        error "Failed to update $STORAGE_CFG - leaving priv secrets in place"
+        rm -f "$temp_file" 2>/dev/null
+        return 1
+    fi
 
     # Remove any of the four priv-stored secrets this storage might have
     # (tn_api_key, tn_chap_password, tn_nvme_dhchap_secret,
@@ -11776,7 +11831,9 @@ uninstall_plugin() {
             read -rp "Remove all TrueNAS storage configurations? [y/N]: " confirm
             if [[ "$confirm" =~ ^[Yy] ]]; then
                 echo "$storages" | while read -r storage; do
-                    remove_storage_config "$storage"
+                    if ! remove_storage_config "$storage"; then
+                        warning "Failed to remove '$storage' from $STORAGE_CFG - its priv secrets were left in place"
+                    fi
                 done
             fi
         fi
