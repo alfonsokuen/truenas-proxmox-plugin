@@ -340,7 +340,7 @@ my $ENFORCES_PERMS = do {
 
 # ------------------------------------------------- migrate_priv_secrets ---
 SKIP: {
-    skip 'PVE::Storage not loadable here', 71 unless eval { require PVE::Storage; 1 };
+    skip 'PVE::Storage not loadable here', 74 unless eval { require PVE::Storage; 1 };
 
     my %STORECFG_IDS;
     {
@@ -678,8 +678,8 @@ SKIP: {
 
         ok(defined($res->{backup}), 'F3: migrate_priv_secrets reports a backup path');
         ok(-f $res->{backup}, '  ...and the file actually exists');
-        like($res->{backup}, qr/\Q$backup_dir\E\/storage\.cfg\.pre-migrate\.\d+$/,
-            '  ...named storage.cfg.pre-migrate.<epoch> under the backup dir, not /etc/pve');
+        like($res->{backup}, qr/\Q$backup_dir\E\/storage\.cfg\.pre-migrate\.\d+\.\d+\.[0-9a-f]{4}$/,
+            '  ...named storage.cfg.pre-migrate.<epoch>.<pid>.<random> under the backup dir, not /etc/pve');
         my $backup_content = do {
             local $/ = undef;
             open(my $fh, '<', $res->{backup}) or die "cannot read backup: $!\n";
@@ -700,6 +700,24 @@ SKIP: {
         my $res2 = $PKG->migrate_priv_secrets('tn-backup');
         is(scalar(@{ $res2->{moved} }), 0, '  ...idempotent: second call moves nothing');
         ok(!defined($res2->{backup}), '  ...and takes no new backup when there is nothing to change');
+
+        # ------------------------------------------------------- G2 ---
+        # Two DIFFERENT storages migrated back to back can easily land in
+        # the same wall-clock second (this loop does, deterministically) -
+        # each call must claim its own uniquely-named backup, never
+        # overwrite the other's.
+        %STORECFG_IDS = (
+            'tn-backup2' => { type => 'truenasplugin', tn_api_key => 'BACKUP-ME-2' },
+            'tn-backup3' => { type => 'truenasplugin', tn_api_key => 'BACKUP-ME-3' },
+        );
+        my $res_b = $PKG->migrate_priv_secrets('tn-backup2');
+        my $res_c = $PKG->migrate_priv_secrets('tn-backup3');
+        ok(defined($res_b->{backup}) && defined($res_c->{backup}),
+            'G2: two migrations taken back-to-back both report a backup path');
+        isnt($res_b->{backup}, $res_c->{backup},
+            '  ...and the two backup filenames are never the same, even taken in the same second');
+        ok(-f $res_b->{backup} && -f $res_c->{backup},
+            '  ...and BOTH files actually exist - neither call overwrote the other\'s backup');
     }
 
     # A storage.cfg that does not exist yet (fresh install, no storages

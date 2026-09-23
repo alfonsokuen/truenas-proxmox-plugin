@@ -117,7 +117,7 @@ sub run_bash_fn {
 
 SKIP: {
     my $bash_ok = eval { system("bash -c 'source \"$SCRIPT\" 2>/dev/null; exit 0'") == 0 };
-    skip 'install.sh cannot be sourced in this shell', 29 unless $bash_ok;
+    skip 'install.sh cannot be sourced in this shell', 30 unless $bash_ok;
 
     my $priv_dir   = tempdir(CLEANUP => 1);
     my $cfg_dir    = tempdir(CLEANUP => 1);
@@ -355,6 +355,14 @@ SKIP: {
         $out = `bash -c "$env source '$SCRIPT' >/dev/null 2>/dev/null; perl() { exit 1; }; if tn_installer_cluster_ready; then rc=0; else rc=\\\$?; fi; echo RC=\\\$rc" 2>/dev/null`;
         ($rc) = $out =~ /RC=(\d+)/;
         is($rc, '1', '  ...fails CLOSED (not ready) when perl itself fails, instead of dying or defaulting to ready');
+
+        # G1 (QA round 6, Codex): stdout=="1" alone used to be enough,
+        # regardless of perl's own exit status - `printf 1; exit 1` (a
+        # partial success: the print ran, then something afterwards
+        # failed) was being read as READY. Both must hold now.
+        $out = `bash -c "$env source '$SCRIPT' >/dev/null 2>/dev/null; perl() { printf 1; exit 1; }; if tn_installer_cluster_ready; then rc=0; else rc=\\\$?; fi; echo RC=\\\$rc" 2>/dev/null`;
+        ($rc) = $out =~ /RC=(\d+)/;
+        is($rc, '1', '  ...G1: stdout "1" with a non-zero perl exit is NOT ready - both must agree');
     }
 }
 
