@@ -4836,13 +4836,21 @@ run_health_check() {
     fi
 
     # Check 5b: API authentication
+    #
+    # Use auth.me (no role required) instead of system.info (needs
+    # READONLY_ADMIN). The least-privilege role set documented in
+    # wiki/API-Permissions.md deliberately does NOT include
+    # READONLY_ADMIN, so a valid least-privilege API key would fail
+    # a system.info-based check with a misleading "auth failed"
+    # message. auth.me works for every authenticated key regardless
+    # of role. (issue #113)
     local api_key_early
     api_key_early=$(get_storage_config_value "$storage_name" "tn_api_key")
     if [[ -n "$api_host" ]] && [[ -n "$api_key_early" ]]; then
         printf "%-30s " "API authentication:"
         start_spinner
         local auth_result
-        if tn_api_call "$api_host" "$api_key_early" "system.info" '[]' >/dev/null 2>&1; then
+        if tn_api_call "$api_host" "$api_key_early" "auth.me" '[]' >/dev/null 2>&1; then
             auth_result="${COLOR_GREEN}✓${COLOR_RESET} Authenticated"
             ((checks_passed++))
         else
@@ -5860,6 +5868,12 @@ check_nvme_multipath() {
 
 # Test TrueNAS API connectivity
 # Uses WebSocket-only API via TrueNASPlugin
+#
+# Auth is verified via auth.me (no role required), so a least-privilege
+# API key configured per wiki/API-Permissions.md passes here even
+# without READONLY_ADMIN. The TrueNAS version display is a best-effort
+# secondary probe via system.info; the connectivity check does not
+# require it to succeed. (issue #113)
 test_truenas_api() {
     local ip="$1"
     local apikey="$2"
@@ -5869,22 +5883,30 @@ test_truenas_api() {
     printf "  Testing connection to TrueNAS at %s%s..." "$ip" "$port_suffix"
     start_spinner
 
-    local response
-    response=$(tn_api_call "$ip" "$apikey" "system.info" "[]" 2>/dev/null)
-    local exit_code=$?
+    local auth_response
+    auth_response=$(tn_api_call "$ip" "$apikey" "auth.me" "[]" 2>/dev/null)
+    local auth_exit=$?
 
     stop_spinner
     printf "\r\033[K"  # Clear spinner line
 
-    if [[ $exit_code -eq 0 ]] && [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
-        local version
-        version=$(echo "$response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
-        success "Connected to TrueNAS successfully (version: $version)"
-        return 0
-    else
+    if [[ $auth_exit -ne 0 ]] || [[ -z "$auth_response" ]]; then
         error "Failed to connect to TrueNAS API"
         return 1
     fi
+
+    # Best-effort version display. system.info needs READONLY_ADMIN;
+    # a least-privilege user gets no version string here (harmless).
+    local version_response
+    version_response=$(tn_api_call "$ip" "$apikey" "system.info" "[]" 2>/dev/null)
+    if [[ -n "$version_response" ]] && echo "$version_response" | grep -q '"version"'; then
+        local version
+        version=$(echo "$version_response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
+        success "Connected to TrueNAS successfully (version: $version)"
+    else
+        success "Connected to TrueNAS successfully"
+    fi
+    return 0
 }
 
 # Verify dataset exists

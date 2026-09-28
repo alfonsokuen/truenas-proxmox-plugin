@@ -1,3 +1,34 @@
+truenas-proxmox-plugin (2.1.23~beta6) unstable; urgency=medium
+
+  * install.sh: health check no longer requires READONLY_ADMIN on the
+    TrueNAS API user (issue #113). The two probes that previously used
+    'system.info' - the wizard/health-check auth check and the
+    connectivity test in test_truenas_api - now use 'auth.me', which
+    every authenticated API key can call regardless of role. 'system.info'
+    is still called on a best-effort basis by test_truenas_api solely
+    to display the TrueNAS version string on success; if the key lacks
+    the role the version display is silently omitted and connectivity
+    is still confirmed. Least-privilege API keys configured per
+    wiki/API-Permissions.md now pass the health check cleanly instead
+    of getting a misleading "Authentication failed" message.
+
+  * wiki/API-Permissions.md: new "install.sh vs. the plugin runtime"
+    section documenting the small set of TrueNAS methods install.sh
+    calls beyond the plugin's runtime footprint (system.info,
+    interface.query) and the least-privilege behavior for each. Also
+    adds a Caveats bullet naming the pre-fix issue #113 symptom so
+    operators on older install.sh copies know to upgrade.
+
+  * wiki/NVMe-Setup.md: correct the ZFS block size tuning callout to
+    reflect that the plugin does not set a default (issue #108). The
+    previous "tn_zvol_blocksize 64K  # Default" comment was misleading -
+    64K is a recommendation for NVMe/TCP workloads, not a default. Zvols
+    with tn_zvol_blocksize omitted inherit TrueNAS SCALE's own
+    pool.dataset.create default (16K on 25.10.x), matching what
+    Configuration.md already documented.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Sun, 28 Sep 2026 09:45:00 -0400
+
 truenas-proxmox-plugin (2.1.23~beta5) unstable; urgency=medium
 
   * New feature: import foreign TrueNAS snapshots (PR #110 by Alfonso
