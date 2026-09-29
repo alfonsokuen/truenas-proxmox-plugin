@@ -1,3 +1,102 @@
+truenas-proxmox-plugin (2.1.23~beta7) unstable; urgency=medium
+
+  * install.sh: complete the #93 install.sh sweep from PR #116
+    (WarlockSyno). Bundles 21 commits across install.sh, debian/postinst,
+    tools/truenas-plugin-lvm-filter, and two wiki pages. Installer /
+    packaging only - no changes to TrueNASPlugin.pm from PR #116.
+
+  * APT-managed install / update / rollback (#93, #105): install, update,
+    and rollback now shell out to APT against the plugin's own APT repo
+    instead of pulling raw .pm files from GitHub. Backup captures the
+    installed .deb at backup time so rollback is dpkg-consistent, with
+    a cluster-wide opt-in. Source-aware update detection compares against
+    the APT candidate on apt-managed nodes (dpkg version ordering, pre-
+    release aware) and keeps the GitHub path on raw / dpkg-only nodes;
+    a raw cluster pull is refused on non-dpkg nodes. Uninstall runs
+    'apt remove' on dpkg-managed packages, and APT install '--reinstall's
+    when the package is registered but the .pm file is missing (#105).
+    APT repo key content is validated (non-empty, PGP block header) before
+    install so a 200-with-empty-body no longer leaves a 0-byte keyring,
+    and the 'apt-cache' '(none)' candidate sentinel is normalized so
+    'dpkg --compare-versions' no longer emits 'bad syntax' noise when the
+    repo is unreachable. The installer re-execs under bash when invoked
+    via sh.
+
+  * Deferred pveproxy restart (#60): both debian/postinst and install.sh
+    now restart the plugin-loading daemons (pvedaemon, pvestatd,
+    pve-ha-crm, pve-ha-lrm) immediately and defer the pveproxy restart
+    by ~10 s through a transient systemd timer, so a web-UI xterm.js
+    upgrade terminal survives the apt transaction. The TRUENAS_PLUGIN_NO
+    _RESTART=1 escape hatch prints the manual command instead. install.sh
+    mirrors the deferral: the timer is armed at installer exit (not
+    mid-menu), a pending timer from the postinst is detected and not
+    re-scheduled, stale failed unit state is 'reset-failed' before
+    scheduling, and remote one-liners report daemon-restart failures
+    instead of swallowing them. Verified live on 2026-09-29 pve: web UI
+    stayed reachable through the install (real outages 0 s over 25 s of
+    polling) and pveproxy did restart afterward.
+
+  * Cluster parity health check (#21, active scope): new "Check 14:
+    Cluster parity" plus collect_parity_facts(). Per-node, one local or
+    ssh round-trip collects functional facts - iSCSI: node records,
+    active sessions, visible LUNs; NVMe: subsystem connected, live
+    namespaces - with exact IQN / NQN field matching so sibling targets
+    (e.g. ':proxmox-move') do not false-match. Per-node rows plus one
+    aggregate row, SKIP on single-node, read-only, non-fatal. 0 LUNs
+    while the cluster sees N is CRIT; 0 sessions everywhere is OK
+    (login is on-demand); partition nodes are excluded from namespace
+    counts; malformed collector output is labeled separately from an
+    SSH failure. MTU-match remains deferred per the issue's scope note.
+    Verified live 2026-09-29: correctly detected a transient asymmetry
+    (pve saw 7 iSCSI LUNs, pvevm1 saw 6) from a just-freed test LUN
+    that pve's session still cached.
+
+  * LVM global filter (#4): install.sh offers the global_filter fix
+    (with confirmation) after storage config for either transport,
+    targets the effective file (lvmlocal.conf when it carries a filter,
+    else lvm.conf), verifies the edit landed (no more false "installed"
+    on multi-line / trailing-comment configs), clears the LVM cache,
+    restarts lvm2-monitor, and is idempotent. New standalone helper
+    tools/truenas-plugin-lvm-filter with '--status' and '--uninstall',
+    plus a wiki troubleshooting entry.
+
+  * Other sweep items: version reporting trusts 'dpkg-query -W' over
+    the plugin's embedded $VERSION (#87), pre-release status derived
+    from the dpkg version. A fresh NVMe/TCP install can no longer
+    write a literal ':' to tn_discovery_portal; generate_storage_config()
+    refuses empty IP / port pairs (#86 part 1). The version picker
+    accepts any pre-release suffix ('-alphaN', '-betaN', '-rcN'), not
+    just '-debN' (#86 part 2). IPv6 tn_api_host validation and portal
+    splitting (#68).
+
+  * install.sh health check preserves the beta6 auth-probe semantics
+    (issues #113, #93): auth.me remains the authoritative auth check
+    at both call sites; system.info is kept only as a best-effort
+    version-display fallback. auth.me is stricter than core.ping (which
+    is no_auth_required and would give a false green on a bogus or
+    revoked API key) while working for every documented least-privilege
+    key. Matches the plugin's own _preflight_check_alloc auth probe.
+
+  * Verified live 2026-09-29 on the 3-node PVE cluster (pve / proxmox2
+    / pvevm1, PVE 9.1.1, TrueNAS 25.10.7):
+      - live-test-v4 sweep (v3-import, v4-iscsi, v4-nvme, v4-lxc,
+        v4-advanced, v4-boot-cluster): 60/60 assertions pass, 0 fail.
+      - proxmox-test-runner storage-plugin-validation with 'rootdir'
+        enabled on both truenas-storage (iSCSI) and truenas-nvme
+        (NVMe/TCP): 19 validated / 0 real failures per transport. The
+        1 cluster_migration.pl failure per run was an environmental
+        PVE-ticket auth issue in the runner itself (direct 'qm migrate'
+        worked), not a plugin regression.
+      - LVM filter helper on all 3 nodes: present, executable, syntax
+        OK, --status reports correct filter state, --help documented.
+      - APT source, apt-cache policy, apt remove + install cleanly:
+        plugin runtime remained active through cross-version churn.
+      - Cluster parity check detected a real transient asymmetry.
+
+  Closes #4, #21, #60, #68, #86, #87, #93, #105.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 29 Sep 2026 11:00:00 -0400
+
 truenas-proxmox-plugin (2.1.23~beta6) unstable; urgency=medium
 
   * install.sh: health check no longer requires READONLY_ADMIN on the
