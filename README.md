@@ -169,6 +169,10 @@ Replace:
 storage. Drop `rootdir` if you only need VM disks; see
 [wiki/LXC-Setup.md](wiki/LXC-Setup.md) for the container-side details.
 
+If your TrueNAS API listens on a port other than 443 (or 80 for `tn_api_scheme=ws`),
+add `tn_api_port <port>` — e.g. `tn_api_port 8443`. Otherwise the plugin defaults
+to 443 and the broker will fail to connect with a TLS-connect error.
+
 #### NVMe/TCP Configuration (Alternative)
 
 For lower latency and reduced CPU overhead, use NVMe/TCP instead of iSCSI:

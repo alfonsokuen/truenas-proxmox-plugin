@@ -962,3 +962,8 @@ pvesm list truenas-storage
 - [Advanced Features](Advanced-Features.md) - Performance tuning and clustering
 - [Troubleshooting](Troubleshooting.md) - Common configuration issues
 - [Multi-Tenancy](Multi-Tenancy.md) - Sharing a TrueNAS system across multiple clusters
+- [Tools](Tools.md) - `truenas-proxmox-manage` CLI, including `import-snapshots` for adopting ZFS snapshots taken outside PVE (periodic tasks, replication targets, hand-invoked `zfs snapshot`) into the guest configuration
+- [LXC Container Setup](LXC-Setup.md) - Enabling the `rootdir` content type for LXC guests
+- [NVMe/TCP Setup](NVMe-Setup.md) - Transport-specific setup, tuning, and DH-CHAP
+- [LVM Filter](LVM-Filter.md) - Hiding TrueNAS-served block devices from the Proxmox host's LVM scanner (`#4`)
+- [API Permissions](API-Permissions.md) - Least-privilege TrueNAS role set for the plugin's API user

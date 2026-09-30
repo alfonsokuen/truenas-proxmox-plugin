@@ -248,6 +248,33 @@ Suggested convention:
 Do not let TrueNAS retention delete a snapshot that PVE thinks it owns —
 it will surface as a rollback failure inside PVE.
 
+### Snapshots taken on TrueNAS — consistency
+
+Snapshots created outside PVE (periodic snapshot tasks, replication
+targets, manual `zfs snapshot`) are **crash-consistent**, not
+application-consistent. TrueNAS does not know a guest is running on
+the zvol, so there is no guest-agent `fs-freeze`: rolling back to one
+is the guest losing power at that instant. Journaling filesystems
+normally come back clean; databases may need their own recovery.
+When you need a known-good state, take a PVE snapshot with the QEMU
+guest agent enabled (`qm snapshot`) and treat imported snapshots as
+a safety net.
+
+A subtler symptom: PVE only rolls back to the newest snapshot in the
+chain, so a periodic TrueNAS snapshot newer than your deliberate PVE
+snapshot puts itself in the way of that rollback — whether or not
+you import it. `qm rollback` fails with `is not most recent
+snapshot` with nothing in the PVE UI to explain why. Options:
+
+- Adopt periodic snapshots on purpose with
+  `truenas-proxmox-manage import-snapshots <vmid> --match REGEX` and
+  roll back to the deliberate one you want. See [Tools.md](Tools.md).
+- Keep periodic snapshot tasks off the zvols that back PVE guests
+  when you rely on PVE-native rollback.
+
+Both options are legitimate; pick the one that matches how you use
+snapshots.
+
 ---
 
 ## Provisioning Workflow

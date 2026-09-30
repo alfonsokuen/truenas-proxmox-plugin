@@ -1,5 +1,49 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.23~beta7 (September 29, 2026)
+
+### New Features
+
+- **install.sh: full `#93` install.sh sweep from PR #116** (WarlockSyno). 21 commits across `install.sh`, `debian/postinst`, `tools/truenas-plugin-lvm-filter`, and two wiki pages. Installer / packaging only — no `TrueNASPlugin.pm` changes. Closes `#4`, `#21`, `#60`, `#68`, `#86`, `#87`, `#93`, `#105`. Highlights:
+  - **APT-managed install / update / rollback**: install, update, and rollback go through APT against the plugin's own APT repo instead of raw file pulls. Backup captures the installed `.deb` at backup time so rollback is dpkg-consistent, with a cluster-wide opt-in. Source-aware update detection compares against the APT candidate on apt-managed nodes and keeps the GitHub path on raw/dpkg-only nodes; a raw cluster pull is refused on non-dpkg nodes. Uninstall `apt remove`s dpkg-managed packages; APT install `--reinstall`s when the package is registered but the `.pm` file is missing (#105).
+  - **Deferred pveproxy restart (#60)**: `postinst` and `install.sh` restart the plugin-loading daemons immediately and defer the pveproxy restart by ~10 s through a transient systemd timer, so a web-UI upgrade terminal survives the apt transaction. `TRUENAS_PLUGIN_NO_RESTART=1` escape hatch prints the manual command instead.
+  - **Cluster parity health check (#21)**: new "Check 14: Cluster parity". Per-node, one local/ssh round-trip collects functional facts (iSCSI: node records, active sessions, visible LUNs; NVMe: subsystem connected, live namespaces) with exact IQN/NQN matching. Per-node rows + aggregate, SKIP on single-node, read-only, non-fatal.
+  - **LVM global filter (#4)**: `install.sh` offers the `global_filter` fix after storage config for either transport; standalone `tools/truenas-plugin-lvm-filter` helper with `--status` / `--uninstall`; wiki troubleshooting entry.
+  - **Version reporting (#87)**: install.sh trusts `dpkg-query -W` over the plugin's embedded `$VERSION`.
+  - **NVMe portal guard (#86)**: fresh NVMe/TCP install can no longer write a literal `:` to `tn_discovery_portal`; the wizard refuses empty IP/port pairs.
+  - **Version picker (#86)**: accepts any pre-release suffix (`-alphaN`, `-betaN`, `-rcN`), not just `-debN`.
+  - **IPv6 (#68)**: `tn_api_host` validation and portal splitting.
+
+### Notes
+
+- Plugin runtime code is identical to 2.1.23~beta6. Beta7 = beta6 runtime + install.sh sweep.
+- Rebase preserved the beta6 `auth.me` health check at both `#113` call sites; `system.info` remains a best-effort version-display probe. WarlockSyno's `core.ping` variant was not accepted because `core.ping` is `no_auth_required` and would give a false green on a bogus/revoked API key.
+
+## Version 2.1.23~beta6 (September 28, 2026)
+
+### Bug Fixes
+
+- **install.sh: least-privilege-safe health check (#113)**: the two probes that previously used `system.info` — the wizard/health-check auth check and the connectivity test in `test_truenas_api` — now use `auth.me`, which every authenticated API key can call regardless of role. `system.info` is still called on a best-effort basis by `test_truenas_api` solely to display the TrueNAS version string on success; if the key lacks the role the version display is silently omitted and connectivity is still confirmed. Least-privilege API keys configured per `wiki/API-Permissions.md` now pass the health check cleanly instead of getting a misleading "Authentication failed" message.
+
+### Documentation
+
+- **`wiki/API-Permissions.md`**: new "install.sh vs. the plugin runtime" section documenting the small set of TrueNAS methods `install.sh` calls beyond the plugin's runtime footprint (`system.info`, `interface.query`) and the least-privilege behavior for each. Also adds a Caveats bullet naming the pre-fix `#113` symptom so operators on older `install.sh` copies know to upgrade.
+- **`wiki/NVMe-Setup.md` (#108)**: correct the ZFS block size tuning callout. The previous "`tn_zvol_blocksize 64K  # Default`" comment was misleading — 64K is a recommendation for NVMe/TCP workloads, not a default. Zvols with `tn_zvol_blocksize` omitted inherit TrueNAS SCALE's own `pool.dataset.create` default (16K on 25.10.x), matching what `Configuration.md` already documented.
+
+## Version 2.1.23~beta5 (September 23, 2026)
+
+### New Features
+
+- **Import foreign TrueNAS snapshots (PR #110 by Alfonso Kuen)**: ZFS snapshots created outside PVE (periodic snapshot tasks, replication targets, hand-invoked `zfs snapshot`) are otherwise invisible to PVE, but they already affect it — a TrueNAS snapshot newer than the last PVE snapshot blocks `qm rollback` with `is not most recent snapshot`, and rollback destroys them recursively. The new `truenas-proxmox-manage import-snapshots <vmid>` walks the guest's disks on TrueNAS and adopts the missing snapshots into the PVE configuration so they can be listed, rolled back, and deleted by the standard `qm listsnapshot` / `qm rollback` / `qm delsnapshot` workflow. Explicit, per-guest, with `--dry-run` to preview and `--match REGEX` to import only the ones you want. Covers both VMs and LXC containers (rootfs plus additional mountpoints); refuses containers with bind mounts because PVE itself does. Non-import guest state is left alone.
+
+### Bug Fixes
+
+- **Cluster-aware refusal for the importer**: `truenas-proxmox-manage import-snapshots <vmid>` invoked on a node that does not own the guest now dies with an explicit `$vmid is a VM/CT on node 'X', not on this one; run import-snapshots there` instead of the generic `Configuration file 'nodes/<node>/qemu-server/<vmid>.conf' does not exist`. Root cause: `_tn_guest_config` queried `PVE::Cluster::get_vmlist()` from a fresh Perl process (install.sh's `exec perl -MPVE::Storage::Custom::TrueNASPlugin ...` dispatch is always a fresh process), where the in-process cluster vmlist cache is empty until `PVE::Cluster::cfs_update()` is called first; `get_vmlist()` returned `{ids => {}}` regardless of what pmxcfs had actually propagated, and `$entry` stayed undef.
+
+### Documentation
+
+- **`wiki/Tools.md`**: note that imported TN snapshots are crash-consistent (no guest-agent `fs-freeze`, no RAM state), unlike PVE-native `qm snapshot` with the guest agent enabled. Raised by @johntdavis84 on PR #110.
+
 ## Version 2.1.23~beta4 (September 11, 2026)
 
 ### Bug Fixes
