@@ -1,3 +1,60 @@
+truenas-proxmox-plugin (2.1.23~beta8) unstable; urgency=medium
+
+  * fix(#88): path() fast-fail + deterministic by-path fallback.
+    PVE's destroy_vm foreach_volume_full closure at QemuServer.pm:1839
+    calls path() -> remove_owned_drive -> vdisk_free -> free_image;
+    when path() died, the closure exited before free_image ran and
+    TrueNAS state leaked (zvol, iSCSI extent, and target-extent
+    mapping stayed behind forever). The old path() called
+    _device_for_lun with the default 600-retry budget (60 s), longer
+    than the destroy hold, so any node that never activated the disk
+    locally (cross-node destroy of an orphan, destroy after a leaked
+    config-migrate, or destroy on a node whose iSCSI session was
+    down) aborted destroy_vm before free_image ran. Now: retries=5
+    (500 ms) at the path() call site, deterministic by-path string
+    fallback (/dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-<N>) for
+    callers that don't need a live device, and die only if we lack
+    LUN + portal + IQN to build the deterministic name. Verified with
+    a two-scenario timing test: same-node destroy 11.5 s, cross-node
+    destroy with iSCSI session logged out on destroying node 15.6 s;
+    TN state cleaned in both. Pre-fix the cross-node case hung ~60 s
+    and leaked. Closes #88.
+
+  * fix: iSCSI extent blocksize=4096 pblocksize=true to satisfy the
+    QEMU 10.1 alignment check. QEMU 10.1's stricter permission/
+    alignment negotiation refuses to attach a scsi-hd whose backing
+    image reports the mismatch shape that TrueNAS's default extent
+    config produces: logical_block_size=512 alongside
+    physical_block_size=16384 (inferred from the zvol's 16K
+    volblocksize). qm start on any iSCSI-backed disk dies with:
+    "kvm: -device scsi-hd,...,write-cache=on: Cannot get 'write'
+    permission without 'resize': Image size is not a multiple of
+    request alignment". Now every iscsi.extent.create payload
+    (_tn_extent_create, _alloc_image_iscsi, _clone_image_iscsi)
+    sends blocksize=4096 and pblocksize=true, so TN reports
+    lbs=4096 pbs=4096 to the initiator and QEMU's check passes.
+    Existing extents are unchanged; older VMs that already fail to
+    start under QEMU 10.1 need their extents updated in place or
+    refreshed via a clone. Verified: 2G / 3G / 4G disks previously
+    refused by qm start now start on the same QEMU/PVE combination.
+
+  * docs(#117): walk through Base Name, Portal, and Target group
+    bindings in README.md and wiki/Installation.md. The old iSCSI
+    setup recipe covered only the target creation step, producing
+    the exact failure mode from issue #117: target created on
+    TrueNAS but 'iscsiadm --mode discovery' from Proxmox returned
+    empty and the plugin could only get as far as extent creation.
+    Both docs now walk through: verify the iSCSI Base Name under
+    Target Global Configuration (must start with 'iqn.'; feeds
+    tn_target_iqn as '<Base Name>:<Target Name>'); create/verify
+    the Portal on 0.0.0.0:3260 and note the Portal ID; create the
+    Target with Portal Group ID + Initiator Group ID bindings and
+    Authentication Method set explicitly, with a callout that
+    without those group bindings the target exists but is not
+    exposed on the network. Refs #117.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 30 Sep 2026 18:20:00 -0400
+
 truenas-proxmox-plugin (2.1.23~beta7) unstable; urgency=medium
 
   * install.sh: complete the #93 install.sh sweep from PR #116
