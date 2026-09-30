@@ -3587,6 +3587,7 @@ sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
     my $submitted_name = $extent_name // $zname;
     my $payload = {
         name => $submitted_name, type => 'DISK', disk => $zvol_path, insecure_tpc => JSON::PP::true,
+        blocksize => 4096, pblocksize => JSON::PP::true,
     };
     # Zvol-visibility retry: TN validates iscsi.extent.create by stat'ing
     # /dev/zvol/<ds>; right after pool.snapshot.clone or pool.dataset.create
@@ -6860,6 +6861,8 @@ sub _alloc_image_iscsi {
         type => 'DISK',
         disk => $zvol_path,
         insecure_tpc => JSON::PP::true, # typical default for modern OS initiators
+        blocksize => 4096,
+        pblocksize => JSON::PP::true,
     };
     my $extent_id;
 
@@ -9084,6 +9087,8 @@ sub _clone_image_iscsi {
             type => 'DISK',
             disk => $zvol_path,
             insecure_tpc => JSON::PP::true,
+            blocksize => 4096,
+            pblocksize => JSON::PP::true,
         };
 
         # pool.snapshot.clone returns as soon as ZFS finishes the clone, but
