@@ -6557,26 +6557,60 @@ sub path {
         _iscsi_login_all($scfg);
         my $dev;
         my $lookup_err;
+        # Short retry (500 ms) — activate_volume is the authoritative
+        # wait-for-device point with the full retry budget; path() is
+        # called from many contexts (including PVE's destroy_vm's
+        # remove_owned_drive closure at QemuServer.pm:1839) where the
+        # device may not be locally attached and blocking for 60 s would
+        # abort the whole destroy before free_image runs, leaking zvols
+        # on TrueNAS (issue #88). If _device_for_lun times out here we
+        # fall back to the deterministic /dev/disk/by-path/... string
+        # so remove_owned_drive keeps a non-empty $path and proceeds to
+        # call vdisk_free -> free_image, which is what actually cleans
+        # TN state up.
         if (defined $lun) {
-            eval { $dev = _device_for_lun($scfg, $lun); };
+            eval { $dev = _device_for_lun($scfg, $lun, 5); };
             $lookup_err = $@;
         }
         if (!$dev) {
             # No embedded LUN, or the embedded one may be stale: re-resolve
-            # the current mapping via the shared helper (also the sole path
-            # for cloud-init volumes, which have no embedded metadata at
-            # all -- issue #84). Dies with a clear message if unresolvable.
-            my $real_lun = _resolve_iscsi_lun($scfg, $zname, undef);
-            if (!defined($lun) || $real_lun != $lun) {
-                $dev = _device_for_lun($scfg, $real_lun);
-            } else {
-                # Mapping is unchanged: the original _device_for_lun failure
-                # already carries a detailed diagnostic (active sessions,
-                # by-path listing) that's more useful than a generic
-                # message, so bubble it up instead of re-deriving one.
-                die $lookup_err if $lookup_err;
-                die "Could not locate device for LUN $lun (IQN $scfg->{tn_target_iqn})\n";
+            # the current mapping via the shared helper. This CAN succeed
+            # even when the device isn't attached locally, because it
+            # asks TrueNAS for the LUN number rather than the Linux
+            # device.
+            my $real_lun = eval { _resolve_iscsi_lun($scfg, $zname, undef) };
+            if (defined $real_lun && (!defined($lun) || $real_lun != $lun)) {
+                eval { $dev = _device_for_lun($scfg, $real_lun, 5); };
             }
+            if (!$dev) {
+                # Device isn't locally attached. Return the deterministic
+                # by-path string so callers that don't need a live device
+                # (destroy_vm's remove_owned_drive, size probes, config
+                # renderers) get a usable identifier rather than dying
+                # with a 60-second timeout. Callers that DO need a live
+                # device (VM start, qm start) go through activate_volume
+                # first, which authoritatively waits for the device.
+                my $resolved_lun = defined $real_lun ? $real_lun : $lun;
+                if (defined $resolved_lun) {
+                    my $portal = $scfg->{tn_discovery_portal} // '';
+                    my $iqn    = $scfg->{tn_target_iqn}       // '';
+                    if ($portal ne '' && $iqn ne '') {
+                        $dev = "/dev/disk/by-path/ip-${portal}-iscsi-${iqn}-lun-${resolved_lun}";
+                        _log($scfg, 2, 'debug',
+                            "[TrueNAS] path: device not locally attached for LUN $resolved_lun; " .
+                            "returning deterministic by-path $dev (activate_volume required for live use)");
+                    }
+                }
+            }
+        }
+        # Absolute last resort: no LUN, no portal/IQN. This is a badly
+        # broken storage config, not a normal path() failure — die with
+        # the original diagnostic so operators see what's missing.
+        if (!$dev) {
+            die $lookup_err if $lookup_err;
+            die "Could not locate device or deterministic by-path for LUN "
+                . ($lun // '<unknown>')
+                . " (IQN $scfg->{tn_target_iqn})\n";
         }
         return ($dev, $vmid, 'images');
 
