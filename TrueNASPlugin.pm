@@ -6514,6 +6514,18 @@ sub parse_volname {
         return ('images', $zname, $vmid, undef, undef, $isBase, 'raw', $uuid);
     }
 
+    # Plain PVE stem: vm-<vmid>-disk-<N> or base-<vmid>-disk-<N>.
+    # PVE core (libpve-storage-perl Storage.pm volume_import_start) calls
+    # parse_volname on the SOURCE's bare stem to extract vmid during
+    # cross-storage migration — before our volume_import even runs. If
+    # we die here, the migration bails and never reaches our import
+    # side. Accept the stem; downstream alloc_image will pick the real
+    # -lun<N> / -ns<uuid> suffix.
+    if ($volname =~ m/^(vm|base)-(\d+)-disk-\d+(?:\.raw)?$/) {
+        my $isBase = $1 eq 'base' ? 1 : undef;
+        return ('images', $volname, $2, undef, undef, $isBase, 'raw', undef);
+    }
+
     die "unable to parse volname '$volname'\n";
 }
 
