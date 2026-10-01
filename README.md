@@ -156,7 +156,7 @@ truenasplugin: truenas-storage
     tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
     tn_dataset tank/proxmox
     tn_discovery_portal 192.168.1.100:3260
-    content images
+    content images,rootdir
     shared 1
 ```
 
@@ -164,6 +164,14 @@ Replace:
 - `192.168.1.100` with your TrueNAS IP
 - `1-your-truenas-api-key-here` with your TrueNAS API key
 - `tank/proxmox` with your ZFS dataset path
+
+`content images,rootdir` enables both VM disks and LXC container rootfs on this
+storage. Drop `rootdir` if you only need VM disks; see
+[wiki/LXC-Setup.md](wiki/LXC-Setup.md) for the container-side details.
+
+If your TrueNAS API listens on a port other than 443 (or 80 for `tn_api_scheme=ws`),
+add `tn_api_port <port>` — e.g. `tn_api_port 8443`. Otherwise the plugin defaults
+to 443 and the broker will fail to connect with a TLS-connect error.
 
 #### NVMe/TCP Configuration (Alternative)
 
@@ -177,7 +185,7 @@ truenasplugin: truenas-nvme
     tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     tn_dataset tank/proxmox
     tn_discovery_portal 192.168.1.100:4420
-    content images
+    content images,rootdir
     shared 1
 ```
 
@@ -201,19 +209,44 @@ Navigate to **System Settings** → **Services**:
 - Enable **iSCSI** service
 - Set to start automatically
 
-#### 3. Create iSCSI Target
-Navigate to **Shares** → **Block Shares (iSCSI)** → **Targets**:
-- Click **Add**
-- **Target Name**: `proxmox` (becomes `iqn.2005-10.org.freenas.ctl:proxmox`)
-- **Target Mode**: iSCSI
-- Click **Save**
+#### 3. Verify the iSCSI Base Name
+Navigate to **Shares** → **Block Shares (iSCSI)** → **Configure**
+(the **Target Global Configuration** section):
+- **Base Name**: `iqn.2005-10.org.freenas.ctl` (the TrueNAS default;
+  any valid IQN is fine, but it MUST start with `iqn.` — the value
+  becomes the prefix of every target IQN, so a base name like
+  `TrueNAS` produces invalid `TrueNAS:...` IQNs and no client will
+  connect)
+- Note the value; you'll need it for `tn_target_iqn` below
 
 #### 4. Create iSCSI Portal
 Navigate to **Shares** → **Block Shares (iSCSI)** → **Portals**:
-- Default portal should exist on `0.0.0.0:3260`
-- If not, create one with your TrueNAS IP and port 3260
+- A default portal on `0.0.0.0:3260` may already exist
+- Otherwise **Add**, IP address `0.0.0.0` (or a specific TrueNAS
+  interface IP), port `3260`
+- Note the **Portal ID** — you'll assign it to the target next
 
-#### 5. Generate API Key
+#### 5. Create iSCSI Target
+Navigate to **Shares** → **Block Shares (iSCSI)** → **Targets** → **Add**:
+- **Target Name**: `proxmox` (becomes `<Base Name>:proxmox`, e.g.
+  `iqn.2005-10.org.freenas.ctl:proxmox`)
+- **Target Alias**: optional
+- **Target Mode**: iSCSI
+- Under **iSCSI Group**:
+  - **Portal Group ID**: pick the portal you just created (step 4)
+  - **Initiator Group ID**: pick your initiator group, or leave it
+    set to allow every initiator
+  - **Authentication Method**: `None` (or CHAP if you want it; the
+    plugin supports CHAP via `tn_chap_user` / `tn_chap_password`)
+- Click **Save**
+
+> **The Portal Group and Initiator Group bindings on the target are
+> what make discovery actually return this target.** Without them,
+> `iscsiadm --mode discovery` from Proxmox returns empty and the
+> plugin can only get as far as creating extents on TrueNAS — a
+> common first-time symptom (see issue #117).
+
+#### 6. Generate API Key
 Navigate to **Credentials** → **Local Users**:
 - Select **root** user (or create dedicated user)
 - Click **Edit**
@@ -221,7 +254,7 @@ Navigate to **Credentials** → **Local Users**:
 - Click **Add** to generate new API key
 - **Copy and save the API key securely** (you won't be able to see it again)
 
-#### 6. Verify Configuration
+#### 7. Verify Configuration
 The plugin will automatically:
 - Create zvols under your dataset (`tank/proxmox/vm-XXX-disk-N`)
 - Create iSCSI extents for each zvol
@@ -258,6 +291,9 @@ qm rollback 100 backup1
 
 # Delete snapshot
 qm delsnapshot 100 backup1
+
+# Import snapshots that already exist on TrueNAS into the guest configuration
+truenas-proxmox-manage import-snapshots 100 --dry-run
 ```
 
 ### Storage Management
@@ -326,6 +362,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.1.5
-**Last Updated**: June 16, 2026
+**Version**: 2.1.23
+**Last Updated**: August 5, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+

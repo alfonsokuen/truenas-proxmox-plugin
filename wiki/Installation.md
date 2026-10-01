@@ -840,20 +840,20 @@ systemctl status iscsitarget
 netstat -tuln | grep 3260
 ```
 
-### 3. Create iSCSI Target
+### 3. Verify the iSCSI Base Name
 
-Navigate to **Shares** → **Block Shares (iSCSI)** → **Targets** → **Add**:
+Navigate to **Shares** → **Block Shares (iSCSI)** → **Configure**
+(the **Target Global Configuration** section):
 
-**Basic Configuration:**
-- **Target Name**: `proxmox` (becomes `iqn.2005-10.org.freenas.ctl:proxmox`)
-- **Target Alias**: Proxmox Storage (optional)
-- **Target Mode**: iSCSI
+- **Base Name**: `iqn.2005-10.org.freenas.ctl` (the TrueNAS default)
 
-**Advanced Options:**
-- **Auth Method**: None (or CHAP if needed)
-- **Auth Group**: None (or configure for CHAP)
+Any valid IQN is fine, but the Base Name **must start with `iqn.`** —
+it becomes the prefix of every target IQN. If it's set to something
+like `TrueNAS`, all targets end up as `TrueNAS:...`, which isn't a
+valid IQN and no client will connect (see issue #117).
 
-Click **Save**
+Note the value; it goes into `tn_target_iqn` in `storage.cfg` as
+`<Base Name>:<Target Name>` (see step 5).
 
 ### 4. Create/Verify iSCSI Portal
 
@@ -869,7 +869,37 @@ Navigate to **Shares** → **Block Shares (iSCSI)** → **Portals**:
 - **Port**: 3260 (default)
 - **Discovery Auth Method**: None (or CHAP)
 
-### 5. Generate API Key
+Note the **Portal ID** shown next to the row — you'll bind it to the
+target in the next step.
+
+### 5. Create iSCSI Target
+
+Navigate to **Shares** → **Block Shares (iSCSI)** → **Targets** → **Add**:
+
+**Basic Configuration:**
+- **Target Name**: `proxmox` (becomes `<Base Name>:proxmox`, e.g.
+  `iqn.2005-10.org.freenas.ctl:proxmox`)
+- **Target Alias**: Proxmox Storage (optional)
+- **Target Mode**: iSCSI
+
+**iSCSI Group (required — this is what makes discovery work):**
+- **Portal Group ID**: the portal you just created (from step 4)
+- **Initiator Group ID**: your initiator group, or leave it set to
+  allow every initiator
+- **Authentication Method**: `None` (or CHAP if you want it; the
+  plugin supports CHAP via `tn_chap_user` / `tn_chap_password`)
+- **Authentication Group**: `None` (or the CHAP auth group)
+
+Click **Save**
+
+> **Important**: Portal Group and Initiator Group are what expose the
+> target on the network. Without them the target exists in TrueNAS but
+> `iscsiadm --mode discovery` from Proxmox returns empty, and the
+> plugin can only get as far as creating extents on TrueNAS. This is
+> the failure mode from issue #117 — one of the most common
+> first-install pitfalls.
+
+### 6. Generate API Key
 
 Navigate to **Credentials** → **Local Users**:
 
@@ -898,7 +928,7 @@ Navigate to **Credentials** → **Local Users**:
 
 For security-conscious deployments, see [Minimum API Permissions](API-Permissions.md) for an explicit, least-privilege role set (verified method-by-method against TrueNAS RBAC) instead of granting a broad admin-level role.
 
-### 6. Optional: Configure CHAP Authentication
+### 7. Optional: Configure CHAP Authentication
 
 Navigate to **Shares** → **Block Shares (iSCSI)** → **Authorized Access**:
 
@@ -925,7 +955,7 @@ truenasplugin: truenas-storage
     tn_chap_password your-chap-password
 ```
 
-### 7. Verify TrueNAS Configuration
+### 8. Verify TrueNAS Configuration
 
 #### Test API Access
 Note: `STORAGE_ID` should be an existing TrueNAS plugin storage ID in `/etc/pve/storage.cfg`.
@@ -1059,15 +1089,15 @@ telnet YOUR_TRUENAS_IP 3260
 # Valid: "tank/my-storage" or "tank/mystorage"
 
 # Check retry parameters
-# api_retry_max must be 0-10
-# api_retry_delay must be 0.1-60
+# tn_api_retry_max must be 0-10
+# tn_api_retry_delay must be 0.1-60
 
 # Verify all required parameters present:
-# - api_host
-# - api_key
-# - dataset
-# - target_iqn
-# - discovery_portal
+# - tn_api_host
+# - tn_api_key
+# - tn_dataset
+# - tn_target_iqn
+# - tn_discovery_portal
 ```
 
 ## Updating the Plugin

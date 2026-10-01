@@ -31,7 +31,7 @@ use IO::Socket::SSL;
 use IO::Socket::INET;
 use IO::Select;
 use Fcntl qw(:flock);
-use POSIX qw(setsid strftime);
+use POSIX qw(setsid strftime WNOHANG);
 use Digest::SHA qw(sha1 sha1_hex);
 use MIME::Base64 qw(encode_base64);
 use JSON::PP;
@@ -42,7 +42,37 @@ my $SOCKET_PATH    = '/run/truenas-plugin/broker.sock';
 my $PIDFILE        = '/run/truenas-plugin/broker.pid';
 my $LOG_FILE       = '/var/log/truenas-plugin-broker.log';
 my $IDLE_REAP_SECS = 600;   # close WS conns idle longer than this
-my $WS_PINNED_PATH = '/api/v25.10.2';
+my $WS_PATH = '/api/current';
+
+# Cache the pool-entry liveness probe (`auth.me`) result for up to
+# this many seconds. Every plugin call goes through get_or_open_ws();
+# running an auth-required RPC on every call adds a per-call round
+# trip whose per-call cost is small in isolation but compounds under
+# multi-node load, and 'auth.me' in particular returns a large
+# response (full user + role list, several KiB) that TN's middleware
+# serialises around user-record locks -- enough to trip 596 API
+# timeouts in PVE under a busy 3-node test suite. Caching the last
+# successful probe timestamp per pool entry and skipping the probe
+# when it is <LIVENESS_CACHE_SECS old costs essentially nothing on
+# healthy connections and still detects TrueNAS's 30-day silent
+# session expiry (AA_LEVEL1.max_session_age, issue #98) within one
+# cache window. Round-trip cost drops from "every call" to "at most
+# one per LIVENESS_CACHE_SECS per pool entry".
+my $LIVENESS_CACHE_SECS = 60;
+
+# Prefork worker count. Each worker holds one upstream WS (auth'd once) and
+# accepts on the shared listen fd; the kernel load-balances accept() across
+# them. Under 3-node cluster test load a single-threaded broker serialized
+# every RPC through one WS, so 4 concurrent client calls (extent.query x2,
+# targetextent.query, pool.dataset.query) took 9.8 s wall vs 0.14+1.6+3.2+
+# 9.8 ≈ 15 s serial-sum -- close to fully serialized. With N workers each
+# client call parallelizes up to N-way. TN's rate-limit on
+# auth.login_with_api_key is 20 / 60 s / IP; N=4 auths at broker startup
+# stay well under that (and each worker only re-auths on WS disconnect).
+# Bump this if a node has many pvedaemon workers; keep it small enough
+# that startup burst + reconnect churn stays inside TN's 20/60s ceiling
+# with headroom for other operational traffic.
+my $PREFORK_N = 4;
 
 my $foreground = grep { $_ eq '--foreground' || $_ eq '-f' } @ARGV;
 my $debug      = grep { $_ eq '--debug' || $_ eq '-d' } @ARGV;
@@ -91,12 +121,44 @@ sub write_pidfile {
 }
 
 # ---------------- WebSocket helpers (subset of plugin code) ----------------
+
+# Resolve $host to an IPv4 literal so IO::Socket::INET/SSL cannot pick the
+# AAAA record on a dual-stack TrueNAS when the caller asked for IPv4. Mirrors
+# TrueNASPlugin.pm::_host_ipv4. Returns $host unchanged when it is already an
+# IPv4 literal, when the lookup fails, or when the host is an IPv6 literal.
+#
+# Perl 5.40 (Debian Trixie, PVE 9) removed the AUTOLOAD path that let
+# Socket::gethostbyname resolve to the core builtin; the older code died
+# with "Undefined subroutine Socket::AUTOLOAD" on every FQDN tn_api_host
+# (issue #102). Socket::inet_aton is the proper Socket export for an
+# A-record lookup and works on every supported Perl.
+sub _host_ipv4 {
+    my ($host) = @_;
+    return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/;
+    my $packed = eval { Socket::inet_aton($host) };
+    if ($packed) {
+        my $ip = inet_ntoa($packed);
+        return $ip if $ip;
+    }
+    return $host;
+}
+
 sub ws_open {
     my ($scfg) = @_;
+    # Normalize scheme the same way TrueNASPlugin.pm::_ws_defaults does.
+    # Without this, an operator who set tn_api_scheme=https (rejected by the
+    # plugin's own validator only against the direct-WS path) would slip
+    # through the broker envelope raw, and the eq 'wss' check below would
+    # miss — the broker would open plain TCP and the handshake would 400.
     my $scheme = $scfg->{api_scheme} || 'wss';
+    if    ($scheme =~ /^https$/i) { $scheme = 'wss'; }
+    elsif ($scheme =~ /^http$/i)  { $scheme = 'ws';  }
     my $host   = $scfg->{api_host} or die "ws_open: no api_host";
     my $port   = $scfg->{api_port} // (($scheme eq 'wss') ? 443 : 80);
-    my $peer   = $host;
+    # Honor prefer_ipv4 (default 1). The wire schema always listed this field
+    # but the earlier broker ignored it, so the OS resolver could pick AAAA
+    # on a dual-stack TN even though the plugin had resolved A already.
+    my $peer   = (($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host);
 
     my $sock;
     if ($scheme eq 'wss') {
@@ -115,7 +177,7 @@ sub ws_open {
     my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
     my $key_b64 = encode_base64($key_raw, '');
     my $req =
-      "GET $WS_PINNED_PATH HTTP/1.1\r\n".
+      "GET $WS_PATH HTTP/1.1\r\n".
       "Host: $host:$port\r\n".
       "Upgrade: websocket\r\n".
       "Connection: Upgrade\r\n".
@@ -254,22 +316,43 @@ sub get_or_open_ws {
     my $sk = scfg_key($scfg);
     my $entry = $POOL{$sk};
     if ($entry && $entry->{conn} && $entry->{conn}->{sock}) {
-        # Quick liveness check: ping
+        # Liveness check: call an AUTHENTICATED method to detect
+        # TrueNAS's silent 30-day session expiry (AA_LEVEL1.max_session_age;
+        # 'core.ping' is no_auth_required and can't). 'auth.me' fits the
+        # semantic but its response is large and TN serialises around
+        # user-record locks; running it on every call caused 596 PVE-API
+        # timeouts under multi-node load. Cache the last successful probe
+        # per pool entry and skip the probe if it's still fresh -- a
+        # 30-day expiry is still detected within LIVENESS_CACHE_SECS of
+        # the next call, and the round-trip cost drops to near-zero on
+        # healthy connections. See issue #98 for the full write-up.
+        my $now = time();
+        my $last_ok = $entry->{last_liveness_ok} // 0;
+        if ($now - $last_ok < $LIVENESS_CACHE_SECS) {
+            $entry->{last_used} = $now;
+            return $entry->{conn};
+        }
         my $ok = eval {
             ws_rpc($entry->{conn}, {
-                jsonrpc => "2.0", id => 999999, method => "core.ping", params => [],
+                jsonrpc => "2.0", id => 999999, method => "auth.me", params => [],
             });
         };
         if ($ok) {
-            $entry->{last_used} = time();
+            $entry->{last_used} = $now;
+            $entry->{last_liveness_ok} = $now;
             return $entry->{conn};
         }
-        # Dead; drop and reopen
+        # Dead or unauthenticated; drop and reopen (which re-auths).
         eval { $entry->{conn}->{sock}->close(); };
         delete $POOL{$sk};
     }
     my $conn = ws_open($scfg);
-    $POOL{$sk} = { conn => $conn, last_used => time() };
+    my $now = time();
+    # ws_open() ran auth.login_with_api_key against TN successfully to
+    # get here, so the session is definitionally authenticated as of
+    # `now`. Stamp last_liveness_ok so the first N calls (within
+    # LIVENESS_CACHE_SECS) skip the auth.me probe entirely.
+    $POOL{$sk} = { conn => $conn, last_used => $now, last_liveness_ok => $now };
     linfo("opened WS for $sk (pool size " . scalar(keys %POOL) . ")");
     return $conn;
 }
@@ -402,7 +485,21 @@ sub handle_request {
         # Rate Limit Exceeded, invalid params, method not found). Worth
         # logging so users can match a failing test to a TN-side cause.
         my $err_repr = ref($result_obj->{error}) ? encode_json($result_obj->{error}) : $result_obj->{error};
-        lwarn("upstream error (sk=$sk method=$method): $err_repr");
+        # Downgrade the well-known "already gone" case to INFO. A DELETE
+        # against a resource that TN reports as InstanceNotFound / ENOENT
+        # is a benign race the callers already handle idempotently
+        # (see e.g. free_image, _teardown_snapshot_device). Leaving it
+        # at WARN level drowns real errors under vzdump-* snapshot-clone
+        # teardown noise: Max Carrara's test_run7 2026-08-25 3-node
+        # cluster-01 logged ~2000 of these per node per subrun.
+        my $is_benign_delete_enoent =
+            ($method =~ /\.delete$/) &&
+            ($err_repr =~ /InstanceNotFound|\bENOENT\b|does not exist/i);
+        if ($is_benign_delete_enoent) {
+            linfo("upstream ENOENT on $method (already gone; sk=$sk)");
+        } else {
+            lwarn("upstream error (sk=$sk method=$method): $err_repr");
+        }
         my $msg = encode_json({ error => encode_json($result_obj->{error}) });
         $client->syswrite("$msg\n");
     } else {
@@ -417,37 +514,94 @@ daemonize();
 write_pidfile();
 linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
 
+$SIG{PIPE} = 'IGNORE';
+# NOTE: parent SIG{TERM}/INT is set AFTER the prefork below so it can
+# also propagate to the worker pool. Workers install their own TERM
+# handler in spawn_worker so they close their local %POOL WS connections
+# and exit cleanly without touching parent's socket / pidfile.
+
+my $srv = make_listener();
+
+# Prefork the worker pool. Parent creates listen fd, forks N children; each
+# child re-runs the accept loop against the shared fd. Kernel serializes
+# accept() among children so no race. Parent then waits and re-spawns any
+# child that dies.
+my %WORKER_PIDS;   # pid => 1
+
+sub spawn_worker {
+    my $pid = fork();
+    if (!defined $pid) {
+        lerr("fork worker failed: $!");
+        return;
+    }
+    if ($pid == 0) {
+        # child: close its own WS pool cleanly on TERM; do NOT touch
+        # parent's socket file or pidfile.
+        $SIG{TERM} = $SIG{INT} = sub {
+            for my $sk (keys %POOL) {
+                my $e = $POOL{$sk};
+                eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
+            }
+            exit 0;
+        };
+        $SIG{CHLD} = 'DEFAULT';
+        worker_loop($srv);
+        exit 0;
+    }
+    $WORKER_PIDS{$pid} = 1;
+    ldebug("spawned worker pid=$pid");
+}
+
+sub worker_loop {
+    my ($srv) = @_;
+    my $sel = IO::Select->new($srv);
+    my $last_reap = time();
+    while (1) {
+        my @ready = $sel->can_read(60);
+        for my $fh (@ready) {
+            if ($fh == $srv) {
+                my $c = $srv->accept();
+                next unless $c;
+                eval { handle_request($c); };
+                if ($@) { lerr("handle_request died: $@"); }
+                eval { $c->close(); };
+            }
+        }
+        if (time() - $last_reap > 60) {
+            reap_idle();
+            $last_reap = time();
+        }
+    }
+}
+
+# Parent: spawn N workers, then supervise
+for (1..$PREFORK_N) { spawn_worker(); }
+linfo("prefork pool up (N=$PREFORK_N)");
+
+# Parent supervision loop: reap dead workers, respawn to keep pool full.
+# Set the parent's TERM/INT handler HERE (after workers are up) so it
+# only affects the parent process -- workers already installed their own
+# in spawn_worker.
 $SIG{TERM} = $SIG{INT} = sub {
-    linfo("shutting down");
-    for my $sk (keys %POOL) {
-        my $e = $POOL{$sk};
-        eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
+    linfo("parent shutting down, signalling workers");
+    kill 'TERM', keys %WORKER_PIDS;
+    # Give workers a moment to close their WS cleanly.
+    for (1..10) {
+        last unless keys %WORKER_PIDS;
+        my $dead = waitpid(-1, WNOHANG);
+        if ($dead > 0) { delete $WORKER_PIDS{$dead}; }
+        else { select(undef, undef, undef, 0.1); }
     }
     unlink $SOCKET_PATH;
     unlink $PIDFILE;
     exit 0;
 };
-$SIG{PIPE} = 'IGNORE';
-
-my $srv = make_listener();
-my $sel = IO::Select->new($srv);
-my $last_reap = time();
 
 while (1) {
-    my @ready = $sel->can_read(60);
-    for my $fh (@ready) {
-        if ($fh == $srv) {
-            my $c = $srv->accept();
-            next unless $c;
-            # Handle inline (single-threaded). Per-conn the round trip is
-            # microseconds; broker bottleneck is the upstream WS not us.
-            eval { handle_request($c); };
-            if ($@) { lerr("handle_request died: $@"); }
-            eval { $c->close(); };
-        }
-    }
-    if (time() - $last_reap > 60) {
-        reap_idle();
-        $last_reap = time();
+    my $dead = waitpid(-1, 0);
+    if ($dead > 0) {
+        delete $WORKER_PIDS{$dead};
+        lwarn("worker pid=$dead exited (status=$?), respawning");
+        spawn_worker();
     }
 }

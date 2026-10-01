@@ -48,6 +48,7 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 - [Performance Issues](#performance-issues)
   - [Slow VM Disk Performance](#slow-vm-disk-performance)
   - [Slow Multipath Read Performance](#slow-multipath-read-performance)
+  - [Host LVM scanning TrueNAS NVMe namespaces / `pvesh` timeouts / duplicate-VG warning storms / `/etc/lvm/archive` bloat](LVM-Filter.md) — see [LVM-Filter](LVM-Filter.md) for the `global_filter` fix (`truenas-plugin-lvm-filter --install`, or the installer's post-configuration prompt) and the `/etc/lvm/archive` cleanup.
   - [Slow VM Cloning](#slow-vm-cloning)
 - [Cluster-Specific Issues](#cluster-specific-issues)
   - [Storage Not Shared Across Nodes](#storage-not-shared-across-nodes)
@@ -499,9 +500,9 @@ tn_api_scheme ws   # for insecure WebSocket (testing only)
 
 # Common mistake: Using http/https scheme instead of ws/wss
 # WRONG:
-# api_scheme https  # Not supported
+# tn_api_scheme https  # Not supported
 # CORRECT:
-# api_scheme wss    # This is for WebSocket
+# tn_api_scheme wss    # This is for WebSocket
 ```
 
 #### 6. Check WebSocket Port Configuration
@@ -1028,7 +1029,7 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 # Should return ok if the call succeeds
 
 # Start service if not running using plugin API via STORAGE_ID
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
 ```
 
 In TrueNAS Web UI:
@@ -1191,8 +1192,8 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 nano /etc/pve/storage.cfg
 
 # Comment out secrets:
-# nvme_dhchap_secret DHHC-1:01:...
-# nvme_dhchap_ctrl_secret DHHC-1:01:...
+# tn_nvme_dhchap_secret DHHC-1:01:...
+# tn_nvme_dhchap_ctrl_secret DHHC-1:01:...
 
 # Set subsystem allow_any_host = true in TrueNAS
 
