@@ -5,10 +5,9 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 ## Table of Contents
 
 - [Critical Workflow Limitations](#critical-workflow-limitations)
-  - [Upstream QEMU 10.1 regression — pointer, not a plugin bug](#upstream-qemu-101-regression--pointer-not-a-plugin-bug)
   - [VM deletion (`qm destroy`)](#vm-deletion-qm-destroy)
 - [Storage Feature Limitations](#storage-feature-limitations)
-  - [Clone semantics](#clone-semantics)
+  - [Where the plugin's `clone_image()` is invoked](#where-the-plugins-clone_image-is-invoked)
   - [No Volume Shrinking](#no-volume-shrinking)
   - [Resize Headroom Limit](#resize-headroom-limit)
 - [Content Type Limitations](#content-type-limitations)
@@ -52,25 +51,6 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 
 ## Critical Workflow Limitations
 
-### Upstream QEMU 10.1 regression — pointer, not a plugin bug
-
-Users of this plugin on PVE 10 may run into
-[Proxmox bugzilla #7197](https://bugzilla.proxmox.com/show_bug.cgi?id=7197):
-offline `qm move_disk` and offline `qm clone --full` fail with
-`qemu-img: error while writing at byte 2145386496: Invalid argument`
-when crossing to or from a 4K-logical iSCSI LUN. The failing code is
-in QEMU, not in us; no plugin method is on the call stack. Fiona
-Ebner has a patch in flight (status: **PATCH AVAILABLE**).
-
-Mentioned here because the bug fires reliably on fresh LUNs this
-plugin creates, so users will match the symptom to our docs first.
-Workaround until the Proxmox patch ships: downgrade `pve-qemu-kvm`
-to 10.0.2-4 and `apt-mark hold` it, do the operation while the VM
-is running (uses `drive-mirror`, not `qemu-img`), or use
-`pvesm export | pvesm import` (routes through our plugin's own
-`volume_export`/`volume_import` and avoids `qemu-img convert`
-entirely).
-
 ### VM deletion (`qm destroy`)
 
 **Works correctly.** `qm destroy VMID --purge` cleans the Proxmox-side
@@ -94,49 +74,25 @@ to beta8 or later.
 
 ## Storage Feature Limitations
 
-### Clone semantics
+### Where the plugin's `clone_image()` is invoked
 
-The plugin exposes two clone paths with different performance
-characteristics. Which one PVE picks depends on whether you are
-cloning a template or a running/stopped VM.
+The plugin exposes `clone_image()`, which performs an instant ZFS
+clone on TrueNAS via `pool.snapshot.clone` — no data copy, metadata
+only. PVE invokes it for **linked clones from a template**:
 
-**Linked clones from a template (fast, native ZFS clone).** When
-you convert a VM to a template with `qm template VMID`, the plugin
-runs `create_base`: it renames the source zvol to `base-VMID-disk-N`
-and takes an immutable `@__base__` snapshot. A subsequent
-`qm clone BASE_VMID NEW_VMID` (linked clone) calls the plugin's
-`clone_image()`, which issues `pool.snapshot.clone` on TrueNAS →
-instant ZFS clone, no data copy, pure metadata operation. This is
-the "fast clone" path, works today, and is the recommended way to
-spin up copies of a known-good image.
+1. `qm template VMID` runs the plugin's `create_base`, which
+   renames the source zvol to `base-VMID-disk-N` and takes an
+   immutable `@__base__` snapshot.
+2. `qm clone BASE_VMID NEW_VMID` (linked clone) calls the plugin's
+   `clone_image()`, which clones the `@__base__` snapshot on
+   TrueNAS.
 
-**Full clones (`qm clone --full`) of a stopped VM.** PVE routes
-these through `PVE::QemuServer::clone_disk` → `vdisk_alloc` →
-`PVE::QemuServer::QemuImage::convert`, which runs `qemu-img convert`
-over the raw block device. The plugin's `clone_image()` is **not**
-on this call stack. Two consequences:
-
-- Full-clone performance is bounded by `qemu-img convert`'s speed
-  across the storage fabric, not by ZFS clone speed.
-- On QEMU 10.1.x this path hits
-  [Proxmox bugzilla #7197](https://bugzilla.proxmox.com/show_bug.cgi?id=7197)
-  and fails at byte 2145386496. See the "Offline cross-storage disk
-  operations" section above for the workaround (downgrade
-  `pve-qemu-kvm` to 10.0.2-4) and the running-VM alternative that
-  uses `drive-mirror` instead.
-
-**Full clones of a running VM** (`qm clone --full` while the source
-VM is powered on): PVE uses `drive-mirror` via QMP. Also not a
-plugin method, but it bypasses the QEMU 10.1 regression — the
-sparse-write path lives in `qemu-img convert`, not in the live
-block-mirror code.
-
-**Cross-storage full clone** (source and destination on different
-storages): same as full clone above, same QEMU 10.1 caveat. For
-cross-storage *moves*, prefer `pvesm export | pvesm import` or
+Full clones (`qm clone --full`) and cross-storage disk moves
+(`qm move_disk`) are routed by PVE through its own data-copy
+mechanisms, not through our `clone_image()`. For cross-storage
+*moves*, prefer `pvesm export | pvesm import` or
 `qm migrate … --targetstorage`, which route through the plugin's
-`volume_export`/`volume_import` (as of 2.1.23~beta8+). Those stream
-with `dd` and avoid `qemu-img convert` entirely.
+`volume_export`/`volume_import` methods (as of 2.1.23~beta8+).
 
 ### No Volume Shrinking
 
@@ -272,15 +228,6 @@ same as any other block-based storage plugin.
 The two mechanisms are complementary, not substitutes. Use PBS for
 "restore the VM", TN replication for "preserve the ZFS snapshot
 chain for forensics or long-term rollback".
-
-### VM clones from a template use ZFS clone; cross-storage full clone does not
-
-See the "Clone semantics" section above. Linked clones from a
-template take the fast ZFS-clone path. Full clones from a snapshot
-of a non-template VM, or full clones across storages, use PVE's
-`qemu-img convert` path — not plugin's `clone_image()`. That is a
-PVE design choice, not a plugin bug; the plugin's `clone_image()`
-is called for the linked-clone path only.
 
 ## Live Migration Limitations
 
