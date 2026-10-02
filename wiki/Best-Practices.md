@@ -153,7 +153,7 @@ Both are supported. Pick one per storage entry via `tn_transport`.
 | TrueNAS support | 25.10 or later | 25.10 or later; TN 25.10.4 is unsafe pending nvmet MDTS fix (GitHub #96) |
 | Namespace identity | LUN number per extent | NGUID per namespace |
 | Snapshot handling | Same via `pool.snapshot.*` | Same via `pool.snapshot.*` |
-| Field maturity | Very mature | Newer; use TrueNAS 25.10 stable or later |
+| Field maturity | Very mature | Newer; shares 25.10 floor with iSCSI, but TN 25.10.4 ships without the `nvmet` MDTS kernel patch (GitHub #96) and can silently corrupt data under NVMe/TCP — until the patch is in a TN point release, use iSCSI for production |
 
 Default to **iSCSI** for most deployments. Move to **NVMe/TCP** when you
 have measurably latency-sensitive workloads and a 25 Gb+ storage fabric.

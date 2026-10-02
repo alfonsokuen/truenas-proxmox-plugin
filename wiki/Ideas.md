@@ -528,7 +528,7 @@ echo "Validating new API key..."
 # Update each node
 for node in $NODES; do
     echo "Updating $node..."
-    ssh root@$node "sed -i 's/api_key .*/api_key $NEW_API_KEY/' /etc/pve/storage.cfg"
+    ssh root@$node "sed -i 's/tn_api_key .*/tn_api_key $NEW_API_KEY/' /etc/pve/storage.cfg"
     ssh root@$node "systemctl restart pvedaemon pveproxy"
     sleep 2
 
@@ -1244,7 +1244,7 @@ sub discover_nvme_targets {
     run_command([
         'nvme', 'discover',
         '-t', $scfg->{transport},  # tcp, rdma, or fc
-        '-a', $scfg->{api_host},
+        '-a', $scfg->{tn_api_host},
         '-s', $scfg->{discovery_port} // '4420',
     ]);
 }
@@ -1257,7 +1257,7 @@ sub connect_nvme_namespace {
         'nvme', 'connect',
         '-t', $scfg->{transport},
         '-n', $namespace_nqn,
-        '-a', $scfg->{api_host},
+        '-a', $scfg->{tn_api_host},
         '-s', $scfg->{discovery_port} // '4420',
     ]);
 }
