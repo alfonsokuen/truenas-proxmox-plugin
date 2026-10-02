@@ -150,7 +150,7 @@ Both are supported. Pick one per storage entry via `tn_transport`.
 | Throughput on 25 Gb+ links | Good, may need multipath | Better with high queue count |
 | Multipath | Standard `multipath-tools` (dm-mp) | Native NVMe multipath (`nvme-cli`) |
 | Auth | CHAP (optional) | DH-HMAC-CHAP (optional) |
-| TrueNAS support | All 25.x | Requires 25.04+ nvmet |
+| TrueNAS support | 25.10 or later | 25.10 or later; TN 25.10.4 is unsafe pending nvmet MDTS fix (GitHub #96) |
 | Namespace identity | LUN number per extent | NGUID per namespace |
 | Snapshot handling | Same via `pool.snapshot.*` | Same via `pool.snapshot.*` |
 | Field maturity | Very mature | Newer; use TrueNAS 25.10 stable or later |

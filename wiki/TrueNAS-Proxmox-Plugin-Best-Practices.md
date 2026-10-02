@@ -79,7 +79,7 @@ TrueNAS as backing store.
 | Protocol | Supported | Description | When to Use | Notes / Caveats |
 |---|---|---|---|---|
 | iSCSI | Yes | Block storage via LUNs mapped from zvol-backed extents | General VM workloads on 10 GbE or slower fabrics | Multipath recommended for reliability; timeouts must be tuned for HA (see §4). Auth via CHAP optional. |
-| NVMe/TCP | Yes | Block storage via NVMe-oF namespaces mapped to zvols | Latency-sensitive workloads on 25 GbE+ fabrics | Requires TrueNAS 25.04 or later. Native NVMe multipath; DH-HMAC-CHAP optional. |
+| NVMe/TCP | Yes | Block storage via NVMe-oF namespaces mapped to zvols | Latency-sensitive workloads on 25 GbE+ fabrics | Shares the 25.10 TrueNAS floor with iSCSI. TN 25.10.4 ships without the `nvmet` MDTS kernel patch (GitHub #96) and can silently corrupt data; use iSCSI until the patch is in a TN point release. Native NVMe multipath; DH-HMAC-CHAP optional. |
 | NFS | Yes (via native Proxmox) | Not implemented by this plugin | ISO libraries, backup targets, mixed file/block deployments | Use Proxmox's built-in NFS storage type; ensure UID/GID mapping is consistent. |
 | SMB | Yes (via native Proxmox) | Not implemented by this plugin | Windows-adjacent workloads, mixed OS environments | Not suitable for VM disk images. |
 
@@ -98,8 +98,13 @@ Software:
 
 - **Proxmox VE** 8.x or later (9.x recommended when using volume-chain
   snapshots).
-- **TrueNAS SCALE** 25.10 or later. NVMe/TCP transport additionally
-  requires TrueNAS 25.04 or later.
+- **TrueNAS SCALE** 25.10 or later for both transports. NVMe/TCP has
+  no earlier floor than iSCSI — they share the 25.10 baseline.
+  **Caveat**: TN 25.10.4 ships without the `nvmet` MDTS kernel patch
+  (GitHub #96) and can silently corrupt data under NVMe/TCP. Until
+  that patch lands in a TN point release, use iSCSI for production
+  deployments on 25.10.4, or stay on a pre-25.10.4 release for
+  NVMe/TCP.
 - **Perl** 5.36 or later (shipped with Proxmox VE).
 
 Network:

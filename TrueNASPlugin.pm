@@ -6514,6 +6514,18 @@ sub parse_volname {
         return ('images', $zname, $vmid, undef, undef, $isBase, 'raw', $uuid);
     }
 
+    # Plain PVE stem: vm-<vmid>-disk-<N> or base-<vmid>-disk-<N>.
+    # PVE core (libpve-storage-perl Storage.pm volume_import_start) calls
+    # parse_volname on the SOURCE's bare stem to extract vmid during
+    # cross-storage migration — before our volume_import even runs. If
+    # we die here, the migration bails and never reaches our import
+    # side. Accept the stem; downstream alloc_image will pick the real
+    # -lun<N> / -ns<uuid> suffix.
+    if ($volname =~ m/^(vm|base)-(\d+)-disk-\d+(?:\.raw)?$/) {
+        my $isBase = $1 eq 'base' ? 1 : undef;
+        return ('images', $volname, $2, undef, undef, $isBase, 'raw', undef);
+    }
+
     die "unable to parse volname '$volname'\n";
 }
 
@@ -9006,6 +9018,190 @@ sub clone_image {
         _log($scfg, 0, 'err', "[TrueNAS] clone_image: unknown transport mode: $mode");
         die "Unknown transport mode: $mode\n";
     }
+}
+
+# ========================================================================
+# volume_export / volume_import — stream a raw volume between storages.
+#
+# Implementing these closes PVE's "cannot migrate from storage type" refusal
+# for cross-storage disk moves (`qm move_disk`, `pct move_volume`,
+# `qmrestore` from VMA, `pct restore`, cross-storage replication). PVE's
+# storage-migrate protocol pipes volume_export -> volume_import between
+# plugins; without them PVE has no way to move data onto our storage from
+# a plugin that doesn't speak our native transport.
+#
+# We only implement `raw+size` for `images` volumes. Snapshots in the
+# stream (zfs-send style replication) are a separate protocol and
+# intentionally not advertised here.
+# ========================================================================
+
+sub volume_export_formats {
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
+
+    # We stream raw bytes of a point-in-time volume. We do not implement
+    # replication streams, snapshot-chain exports, or incremental deltas.
+    return () if defined($base_snapshot);
+    return () if $with_snapshots;
+
+    my ($vtype, undef, undef, undef, undef, undef, $format) = $class->parse_volname($volname);
+    # Only block-level 'images' volumes have a raw byte stream to export.
+    # 'rootdir' is a formatted filesystem on top of a zvol — exporting it
+    # as a raw blob would ship the whole formatted container including
+    # unused extent, which is not what PVE's import side expects for
+    # 'tar+size'. Omit for now; LXC rootdir moves fall back to PVE's
+    # existing LXC code paths.
+    return () if $vtype ne 'images';
+    return () if ($format // 'raw') ne 'raw';
+
+    return ('raw+size');
+}
+
+sub volume_import_formats {
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
+
+    return () if defined($base_snapshot);
+    return () if $with_snapshots;
+
+    my ($vtype, undef, undef, undef, undef, undef, $format) = $class->parse_volname($volname);
+    return () if $vtype ne 'images';
+    return () if ($format // 'raw') ne 'raw';
+
+    return ('raw+size');
+}
+
+sub volume_export {
+    my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot, $with_snapshots)
+        = @_;
+
+    die "volume export format '$format' not supported by TrueNASPlugin (only raw+size)\n"
+        if $format ne 'raw+size';
+    die "snapshot/with-snapshots export not supported by TrueNASPlugin\n"
+        if defined($base_snapshot) || $with_snapshots;
+    die "snapshot export not supported by TrueNASPlugin\n"
+        if defined($snapshot);
+
+    my ($vtype) = $class->parse_volname($volname);
+    die "volume_export: only 'images' vtype supported, got '$vtype'\n"
+        if $vtype ne 'images';
+
+    # Make sure the LUN is attached locally so dd can read it.
+    $class->activate_volume($storeid, $scfg, $volname, undef, {});
+
+    my ($dev) = $class->path($scfg, $volname, $storeid);
+    die "volume_export: no device path for $volname\n" if !$dev;
+
+    my $real = abs_path($dev) // $dev;
+    die "volume_export: $real is not a block device\n" if ! -b $real;
+
+    my $size = $class->volume_size_info($scfg, $storeid, $volname, 10);
+    die "volume_export: could not determine size for $volname\n" if !$size;
+
+    _log($scfg, 1, 'info',
+        "[TrueNAS] volume_export: streaming $volname ($size bytes) from $real");
+
+    PVE::Storage::Plugin::write_common_header($fh, $size);
+
+    # dd straight from the block device. No qemu-img — the destination's
+    # import side handles format conversion, and avoiding qemu-img here
+    # also keeps us clear of Proxmox#7197 (qemu-img sparse-write EINVAL
+    # on 4K-logical iSCSI LUNs under QEMU 10.1).
+    run_command(
+        ['dd', "if=$real", 'bs=4M', 'status=progress'],
+        output => '>&' . fileno($fh),
+    );
+
+    return;
+}
+
+sub volume_import {
+    my (
+        $class,
+        $scfg,
+        $storeid,
+        $fh,
+        $volname,
+        $format,
+        $snapshot,
+        $base_snapshot,
+        $with_snapshots,
+        $allow_rename,
+    ) = @_;
+
+    die "volume import format '$format' not supported by TrueNASPlugin (only raw+size)\n"
+        if $format ne 'raw+size';
+    die "snapshot/with-snapshots import not supported by TrueNASPlugin\n"
+        if defined($base_snapshot) || $with_snapshots;
+
+    # pvesm import passes user-supplied volnames like "vm-9962-disk-0"
+    # (no "-lunN" suffix). Our strict parse_volname rejects that. First
+    # try strict, then fall back to a stem regex to extract VMID so
+    # alloc_image can pick the LUN.
+    my ($vtype, $vmid);
+    eval {
+        my (undef, $name, $v, undef, undef, undef, $fmt) = $class->parse_volname($volname);
+        $vtype = 'images';  # strict form only occurs for images volnames in our plugin
+        $vmid  = $v;
+        die "volume_import: only 'raw' format supported, got '$fmt'\n"
+            if ($fmt // 'raw') ne 'raw';
+    };
+    if ($@) {
+        # Lenient fallback: match common PVE disk-name stems.
+        if ($volname =~ /^(?:vm|base)-(\d+)-disk-\d+(?:\.raw)?$/) {
+            $vtype = 'images';
+            $vmid  = $1;
+        } else {
+            die "volume_import: cannot parse volname '$volname' (expected vm-<vmid>-disk-<N>): $@";
+        }
+    }
+    die "volume_import: only 'images' vtype supported, got '$vtype'\n"
+        if $vtype ne 'images';
+
+    my $bytes = PVE::Storage::Plugin::read_common_header($fh);
+    # alloc_image expects size in KiB; round up so a non-KiB-aligned
+    # source doesn't under-allocate on the destination.
+    my $size_kib = int(($bytes + 1023) / 1024);
+
+    _log($scfg, 1, 'info',
+        "[TrueNAS] volume_import: allocating $size_kib KiB for vmid=$vmid "
+      . "(stem='$volname', $bytes bytes)");
+
+    # Always let alloc_image pick the final name (vm-<vmid>-disk-<N>-lun<K>).
+    # The incoming $volname is a stem from pvesm/storage_migrate; the real
+    # on-TN layout dictates the suffix. Callers get the final volid in
+    # our return value.
+    my $allocname = $class->alloc_image($storeid, $scfg, $vmid, 'raw', undef, $size_kib);
+    die "volume_import: alloc_image returned no name\n" if !$allocname;
+
+    my $new_volname = $allocname;
+
+    # Stream the raw bytes onto the newly-allocated LUN.
+    eval {
+        $class->activate_volume($storeid, $scfg, $new_volname, undef, {});
+
+        my ($dev) = $class->path($scfg, $new_volname, $storeid);
+        die "volume_import: no device path for $new_volname\n" if !$dev;
+
+        my $real = abs_path($dev) // $dev;
+        die "volume_import: $real is not a block device\n" if ! -b $real;
+
+        # conv=sparse so zero-runs in the stream don't actually write
+        # (the LUN came up zero-initialised from a fresh zvol).
+        # bs=4M matches our export side; status=progress gives operators
+        # feedback on large transfers.
+        run_command(
+            ['dd', "of=$real", 'conv=sparse', 'bs=4M', 'status=progress'],
+            input => '<&' . fileno($fh),
+        );
+    };
+    if (my $err = $@) {
+        _log($scfg, 0, 'err',
+            "[TrueNAS] volume_import: streaming failed, rolling back alloc for $new_volname: $err");
+        eval { $class->free_image($storeid, $scfg, $new_volname, 0, 'raw') };
+        warn "[TrueNAS] volume_import: rollback free_image failed: $@\n" if $@;
+        die $err;
+    }
+
+    return "$storeid:$new_volname";
 }
 
 # iSCSI-specific clone implementation
