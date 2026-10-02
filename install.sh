@@ -1078,10 +1078,27 @@ apt_bootstrap_install() {
     # Validate before installing: a 200-with-empty-body (or truncated) key
     # download passes download_file, and installing it leaves a 0-byte
     # keyring that fails every apt signature check afterwards.
-    if [[ ! -s "$key_tmp" ]] || ! grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$key_tmp"; then
+    #
+    # Accept either an ASCII-armored key (starts with "-----BEGIN PGP
+    # PUBLIC KEY BLOCK-----") or a binary OpenPGP public key (first byte
+    # 0x98 or 0x99: the old-format Public-Key packet tag). The /apt/
+    # keyring convention under Debian trixie's Signed-By is binary, so
+    # servers routinely publish the binary form — rejecting it is wrong.
+    local first_byte
+    first_byte=$(head -c 1 "$key_tmp" | od -An -tu1 | tr -d ' ')
+    local is_valid_key=0
+    if [[ ! -s "$key_tmp" ]]; then
+        is_valid_key=0
+    elif grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$key_tmp"; then
+        is_valid_key=1
+    elif [[ "$first_byte" == "152" || "$first_byte" == "153" ]]; then
+        # 0x98 (152) or 0x99 (153) = OpenPGP old-format public-key packet.
+        is_valid_key=1
+    fi
+    if [[ "$is_valid_key" != "1" ]]; then
         rm -f "$key_tmp"
         echo -e "${c1}FAILED${c0}"
-        error "Downloaded APT key is empty or not a PGP key block -- not installing it"
+        error "Downloaded APT key is empty or not a valid PGP key (neither ASCII-armored nor binary OpenPGP) -- not installing it"
         return 1
     fi
     install -m 0644 "$key_tmp" "$APT_KEYRING_PATH"
