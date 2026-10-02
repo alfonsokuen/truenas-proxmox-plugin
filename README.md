@@ -199,67 +199,106 @@ truenasplugin: truenas-nvme
 
 ### TrueNAS SCALE Setup
 
-#### 1. Create Dataset
-Navigate to **Datasets** → Create new dataset:
-- **Name**: `proxmox` (under existing pool like `tank`)
+Minimum TrueNAS SCALE version: **25.10** (Goldeye). Both iSCSI and
+NVMe/TCP share this floor.
+
+#### 1. Create a dataset
+
+Navigate to **Datasets** → **Add Dataset**:
+- **Name**: `proxmox`
+- **Parent**: your storage pool (e.g. `tank`)
 - **Dataset Preset**: Generic
 
-#### 2. Enable iSCSI Service
-Navigate to **System Settings** → **Services**:
-- Enable **iSCSI** service
-- Set to start automatically
+#### 2. Set up iSCSI — TrueNAS SCALE 25.10 (Goldeye)
 
-#### 3. Verify the iSCSI Base Name
-Navigate to **Shares** → **Block Shares (iSCSI)** → **Configure**
-(the **Target Global Configuration** section):
-- **Base Name**: `iqn.2005-10.org.freenas.ctl` (the TrueNAS default;
-  any valid IQN is fine, but it MUST start with `iqn.` — the value
-  becomes the prefix of every target IQN, so a base name like
-  `TrueNAS` produces invalid `TrueNAS:...` IQNs and no client will
-  connect)
-- Note the value; you'll need it for `tn_target_iqn` below
+**(a) Enable the iSCSI service.** Nav: **System** → **Services**.
+In the iSCSI row, click the play button under **Status**, and
+toggle **Start Automatically** on.
 
-#### 4. Create iSCSI Portal
-Navigate to **Shares** → **Block Shares (iSCSI)** → **Portals**:
-- A default portal on `0.0.0.0:3260` may already exist
-- Otherwise **Add**, IP address `0.0.0.0` (or a specific TrueNAS
-  interface IP), port `3260`
-- Note the **Portal ID** — you'll assign it to the target next
+**(b) Set the iSCSI Base Name.** Nav: **System** → **Services** →
+**iSCSI** row → **pencil** (edit) icon on the right end of the row.
+The right-side drawer **iSCSI Global Configuration** opens.
 
-#### 5. Create iSCSI Target
-Navigate to **Shares** → **Block Shares (iSCSI)** → **Targets** → **Add**:
-- **Target Name**: `proxmox` (becomes `<Base Name>:proxmox`, e.g.
-  `iqn.2005-10.org.freenas.ctl:proxmox`)
-- **Target Alias**: optional
-- **Target Mode**: iSCSI
-- Under **iSCSI Group**:
-  - **Portal Group ID**: pick the portal you just created (step 4)
-  - **Initiator Group ID**: pick your initiator group, or leave it
-    set to allow every initiator
-  - **Authentication Method**: `None` (or CHAP if you want it; the
-    plugin supports CHAP via `tn_chap_user` / `tn_chap_password`)
-- Click **Save**
+- **Base Name**: must start with `iqn.`. The TN default
+  `iqn.2005-10.org.freenas.ctl` is fine. Any string that doesn't
+  start with `iqn.` (e.g. `TrueNAS`) produces invalid IQNs and no
+  initiator will connect — this is the symptom in issue #117.
 
-> **The Portal Group and Initiator Group bindings on the target are
-> what make discovery actually return this target.** Without them,
-> `iscsiadm --mode discovery` from Proxmox returns empty and the
-> plugin can only get as far as creating extents on TrueNAS — a
-> common first-time symptom (see issue #117).
+Note the value; it goes into `tn_target_iqn` in `storage.cfg`
+combined with the Target Name you'll pick next, as
+`<Base Name>:<Target Name>`.
 
-#### 6. Generate API Key
-Navigate to **Credentials** → **Local Users**:
-- Select **root** user (or create dedicated user)
-- Click **Edit**
-- Scroll to **API Key** section
-- Click **Add** to generate new API key
-- **Copy and save the API key securely** (you won't be able to see it again)
+**(c) Create target, extent, and portal in one flow.** Nav:
+**Shares** → **Block (iSCSI) Shares Targets** card → **Wizard**
+button on the card. The right-side drawer **iSCSI Wizard** opens
+with three steps.
 
-#### 7. Verify Configuration
-The plugin will automatically:
-- Create zvols under your dataset (`tank/proxmox/vm-XXX-disk-N`)
-- Create iSCSI extents for each zvol
-- Associate extents with your target
-- Handle all iSCSI session management
+- **Step 1 — Target**: leave the Target dropdown on **Create New**
+  (TN will prompt for the Target Name after Save). Click **Next**.
+- **Step 2 — Extent**:
+  - **Name**: the extent name on TN (any string).
+  - **Extent Type**: Device.
+  - **Device**: pick the zvol path TN should publish.
+  - **Sharing Platform**: pick a modern-OS-style preset. The
+    VMware-tuned default sets block-size optimizations that aren't
+    what Proxmox wants.
+  - Click **Next**.
+- **Step 3 — Protocol Options**:
+  - **Portal**: `Create New` to spin up a portal on
+    `0.0.0.0:3260`, or pick an existing one.
+  - **Initiators**: leave empty to allow all Proxmox nodes, or
+    paste the initiator IQNs if you want to lock access down.
+  - Click **Save**.
+
+> **Both Portal and Initiators on step 3 are what expose the
+> target on the network.** If either is blank, `iscsiadm --mode
+> discovery` from Proxmox returns empty and the plugin can only
+> get as far as allocating zvols on TN. That's the most common
+> first-install symptom (issue #117).
+
+The manual per-tab flow (Targets / Extents / Initiators / Portals /
+Authorized Access) still exists at `/ui/sharing/iscsi/targets`
+with a **Global Target Configuration** button that opens the same
+Base Name drawer as (b). Use it only if you need per-field control.
+
+**(d) Create an API key for root.** Top-right **user menu** (person
+icon labeled "root") → **My API Keys** → **Add**. Copy the key
+value immediately — TN shows it only once. Paste it into
+`tn_api_key` in `storage.cfg`.
+
+For a least-privilege API user instead of root, see
+[API Permissions](wiki/API-Permissions.md).
+
+#### 3. Set up iSCSI — TrueNAS SCALE 26.0 and later
+
+Nearly identical to 25.10. Follow (a) through (d) above, with
+these cosmetic deltas:
+
+- **Shares page** has an extra **WebShare** card — unrelated to
+  this plugin, ignore.
+- **iSCSI Wizard → Extent step** has an extra **Read-only**
+  checkbox — leave it unchecked for Proxmox.
+- **Top-right user menu** has an extra **Preferences** item;
+  **My API Keys** is in the same place.
+
+#### 4. Optional: CHAP
+
+If you want CHAP on the target: at step 3 (Protocol Options) of
+the Wizard, pick a portal whose **Discovery Auth Method** is set
+to CHAP, and configure an entry under the manual flow's
+**Authorized Access** tab (user + 12-16 character secret). In
+Proxmox, add `tn_chap_user` and `tn_chap_password` to the
+`storage.cfg` entry.
+
+#### 5. Verify configuration
+
+The plugin takes it from here. On the first VM disk allocation
+it will:
+- Create zvols under your dataset (e.g.
+  `tank/proxmox/vm-100-disk-0`).
+- Create an iSCSI extent for each zvol.
+- Associate each extent with your target under a per-disk LUN.
+- Manage iSCSI session setup/teardown on each Proxmox node.
 
 ## Basic Usage
 
