@@ -5,7 +5,7 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 ## Table of Contents
 
 - [Critical Workflow Limitations](#critical-workflow-limitations)
-  - [Offline cross-storage disk operations (upstream QEMU regression)](#offline-cross-storage-disk-operations-upstream-qemu-regression)
+  - [Upstream QEMU 10.1 regression — pointer, not a plugin bug](#upstream-qemu-101-regression--pointer-not-a-plugin-bug)
   - [VM deletion (`qm destroy`)](#vm-deletion-qm-destroy)
 - [Storage Feature Limitations](#storage-feature-limitations)
   - [Clone semantics](#clone-semantics)
@@ -19,7 +19,6 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 - [Live Migration Limitations](#live-migration-limitations)
   - [Requires Shared Storage](#requires-shared-storage)
   - [vmstate Storage Considerations](#vmstate-storage-considerations)
-  - [Shared CPU model required across heterogeneous nodes](#shared-cpu-model-required-across-heterogeneous-nodes)
 - [TrueNAS Specific Limitations](#truenas-specific-limitations)
   - [API Rate Limits](#api-rate-limits)
   - [WebSocket Connection Stability](#websocket-connection-stability)
@@ -53,48 +52,24 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 
 ## Critical Workflow Limitations
 
-### Offline cross-storage disk operations (upstream QEMU regression)
+### Upstream QEMU 10.1 regression — pointer, not a plugin bug
 
-**Limitation (external, not our plugin):** `qm move_disk` and
-`qm clone --full` for a **stopped** VM, when source or destination is
-on this plugin, fail against QEMU 10.1.x with:
+Users of this plugin on PVE 10 may run into
+[Proxmox bugzilla #7197](https://bugzilla.proxmox.com/show_bug.cgi?id=7197):
+offline `qm move_disk` and offline `qm clone --full` fail with
+`qemu-img: error while writing at byte 2145386496: Invalid argument`
+when crossing to or from a 4K-logical iSCSI LUN. The failing code is
+in QEMU, not in us; no plugin method is on the call stack. Fiona
+Ebner has a patch in flight (status: **PATCH AVAILABLE**).
 
-```
-qemu-img: error while writing at byte 2145386496: Invalid argument
-```
-
-The exact byte number (1023 × 2 MiB) is a structural QEMU regression.
-PVE routes these operations straight to `qemu-img convert`, which
-tries to hole-punch with a trailing 3584-byte non-4K-aligned chunk
-and gets EINVAL from the kernel's `BLKZEROOUT`/`FALLOC_FL_PUNCH_HOLE`
-path against our 4K-logical iSCSI LUNs. The write path is in QEMU,
-not in us; no plugin method is on the call stack. Tracking:
-[Proxmox bugzilla #7197](https://bugzilla.proxmox.com/show_bug.cgi?id=7197)
-(status: **PATCH AVAILABLE**, assignee Fiona Ebner) and
-[QEMU GitLab #3257](https://gitlab.com/qemu-project/qemu/-/issues/3257).
-
-**Workarounds until the patch ships:**
-
-- **Downgrade `pve-qemu-kvm` to 10.0.2-4** on every node and
-  `apt-mark hold pve-qemu-kvm`. The regression is specific to 10.1.x.
-  Example (apply on each node, then restart running VMs so they pick
-  up the downgraded binary):
-  ```bash
-  wget http://download.proxmox.com/debian/pve/dists/trixie/pve-no-subscription/binary-amd64/pve-qemu-kvm_10.0.2-4_amd64.deb
-  apt-get install --allow-downgrades ./pve-qemu-kvm_10.0.2-4_amd64.deb
-  apt-mark hold pve-qemu-kvm
-  ```
-- **Do the move or clone while the VM is running.** Online operations
-  use QEMU's `drive-mirror` (via QMP), a different code path that
-  does not trip the regression.
-- **Use `pvesm export | pvesm import`** between storages. The plugin's
-  `volume_import`/`volume_export` methods use `dd`-with-sparse rather
-  than `qemu-img convert`, and work regardless of this bug.
-
-Paths that bypass this bug and work normally: `vzdump → PBS` and
-`qmrestore` from PBS (chunk-stream, not `qemu-img`), live migration
-with shared storage (RAM-only), linked clones from templates (plugin's
-own `clone_image` → ZFS clone on TrueNAS), and all normal VM I/O.
+Mentioned here because the bug fires reliably on fresh LUNs this
+plugin creates, so users will match the symptom to our docs first.
+Workaround until the Proxmox patch ships: downgrade `pve-qemu-kvm`
+to 10.0.2-4 and `apt-mark hold` it, do the operation while the VM
+is running (uses `drive-mirror`, not `qemu-img`), or use
+`pvesm export | pvesm import` (routes through our plugin's own
+`volume_export`/`volume_import` and avoids `qemu-img convert`
+entirely).
 
 ### VM deletion (`qm destroy`)
 
@@ -341,33 +316,6 @@ shared 1
 # Or delete snapshots before migration
 # Or use offline migration (stop VM, migrate, start)
 ```
-
-### Shared CPU model required across heterogeneous nodes
-
-Live migration between nodes with **different physical CPUs** (even
-within the same Intel generation line) will crash the destination
-QEMU with a `kvm_buf_set_msrs` assertion if the VM is configured
-with `cpu: host`. Example from a mixed cluster that includes a
-Westmere node and an Ivy Bridge node:
-
-```
-kvm: warning: TSC frequency mismatch between VM (2393998 kHz)
-     and host (3300022 kHz), and TSC scaling unavailable
-kvm: error: failed to set MSR 0x202 to 0xe000000000
-kvm: ../target/i386/kvm/kvm.c:3888: kvm_buf_set_msrs:
-     Assertion `ret == cpu->kvm_msr_buf->nmsrs' failed.
-```
-
-Older Intel generations (pre-Haswell on most SKUs) lack hardware
-TSC scaling, so the destination KVM cannot rewrite a running
-guest's TSC rate during the resume step.
-
-**Fix**: pick a CPU model that is actually portable across your
-cluster. The common denominator for a mixed Westmere/Ivy Bridge
-fleet is `Nehalem`. For modern-only clusters, `x86-64-v2-AES` or
-`x86-64-v3` are typical choices. Set with `qm set VMID --cpu
-Nehalem`, then reboot the VM. Not a plugin bug — same limitation
-applies to every PVE storage backend.
 
 ## TrueNAS Specific Limitations
 
