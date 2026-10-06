@@ -2906,6 +2906,29 @@ sub _parse_dataset_error {
     };
 }
 
+# The recursive+force delete that follows is only safe if we KNOW the dataset
+# has no child datasets. If the dataset cannot be read, nothing is known: the
+# old code swallowed the error and went ahead (a child "precious" was destroyed
+# with its parent while get_instance was failing). Fail closed. A dataset that
+# is really gone (ENOENT/InstanceNotFound - not a transport "Method does not
+# exist") has nothing left to protect and counts as already deleted.
+sub _assert_no_child_datasets {
+    my ($scfg, $full_ds) = @_;
+    my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
+    if (my $err = $@) {
+        return if _is_dataset_absent_error($err);
+        chomp $err;
+        die "Cannot verify that dataset $full_ds has no child datasets (reading it failed: $err); "
+          . "refusing to run a recursive delete. Retry once the TrueNAS API answers.\n";
+    }
+    return if !$ds_info || !$ds_info->{children};
+    my @children = grep { ($_->{type} // '') ne 'SNAPSHOT' } @{$ds_info->{children}};
+    return if !@children;
+    my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
+    die "Cannot use recursive deletion: dataset $full_ds has child datasets: $child_names. " .
+        "Recursive deletion would destroy these child datasets. Please remove them manually first.";
+}
+
 # Is $err a statement about a DATASET not existing? The phrase "does not exist"
 # also appears in transport errors - JSON-RPC "-32601 Method does not exist"
 # when the call itself is unknown, or a broker dying mid-call - and treating
@@ -10401,18 +10424,7 @@ sub _free_image_iscsi {
     # can fail the free_image call cleanly if a manually-created child dataset
     # is present. Recursive deletion in the cleanup_worker would otherwise
     # destroy those children silently.
-    eval {
-        my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
-        if ($ds_info && $ds_info->{children}) {
-            my @children = grep { $_->{type} ne 'SNAPSHOT' } @{$ds_info->{children}};
-            if (@children) {
-                my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
-                die "Cannot use recursive deletion: dataset $full_ds has child datasets: $child_names. " .
-                    "Recursive deletion would destroy these child datasets. Please remove them manually first.";
-            }
-        }
-    };
-    die $@ if $@;
+    _assert_no_child_datasets($scfg, $full_ds);
 
     # Invalidate cache eagerly (list_images should not see the stale mapping).
     _clear_cache(_cache_host_key($scfg));
@@ -10634,18 +10646,7 @@ sub _free_image_nvme {
     # 3) Safety check (sync) then defer dataset delete to cleanup_worker.
     # Same rationale as _free_image_iscsi: hoist the slow pool.dataset.delete
     # out of the caller's synchronous path so qm destroy returns quickly.
-    eval {
-        my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
-        if ($ds_info && $ds_info->{children}) {
-            my @children = grep { $_->{type} ne 'SNAPSHOT' } @{$ds_info->{children}};
-            if (@children) {
-                my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
-                die "Cannot use recursive deletion: dataset $full_ds has child datasets: $child_names. " .
-                    "Recursive deletion would destroy these child datasets. Please remove them manually first.";
-            }
-        }
-    };
-    die $@ if $@;
+    _assert_no_child_datasets($scfg, $full_ds);
 
     # 4) Defer udev cleanup after lock release, then reap any orphan
     # namespaces on our subsystem. Under multi-node load a namespace
@@ -11975,11 +11976,16 @@ sub _teardown_snapshot_device {
         warn "[TrueNAS] _teardown_snapshot_device: namespace delete failed: $@\n" if $@;
     }
 
-    # Destroy the clone zvol (ignore if already gone).
-    eval { _tn_dataset_delete($scfg, $clone_full) };
+    # Destroy the clone zvol. Right after the extent/namespace is deleted
+    # TrueNAS still holds the zvol and answers EBUSY, so a single attempt left
+    # the clone behind (the CT kept lock: snapshot-delete and the next vzdump
+    # failed while the job said it finished). Use the retrying delete, which
+    # also confirms with the array before treating "does not exist" as done.
+    # A failure is raised, not warned: swallowing it is how the job reported
+    # success over an orphan.
+    eval { _delete_dataset_with_retry($scfg, $clone_full) };
     if (my $err = $@) {
-        warn "[TrueNAS] _teardown_snapshot_device: clone delete failed: $err\n"
-            if $err !~ /does not exist|ENOENT|InstanceNotFound/i;
+        die "[TrueNAS] _teardown_snapshot_device: could not delete the snapshot clone $clone_full: $err";
     }
 
     return;
