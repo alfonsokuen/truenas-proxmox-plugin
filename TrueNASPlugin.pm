@@ -461,30 +461,53 @@ sub _is_auth_error {
 }
 
 # ======== Retry logic with exponential backoff ========
+# Classify the error into "retry at the generic layer" or not. All of the
+# non-retryable classifiers below MUST run before _is_connection_error:
+# that one is a loose substring match against the full error string
+# (including the pretty-printed Python traceback middlewared embeds in
+# JSON-RPC error payloads), so any error whose trace mentions a frame
+# or local named "timeout", "connection reset", etc. will false-match.
+# Barbapapade's #123 report caught the shape in production: a real EBUSY
+# from pool.dataset.delete and a dependent EINVAL from pool.snapshot.delete
+# both carry Python frames with those strings, and gating connection-
+# detection first classified the EINVAL as retryable (looping on an
+# operation that could not succeed) while skipping the retry budget the
+# real EBUSY actually needed. The ordering below puts every authoritative
+# non-retryable classifier (structured errname / explicit error codes)
+# ahead of the substring heuristic.
 sub _is_retryable_error {
     my ($error) = @_;
     return 0 if !defined $error;
 
-    # Do NOT retry on database integrity errors — check BEFORE connection patterns
-    # because FK errors include Python traceback paths containing "connection.py"
-    # which would otherwise false-match the /connection.*failed/ pattern below
+    # Do NOT retry on database integrity errors — FK errors include Python
+    # traceback paths containing "connection.py" which would otherwise
+    # false-match the connection-error substring list.
     return 0 if $error =~ /FOREIGN KEY constraint failed|IntegrityError|constraint failed/i;
 
-    # Do NOT retry on ZFS "already exists" errors -- these are deterministic
-    # collisions (auto-increment handles them in the caller). Also gated
-    # BEFORE the connection-error check because middlewared's error payload
-    # includes a Python traceback whose text may otherwise false-match a
-    # retryable pattern.
+    # Do NOT retry on ZFS "already exists" / "dependent clone" errors —
+    # these are deterministic collisions that will fail every retry.
     return 0 if $error =~ /dataset already exists|EZFS_EXISTS|zfs_create.*failed/i;
+    return 0 if $error =~ /ZFSPathAlreadyExistsException|path already exists/i;
+    return 0 if $error =~ /has dependent clones|dependent clones|clone.*exists/i;
 
-    # Retry on transient connection/network errors
-    return 1 if _is_connection_error($error);
+    # Do NOT retry on EBUSY — the backing device is held by someone, and
+    # a blind retry at this layer just hammers the same error. The one
+    # place that can productively retry EBUSY is _teardown_snapshot_device,
+    # which has its own bounded ladder with a readiness barrier (udev
+    # settle) between attempts. (issue #123)
+    return 0 if $error =~ /\bEBUSY\b|dataset is busy|is busy|device.*busy/i;
 
-    # Do NOT retry on authentication, not found, or validation errors
+    # Do NOT retry on authentication / not-found / validation errors.
+    # These are authoritative structured classifications; moving them
+    # ahead of the connection substring match is the ordering fix.
     return 0 if _is_auth_error($error);
     return 0 if _is_not_found_error($error);
     return 0 if $error =~ /validation.*error|invalid.*parameter/i;
-    return 0 if $error =~ /EINVAL|Invalid params/i;
+    return 0 if $error =~ /\bEINVAL\b|Invalid params/i;
+
+    # Retry on transient connection/network errors (substring heuristic;
+    # last so authoritative classifiers above win on conflict).
+    return 1 if _is_connection_error($error);
 
     return 0; # Default: don't retry unknown errors
 }
@@ -2477,11 +2500,29 @@ sub volume_snapshot_delete {
         # volume_snapshot_delete directly — it never calls deactivate_volume with a
         # snapname — so the clone would otherwise be orphaned. A clone also holds the
         # snapshot as its origin, blocking the snapshot delete below until removed.
-        # Best-effort: _teardown_snapshot_device is idempotent and no-ops when no
-        # clone exists.
+        # _teardown_snapshot_device is idempotent and no-ops when no clone exists.
+        #
+        # Teardown failures were previously swallowed to a warn here, and the code
+        # proceeded to pool.snapshot.delete regardless (issue #123). That path
+        # produced two bad outcomes together:
+        #   - the dependent clone kept the origin snapshot alive, so the ZFS delete
+        #     returned "has dependent clones" / EINVAL, and
+        #   - PVE's vzdump cleanup treats volume_snapshot_delete failures as
+        #     warnings on top of an already-written PBS archive, so operators saw
+        #     TASK OK while the CT retained lock=snapshot-delete + parent=vzdump
+        #     metadata, blocking every subsequent backup until manual recovery.
+        # Propagate teardown failure and SKIP the origin snapshot delete so the
+        # dependency chain is explicit in the task log and PVE's cleanup phase
+        # has an actual error to surface. The bounded EBUSY retry inside
+        # _teardown_snapshot_device absorbs the typical settle race first.
         if (defined($snapname) && $snapname ne '') {
             eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
-            warn "[TrueNAS] volume_snapshot_delete: snapshot clone teardown failed: $@\n" if $@;
+            if (my $teardown_err = $@) {
+                die "volume_snapshot_delete: refusing to delete $snap_full while "
+                    . "its ephemeral vzdump clone cannot be torn down "
+                    . "(leaves the origin held by the clone; manual cleanup needed): "
+                    . "$teardown_err";
+            }
         }
 
         my $result = _api_call_mutate(
@@ -8834,11 +8875,87 @@ sub _teardown_snapshot_device {
         warn "[TrueNAS] _teardown_snapshot_device: namespace delete failed: $@\n" if $@;
     }
 
-    # Destroy the clone zvol (ignore if already gone).
-    eval { _tn_dataset_delete($scfg, $clone_full) };
-    if (my $err = $@) {
-        warn "[TrueNAS] _teardown_snapshot_device: clone delete failed: $err\n"
-            if $err !~ /does not exist|ENOENT|InstanceNotFound/i;
+    # Readiness barrier before the dataset delete (issue #123). The
+    # initiator-side scsi device delete + multipath -f + targetextent
+    # delete all return before middlewared / SCST / udev finish their
+    # own release handshake on the backing zvol, so a same-tick
+    # pool.dataset.delete can race and return EBUSY even though the
+    # volume is logically free. udevadm settle drains any in-flight
+    # device-removal uevents on the initiator; the retry ladder below
+    # covers middlewared's own release lag.
+    eval { run_command(['udevadm','settle'], outfunc=>sub{}, errfunc=>sub{}) };
+
+    # Destroy the clone zvol with a bounded EBUSY retry (issue #123).
+    # Attempts: 1 immediate + 4 backoff steps (0.5s, 1s, 2s, 4s) ≈
+    # 7.5 s worst-case wall-clock. Longer than the ~1 s settle window
+    # Barbapapade observed, short enough not to visibly stall vzdump
+    # cleanup when the backing device really is wedged. A persistent
+    # EBUSY after this budget is propagated — see the matching change
+    # in volume_snapshot_delete, which refuses to delete the dependent
+    # @vzdump snapshot rather than surface a false TASK OK.
+    #
+    # IMPORTANT (observed on TN 26.0 BETA.36, 2026-10-06): pool.dataset.delete
+    # can report success without the underlying ZFS destroy actually
+    # completing. The response path short-circuits before verifying zpool
+    # state, so an EBUSY from the kernel's zfs destroy ioctl is masked and
+    # the plugin thinks the clone is gone when the zvol is still live.
+    # Barbapapade's 25.10.6 report shows a VISIBLE EBUSY (that version
+    # surfaces it); 26.0 BETA.36 hides it. The explicit readback below
+    # closes the gap on BOTH TN versions:
+    #   - if TN returned EBUSY → caught by the explicit regex, retried
+    #   - if TN silently succeeded while leaving the dataset live →
+    #     readback via pool.dataset.get_instance sees the zombie dataset,
+    #     we synthesize an EBUSY-shaped error and retry
+    # Either way, after the bounded ladder the only paths out are
+    # "dataset truly gone" or "die with authoritative error".
+    my $last_err;
+    my @delay_ms = (0, 500, 1000, 2000, 4000);
+    for my $delay (@delay_ms) {
+        usleep($delay * 1000) if $delay;
+        $last_err = undef;
+        eval { _tn_dataset_delete($scfg, $clone_full) };
+        if (my $err = $@) {
+            if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # Already gone (e.g. a concurrent teardown won the race): success.
+                $last_err = undef;
+                last;
+            }
+            $last_err = $err;
+            # Only loop on EBUSY-shaped errors; any other failure (auth,
+            # not-found-on-pool, EINVAL from a stray race) breaks out
+            # immediately so the operator sees the authoritative cause.
+            last unless $err =~ /\bEBUSY\b|dataset is busy|is busy|device.*busy/i;
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] _teardown_snapshot_device: clone $clone_full busy, "
+                . "retrying in ${delay}ms (next step)");
+        } else {
+            # TN reported success. Verify the dataset is actually gone —
+            # TN 26.0 BETA.36 can return 'deleted' while leaving the zvol
+            # live when a holder has the device open. If get_instance
+            # still finds the dataset, treat as implicit EBUSY and loop.
+            my $still_there = eval { _tn_dataset_get($scfg, $clone_full) };
+            my $get_err = $@;
+            if ($get_err && $get_err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # Readback confirms gone. Real success.
+                last;
+            }
+            if ($still_there) {
+                $last_err = "pool.dataset.delete reported success but "
+                    . "pool.dataset.get_instance still finds $clone_full "
+                    . "(TN masked EBUSY)";
+                _log($scfg, 1, 'warning',
+                    "[TrueNAS] _teardown_snapshot_device: $last_err; "
+                    . "retrying in ${delay}ms (next step)");
+            } else {
+                # get_instance returned no error and no instance — treat as
+                # gone, same as the ENOENT branch above.
+                last;
+            }
+        }
+    }
+    if ($last_err) {
+        die "[TrueNAS] _teardown_snapshot_device: clone delete failed for "
+            . "$clone_full after bounded retry (@delay_ms ms): $last_err\n";
     }
 
     return;
