@@ -94,7 +94,10 @@ truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium
     nodo no quorate, dos storages sobre el mismo dataset); `--yes` exige ademas
     `--confirm-sole-cluster`. PREVENCION probada en laboratorio (iSCSI y NVMe):
     `qm destroy N --purge --destroy-unreferenced-disks 1` si libera el cloud-init;
-    `--purge` a secas no.
+    `--purge` a secas no. Solo cuenta una tarea ACTIVA si su proceso sigue vivo
+    (pid y hora de inicio del UPID): los nodos de produccion arrastran entradas
+    muertas en /var/log/pve/tasks/active que bloquearian la herramienta para
+    siempre. Aborta tambien si el nodo no es quorate.
 
   * install.sh --help: los backticks del texto de ayuda estaban en un heredoc sin
     comillas y EJECUTABAN `qm destroy --purge`, `pvesm free` y `pvesh get` al
