@@ -47,4 +47,21 @@ for my $case ([1, 'devices in use'], [0, 'no device in use']) {
         ok($disconnects > 0, "$label: reconnect is allowed");
     }
 }
+
+# The i==25 "zero devices" gate must respect allow_reconnect and must not read a
+# failed enumeration as zero devices.
+{
+    no strict 'refs'; no warnings 'redefine';
+    local *{"${PKG}::_nvme_find_device_by_subsystem"} = sub { undef };   # never sees devices
+    local *{"${PKG}::_nvme_check_devices_in_use"} = sub { 0 };
+    $in_use = 0;
+    $disconnects = 0;
+    eval { $f->($scfg, 'uuid-1', allow_reconnect => 0) };
+    is($disconnects, 0, 'i==25 gate: allow_reconnect=0 never disconnects');
+    local *{"${PKG}::_nvme_get_subsystem_device_paths"} = sub { die "cannot enumerate
+" };
+    $disconnects = 0;
+    eval { $f->($scfg, 'uuid-1', allow_reconnect => 1) };
+    is($disconnects, 0, 'i==25 gate: an enumeration that FAILS is not "zero devices", no disconnect');
+}
 done_testing;

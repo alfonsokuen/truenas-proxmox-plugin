@@ -8148,29 +8148,52 @@ sub _nvme_find_device_by_subsystem {
 }
 
 # Collect /dev/nvmeXnY paths for all block devices belonging to our subsystem NQN
+# Injectable roots so the in-use gate can be tested against a fake tree and
+# probed read-only on real hardware: sysfs root, mountinfo file, and a fuser
+# runner (returns fuser's exit status, undef when it could not be run).
+our $_NVME_SYSFS     = '/sys';
+our $_NVME_MOUNTINFO = '/proc/self/mountinfo';
+our $_NVME_FUSER_RC;
+
+# With strict => 1 an unreadable /sys/block DIES instead of returning an empty
+# list: an empty list reads as "no devices, nothing to protect", which is the
+# wrong answer to "I could not look".
 sub _nvme_get_subsystem_device_paths {
-    my ($scfg) = @_;
+    my ($scfg, %opt) = @_;
 
     my $nqn = $scfg->{tn_subsystem_nqn};
     my @paths;
 
-    opendir(my $bdh, "/sys/block") or return @paths;
+    my $bdh;
+    if (!opendir($bdh, "$_NVME_SYSFS/block")) {
+        die "cannot enumerate $_NVME_SYSFS/block: $!\n" if $opt{strict};
+        return @paths;
+    }
     while (my $entry = readdir($bdh)) {
         next unless $entry =~ /^(nvme\d+(?:c\d+)?n\d+)$/;
         $entry = $1;  # Untaint
 
         my $dev_nqn = eval {
             # Standard devices have subsysnqn under device/, controller devices under device/../
-            my $nqn_path = -e "/sys/block/$entry/device/subsysnqn"
-                ? "/sys/block/$entry/device/subsysnqn"
-                : "/sys/block/$entry/device/../subsysnqn";
-            open my $fh, '<', $nqn_path or return undef;
+            my $nqn_path = -e "$_NVME_SYSFS/block/$entry/device/subsysnqn"
+                ? "$_NVME_SYSFS/block/$entry/device/subsysnqn"
+                : "$_NVME_SYSFS/block/$entry/device/../subsysnqn";
+            if (!open(my $fh0, '<', $nqn_path)) {
+                return undef if $!{ENOENT};    # not an NVMe-oF-style device: not ours
+                die "cannot read $nqn_path: $!\n";
+            }
+            open my $fh, '<', $nqn_path or die "cannot read $nqn_path: $!\n";
             my $val = <$fh>;
             close $fh;
             chomp($val);
             return $val;
         };
 
+        if (my $e = $@) {
+            closedir($bdh);
+            die $e if $opt{strict};
+            next;
+        }
         push @paths, "/dev/$entry" if $dev_nqn && $dev_nqn eq $nqn;
     }
     closedir($bdh);
@@ -8269,27 +8292,140 @@ sub _nvme_warn_target_no_mdts {
         . ". Once the array declares a limit, set tn_nvme_max_io_kb 0 (issue #96).");
 }
 
-# Check if any of the given device paths are in use by a running process.
-# Returns: 1 if any device is in use (unsafe to disconnect), 0 if all clear.
+# Is any of these NVMe devices in use? Returns 1 when in use OR when that could
+# not be established, 0 only when it positively is not. The answer gates
+# `nvme disconnect`, which drops every controller of the subsystem, so every
+# doubt is "in use". The old check ran `fuser -s` and read ANY failure as
+# "free": a mounted filesystem or a dm/LVM holder has no process with the node
+# open, and fuser's rc=1 mixes "nobody has it" with "could not look".
+#
+# In use when: (a) fuser exits 0; (b) fuser exits > 1, dies, or is missing;
+# (c) the device, its partitions or the head of a multipath path device is the
+# source of a mount in mountinfo (matched by major:minor and by /dev name);
+# (d) its sysfs holders/ directory (or a partition's) is not empty (dm, LVM,
+# md); (e) sysfs cannot be read or a device has no readable dev number.
 sub _nvme_check_devices_in_use {
     my ($scfg, @device_paths) = @_;
     return 0 unless @device_paths;
 
-    # Fail safe: if fuser not available, assume in use
-    if (! -x '/usr/bin/fuser' && ! -x '/bin/fuser') {
-        _log($scfg, 1, 'warning', "[TrueNAS] fuser not found, cannot verify device safety");
-        return 1;
+    my $sys = $_NVME_SYSFS;
+    my %names;                          # every kernel name to examine
+    for my $path (@device_paths) {
+        my ($name) = $path =~ m{^(?:/dev/)?(nvme\d+(?:c\d+)?n\d+)$};
+        if (!defined $name) {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: unrecognised device '$path', treating as in use");
+            return 1;
+        }
+        $names{$name} = 1;
+        # nvme<S>c<C>n<N> is a path of the head nvme<S>n<N>, and the head is
+        # what a filesystem or a dm table is built on.
+        $names{"nvme$1n$2"} = 1 if $name =~ /^nvme(\d+)c\d+n(\d+)$/;
     }
 
-    # fuser -s: exit 0 = at least one device has active process
-    #           exit 1 = none accessed (run_command dies on non-zero)
-    eval {
-        run_command(['fuser', '-s', @device_paths],
-            outfunc => sub {},
-            errfunc => sub {},
-        );
-    };
-    return $@ ? 0 : 1;  # $@ set = no processes = not in use
+    my (%majmin, %devnames, @existing);
+    for my $name (sort keys %names) {
+        my $dir = "$sys/block/$name";
+        if (!-d $dir) {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $dir not readable, treating as in use");
+            return 1;
+        }
+        my @units = ($name);
+        if (opendir(my $dh, $dir)) {
+            push @units, grep { /^\Q$name\Ep?\d+$/ } readdir($dh);
+            closedir($dh);
+        } else {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot list $dir ($!), treating as in use");
+            return 1;
+        }
+        for my $u (@units) {
+            my $base = ($u eq $name) ? $dir : "$dir/$u";
+            my $mm;
+            if (open(my $fh, '<', "$base/dev")) { local $/; $mm = <$fh>; close $fh; }
+            # A multipath path device (nvmeXcYnZ) is a HIDDEN gendisk: it has no
+            # dev number and no /dev node, only its head does. Anything else
+            # without a readable dev number cannot be examined: in use.
+            my $hidden = ($u eq $name && $name =~ /^nvme\d+c\d+n\d+$/ && -e "$base/hidden");
+            if (!$hidden && (!defined $mm || $mm !~ /^(\d+:\d+)/)) {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot read $base/dev, treating as in use");
+                return 1;
+            }
+            if (!$hidden) {
+                $majmin{$1} = 1;
+                $devnames{"/dev/$u"} = 1;
+                push @existing, "/dev/$u" if -e "/dev/$u";
+            }
+            my $holders = "$base/holders";
+            if (-d $holders) {
+                my $hh;
+                if (!opendir($hh, $holders)) {
+                    _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot list $holders, treating as in use");
+                    return 1;
+                }
+                my @h = grep { !/^\.\.?$/ } readdir($hh);
+                closedir($hh);
+                if (@h) {
+                    _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $u has holders (@h)");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    # Mounts, by major:minor and by source name.
+    my $mi;
+    if (!open($mi, '<', $_NVME_MOUNTINFO)) {
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot read $_NVME_MOUNTINFO ($!), treating as in use");
+        return 1;
+    }
+    while (my $line = <$mi>) {
+        my @f = split ' ', $line;
+        my $dash = 0;
+        $dash++ while $dash < @f && $f[$dash] ne '-';
+        my $mm  = $f[2] // '';
+        my $src = $f[$dash + 2] // '';
+        if ($majmin{$mm} || $devnames{$src}) {
+            close($mi);
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $src ($mm) is mounted");
+            return 1;
+        }
+    }
+    close($mi);
+
+    # Processes that hold a device node open (QEMU, tools, anything).
+    my $rc;
+    if ($_NVME_FUSER_RC) {
+        $rc = $_NVME_FUSER_RC->(@existing);
+    } else {
+        my ($fuser) = grep { -x $_ } ('/usr/bin/fuser', '/bin/fuser');
+        if (!$fuser) {
+            _log($scfg, 1, 'warning', "[TrueNAS] fuser not found, cannot verify device safety");
+            return 1;
+        }
+        my @args = map { m{^(/dev/[A-Za-z0-9]+)$} ? $1 : () } @existing;
+        if (@args) {
+            my $st = system($fuser, '-s', '-m', @args);
+            $rc = ($st == -1 || ($st & 127)) ? undef : ($st >> 8);
+        } else {
+            $rc = 1;    # nothing to ask fuser about; the sysfs and mount checks stand
+        }
+    }
+    # fuser: 0 = a process uses it, 1 = none, anything else = it did not work.
+    return 0 if defined $rc && $rc == 1;
+    return 1;
+}
+
+# The gate used before every reconnect: enumerate the subsystem's devices and
+# check them. Returns (busy, @paths); busy is 1 when the devices are in use OR
+# could not be enumerated (an empty list from a failed look is not "no devices").
+sub _nvme_subsystem_busy {
+    my ($scfg) = @_;
+    my @paths = eval { _nvme_get_subsystem_device_paths($scfg, strict => 1) };
+    if (my $err = $@) {
+        chomp $err;
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme_subsystem_busy: $err; treating the subsystem as in use");
+        return (1);
+    }
+    return (_nvme_check_devices_in_use($scfg, @paths) ? 1 : 0, @paths);
 }
 
 # Get device path for namespace by matching subsystem NQN and namespace properties
@@ -8353,8 +8489,8 @@ sub _nvme_device_for_uuid {
             # the TrueNAS API within the first 1s. An NGUID contradiction is definitive —
             # the kernel's cached namespace data belongs to a previous TrueNAS state and
             # will never self-resolve without a disconnect/reconnect cycle.
-            my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
-            if (_nvme_check_devices_in_use($scfg, @dev_paths)) {
+            my ($busy, @dev_paths) = _nvme_subsystem_busy($scfg);
+            if ($busy) {
                 _log($scfg, 1, 'warning',
                     "[TrueNAS] nvme_device_for_uuid: stale NGUIDs detected (early) but "
                     . scalar(@dev_paths) . " device(s) are in use, skipping reconnect");
@@ -8379,8 +8515,11 @@ sub _nvme_device_for_uuid {
             # Trigger udev and rescan NVMe controllers for our subsystem
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
             eval { _nvme_rescan_subsystem_controllers($scfg) };
-        } elsif ($i == 25 && !$reconnect_attempted && !$ever_saw_devices && _nvme_is_connected($scfg)) {
-            # No $allow_reconnect check needed: zero devices means no VMs are affected.
+        } elsif ($i == 25 && !$reconnect_attempted && $allow_reconnect && !$ever_saw_devices
+                 && _nvme_is_connected($scfg) && !(_nvme_subsystem_busy($scfg))[0]) {
+            # "Zero devices" is established by the strict enumeration above
+            # (a sysfs that cannot be read is NOT zero devices) and the caller
+            # must have opted into reconnects like every other gate.
             # Stale connection recovery: subsystem shows connected but zero block devices
             # have appeared across all iterations. The TrueNAS target has likely stopped
             # publishing namespaces over this connection. Reconnecting forces re-enumeration.
@@ -8415,8 +8554,7 @@ sub _nvme_device_for_uuid {
                 $tn_has_uuid = 1 if $q && @$q;
             };
             if ($tn_has_uuid) {
-                my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
-                my $in_use = _nvme_check_devices_in_use($scfg, @dev_paths);
+                my ($in_use, @dev_paths) = _nvme_subsystem_busy($scfg);
                 if ($in_use) {
                     _log($scfg, 1, 'warning',
                         "[TrueNAS] nvme_device_for_uuid: target $device_uuid confirmed on TN "
@@ -8451,8 +8589,8 @@ sub _nvme_device_for_uuid {
             # Note: inherent TOCTOU window between fuser check and disconnect.
             # CFS lock prevents concurrent plugin operations; manual VM starts
             # during this ~1ms window are the residual (very low) risk.
-            my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
-            if (_nvme_check_devices_in_use($scfg, @dev_paths)) {
+            my ($busy, @dev_paths) = _nvme_subsystem_busy($scfg);
+            if ($busy) {
                 _log($scfg, 1, 'warning',
                     "[TrueNAS] nvme_device_for_uuid: stale NGUIDs detected but "
                     . scalar(@dev_paths) . " device(s) are in use, skipping reconnect");
@@ -8511,11 +8649,11 @@ sub _nvme_device_for_uuid {
     # kernel needed a SECOND reconnect to see it. The single-reconnect
     # cap was silently killing recovery.
     #
-    # The only remaining safety concern with unconditional emergency
-    # reconnect: cost is ~500ms NVMe controller drop for other VMs on
-    # the shared subsystem, running at the moment the loop exhausts.
-    # Trade-off: 500ms I/O pause vs a guaranteed failure. The pause
-    # wins.
+    # This fork's departure from upstream (which reconnected here with no use
+    # check, "the pause wins"): the disconnect hits every controller of the
+    # subsystem, so with any device in use - or when that cannot be told - the
+    # emergency reconnect is SKIPPED and the activation fails with a readable
+    # error instead of giving running guests EIO.
     if (!$allow_reconnect) {
         _log($scfg, 0, 'warning',
             "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
@@ -8524,10 +8662,7 @@ sub _nvme_device_for_uuid {
         _log($scfg, 0, 'warning',
             "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
             . "(_nvme_is_connected=0) — subsystem not currently connected");
-    } elsif (do {
-            my @dp = _nvme_get_subsystem_device_paths($scfg);
-            _nvme_check_devices_in_use($scfg, @dp) ? 1 : 0;
-        }) {
+    } elsif ((_nvme_subsystem_busy($scfg))[0]) {
         # Upstream reconnected here unconditionally ("the pause wins"). This
         # fork does not: the disconnect hits every controller of the
         # subsystem, and a running guest on another namespace would see EIO.
