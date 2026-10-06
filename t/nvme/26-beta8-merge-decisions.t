@@ -189,4 +189,58 @@ SKIP: {
     ok(eval { $new->('[fd00:1::1]', undef); 1 }, '  ...and a bracketed IPv6 literal is now accepted');
 }
 
+# --- 9. second review round: fail-closed details ---------------------------
+{
+    no strict 'refs'; no warnings 'redefine';
+    # (a) reaper: a transport "Method does not exist" is not a dataset absent
+    my @deleted; my %get;
+    local *{"${PKG}::_api_call"} = sub {
+        my ($s, $m, $p) = @_;
+        push @deleted, $p->[0] if $m eq 'nvmet.namespace.delete';
+        return [ { id => 7 } ] if $m eq 'nvmet.subsys.query';
+        return [ { id => 2, device_path => 'zvol/tank/pve/vm-2-disk-0' } ] if $m eq 'nvmet.namespace.query';
+        return [ { id => 'tank/pve/vm-9-disk-0' } ] if $m eq 'pool.dataset.query';
+        return [];
+    };
+    local *{"${PKG}::_tn_dataset_get"} = sub { die $get{err} };
+    my $rs = { tn_dataset => 'tank/pve', tn_subsystem_nqn => 'nqn.x:y' };
+    $get{err} = "[-32601] Method does not exist: pool.dataset.get_instance\n";
+    $PKG->can('_nvme_reap_orphan_namespaces')->($rs);
+    is(scalar(@deleted), 0, 'reaper: "Method does not exist" from the probe is NOT proof the dataset is gone');
+    $get{err} = "[ENOENT] ... InstanceNotFound\n";
+    $PKG->can('_nvme_reap_orphan_namespaces')->($rs);
+    is_deeply([@deleted], [2], '  ...while a real InstanceNotFound still reaps');
+}
+{
+    no strict 'refs'; no warnings 'redefine';
+    # (b) orphan recovery needs a valid ARRAY from the clone query
+    my ($clones, @calls);
+    local *{"${PKG}::_api_call"} = sub {
+        my ($s, $m, $p) = @_;
+        if ($m eq 'pool.dataset.query' && $p->[0][0][0] eq 'origin.parsed') { return $clones }
+        return [ { id => 'tank/pve/base-1-disk-0', children => [] } ];
+    };
+    local *{"${PKG}::_api_call_mutate"} = sub { push @calls, $_[1]; 1 };
+    for my $bad (undef, { id => 'x' }, 'str') {
+        @calls = (); $clones = $bad;
+        my $r = $PKG->can('_dataset_orphan_check_and_delete')->($scfg, 'tank/pve/base-1-disk-0');
+        is($r, 0, 'orphan recovery: clone query answering ' . (defined $bad ? ref($bad) || 'a string' : 'undef') . ' -> refuses');
+        ok(!(grep { $_ eq 'pool.dataset.delete' } @calls), '  ...no delete');
+    }
+}
+{
+    no strict 'refs'; no warnings 'redefine';
+    # (c) the retry loop must reach the confirmation before reporting success
+    my ($del_err, $present);
+    local *{"${PKG}::_api_call_mutate"} = sub { die $del_err };
+    local *{"${PKG}::_tn_dataset_get"} = sub { $present ? { id => 'x' } : die "[ENOENT] does not exist\n" };
+    my $d = $PKG->can('_delete_dataset_with_retry');
+    $del_err = "[-32601] Method does not exist: pool.dataset.delete\n"; $present = 1;
+    like(do { eval { $d->($scfg, 'tank/pve/vm-1-disk-0', 1); 1 }; $@ }, qr/Refusing to report success/,
+        'delete retry: a transport "does not exist" with the dataset still there is NOT success');
+    $del_err = "[ENOENT] dataset does not exist\n"; $present = 0;
+    ok(eval { $d->($scfg, 'tank/pve/vm-1-disk-0', 1); 1 }, '  ...a real "does not exist" with the dataset gone is success');
+}
+is($PKG->can('DATASET_DELETE_TIMEOUT_S')->(), 30, 'DATASET_DELETE_TIMEOUT_S keeps the fork value (30)');
+
 done_testing;

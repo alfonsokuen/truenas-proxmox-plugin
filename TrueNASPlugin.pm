@@ -136,7 +136,7 @@ use constant {
 
     # Job timeouts (seconds)
     SNAPSHOT_DELETE_TIMEOUT_S        => 15,  # snapshot deletion job timeout
-    DATASET_DELETE_TIMEOUT_S         => 15,  # dataset deletion job timeout (per-attempt; retries handle transient TN busy)
+    DATASET_DELETE_TIMEOUT_S         => 30,  # dataset deletion job timeout (increased for reliability; the fork's value, upstream beta8 lowered it to 15)
     DEVICE_CLEANUP_VERIFY_TIMEOUT_S  => 2,   # device cleanup verification timeout (normal path ~200ms)
     DATASET_DELETE_RETRY_COUNT       => 3,   # max retries for dataset deletion on "busy" errors
 
@@ -464,7 +464,16 @@ sub _dataset_orphan_check_and_delete {
             "$target_dataset failed ($qerr); not deleting");
         return 0;
     }
-    if ($snap_clones && ref($snap_clones) eq 'ARRAY' && @$snap_clones) {
+    # Only a real array - possibly empty - is an answer. undef, a hash or a
+    # string means the query did not do what we asked, which is not "no clones".
+    if (ref($snap_clones) ne 'ARRAY') {
+        _log($scfg, 0, 'err',
+            "[TrueNAS] _dataset_orphan_check_and_delete: clone query for " .
+            "$target_dataset returned " . (defined $snap_clones ? (ref($snap_clones) || 'a scalar') : 'nothing') .
+            " instead of a list; not deleting");
+        return 0;
+    }
+    if (@$snap_clones) {
         my $clone_names = join(', ', map { $_->{id} // '<undef>' } @$snap_clones);
         _log($scfg, 0, 'err',
             "[TrueNAS] $target_dataset has linked clone(s) [$clone_names] " .
@@ -2897,6 +2906,19 @@ sub _parse_dataset_error {
     };
 }
 
+# Is $err a statement about a DATASET not existing? The phrase "does not exist"
+# also appears in transport errors - JSON-RPC "-32601 Method does not exist"
+# when the call itself is unknown, or a broker dying mid-call - and treating
+# those as "the dataset is gone" turns an outage into a deletion. Only
+# ENOENT / InstanceNotFound / a "does not exist" that is not about a method or
+# call counts.
+sub _is_dataset_absent_error {
+    my ($err) = @_;
+    return 0 if !defined $err;
+    return 0 if $err =~ /Method (?:call )?(?:does not exist|not found)|-32601|MethodNotFound|method.*does not exist/i;
+    return $err =~ /ENOENT|InstanceNotFound|does not exist/i ? 1 : 0;
+}
+
 # A delete that fails with "does not exist" is only idempotent when the dataset
 # really is gone. That phrase matches anywhere in free text, and a transport
 # failure carries it for reasons unrelated to the dataset: a JSON-RPC
@@ -2914,7 +2936,7 @@ sub _confirm_dataset_gone {
         die "Refusing to report success for $full_ds: the delete failed "
           . "with '$err', but the dataset is still on the array.\n";
     }
-    if ($probe_err && $probe_err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+    if ($probe_err && !_is_dataset_absent_error($probe_err)) {
         die "Cannot confirm $full_ds was deleted: the delete failed with "
           . "'$err' and the follow-up query failed with '$probe_err'. "
           . "Retry once the TrueNAS API answers.\n";
@@ -2952,6 +2974,9 @@ sub _delete_dataset_with_retry {
 
         # If already gone, treat as success
         if ($error_info->{type} eq 'not_found') {
+            # The phrase can come from a transport failure; ask the array
+            # before calling it done (dies unless absence is confirmed).
+            _confirm_dataset_gone($scfg, $full_ds, $err);
             _log($scfg, 2, 'debug', "[TrueNAS] Dataset $full_ds already deleted");
             return;
         }
@@ -9106,7 +9131,7 @@ sub _nvme_reap_orphan_namespaces {
         # an empty answer all mean we do not know, and not knowing keeps it.
         my $probe = eval { _tn_dataset_get($scfg, $ds_id) };
         my $probe_err = $@;
-        if ($probe || !$probe_err || $probe_err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+        if ($probe || !$probe_err || !_is_dataset_absent_error($probe_err)) {
             _log($scfg, 1, 'warning',
                 "[TrueNAS] reap_orphan_namespaces: cannot confirm $ds_id is gone; keeping id=" . ($ns->{id} // '?'));
             next;
