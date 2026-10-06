@@ -55,7 +55,7 @@ sub put_conf {   # a conf of another guest that mentions some text
 my (@freed, $free_rc);
 my $list = sub { my ($store) = @_; return [ $VOL_A, $VOL_B, $VOL_C, $VOL_D, $VOL_E ] if $store eq 'tn-prod'; return [] };
 my $free = sub { my ($volid) = @_; push @freed, $volid; return $free_rc // 0 };
-my %base = (list_volumes => $list, free_volume => $free, local_node => 'pve1', tasks_active => undef);
+my %base = (list_volumes => $list, free_volume => $free, local_node => 'pve1', tasks_active => undef, quorum_check => undef);
 sub run { my ($root, %o) = @_; return $prune->($PKG, pve_root => $root, %base, %o) }
 sub orphans_of { my ($r) = @_; return [ sort map { $_->{volid} } @{ $r->{orphans} } ] }
 
@@ -242,6 +242,52 @@ SKIP: {
             push @freed, $volid; return 0;
         });
     is(scalar(@freed), 1, 'race guard: a guest that appears after the listing stops the next free');
+}
+
+# --- (b) quorum: a node that is not quorate aborts ---------------------------
+{
+    my $root = pve_root();
+    my $r = eval { run($root, quorum_check => sub { die "this node is not quorate\n" }) };
+    ok(!$r && $@ =~ /not quorate/, 'a non-quorate node aborts, even for a dry run');
+
+    # the default check, against a fake pvecm and a clustered root
+    my $dir = tempdir(CLEANUP => 1);
+    open(my $c, '>', "$root/corosync.conf") or die; close $c;
+    my $fake = sub { my ($body) = @_; open(my $f, '>', "$dir/pvecm") or die; print $f "#!/bin/sh\n$body\n"; close $f; chmod 0755, "$dir/pvecm"; };
+    no strict 'refs'; no warnings 'redefine';
+    local ${"${PKG}::_PRUNE_PVECM"} = "$dir/pvecm";
+    $fake->('echo "Quorate:          No"');
+    ok(!eval { $prune->($PKG, pve_root => $root, %base, quorum_check => \&{"${PKG}::_prune_check_quorate"}) },
+        'pvecm status saying Quorate: No aborts');
+    $fake->('echo boom >&2; exit 2');
+    ok(!eval { $prune->($PKG, pve_root => $root, %base, quorum_check => \&{"${PKG}::_prune_check_quorate"}) },
+        '  ...and a failing pvecm aborts too (cannot confirm)');
+    $fake->('echo "Quorate:          Yes"');
+    ok(eval { $prune->($PKG, pve_root => $root, %base, quorum_check => \&{"${PKG}::_prune_check_quorate"}) },
+        '  ...and Quorate: Yes proceeds') or diag($@);
+    unlink "$root/corosync.conf";
+    $fake->('echo "Quorate:          No"');
+    ok(eval { $prune->($PKG, pve_root => $root, %base, quorum_check => \&{"${PKG}::_prune_check_quorate"}) },
+        '  ...a standalone node (no corosync.conf) has no quorum to lose');
+}
+
+# --- (d) a re-read that fails mid --yes reports EVERY volume left unfreed -----
+{
+    my $root = pve_root();
+    @freed = ();
+    my $n = 0;
+    my $r = run($root, yes => 1, confirm_sole_cluster => 1,
+        list_volumes => sub { [ $VOL_B, $VOL_D, 'tn-prod:vol-vm-778-cloudinit-lun1' ] },
+        free_volume => sub {
+            my ($volid) = @_;
+            # after the first free the guest directories become unreadable
+            rename "$root/nodes/pve1/qemu-server", "$root/nodes/pve1/qemu-server.gone" if !$n++;
+            push @freed, $volid; return 0;
+        });
+    is(scalar(@freed), 1, 'a failing re-check stops after the first free');
+    my @skipped = grep { !defined $_->{rc} } @{ $r->{freed} };
+    is(scalar(@skipped), 2, '  ...and EVERY volume left over is listed as skipped, not silently dropped');
+    like($skipped[0]{note} // '', qr/re-check failed/, '  ...with the reason');
 }
 
 done_testing;

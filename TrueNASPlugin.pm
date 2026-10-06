@@ -5154,6 +5154,7 @@ sub migrate_priv_secrets {
 our $_PRUNE_PVE_ROOT = $ENV{TRUENAS_TEST_PVE_ROOT} // '/etc/pve';
 our $_PRUNE_TASKS_ACTIVE = $ENV{TRUENAS_TEST_TASKS_ACTIVE} // '/var/log/pve/tasks/active';
 our $_PRUNE_LOCAL_NODE = $ENV{TRUENAS_TEST_LOCAL_NODE};
+our $_PRUNE_PVECM = $ENV{TRUENAS_TEST_PVECM};     # path of pvecm (tests)
 our $_PRUNE_LIST;       # coderef($storeid) -> [volids]   (tests)
 our $_PRUNE_FREE;       # coderef($volid)   -> exit status (tests)
 
@@ -5211,6 +5212,21 @@ sub _prune_guest_index {
     die "no guest configuration was read from any node; refusing to treat every volume as orphaned\n"
         if !%exists;
     return { exists => \%exists, text => \@text };
+}
+
+# A node that lost quorum sees /etc/pve read-only and possibly stale: its guest
+# list cannot be trusted to be the cluster's. A standalone node (no
+# corosync.conf) has no quorum to lose. Anything that cannot be established aborts.
+sub _prune_check_quorate {
+    my ($root) = @_;
+    return 1 if !-e "$root/corosync.conf";
+    my ($pvecm) = grep { defined($_) && -x $_ } ($_PRUNE_PVECM, '/usr/bin/pvecm');
+    die "this node is clustered but pvecm is not available; cannot confirm quorum, refusing\n" if !$pvecm;
+    my $out = `$pvecm status 2>&1`;
+    die "pvecm status failed (exit " . ($? >> 8) . "); cannot confirm quorum, refusing\n" if $? != 0;
+    die "this node is not quorate (pvecm status: no 'Quorate: Yes'); its view of the guests may be stale, refusing\n"
+        if $out !~ /^Quorate:\s+Yes\b/mi;
+    return 1;
 }
 
 # Tasks that create/restore/clone/back up volumes. Unreadable list: abort.
@@ -5293,6 +5309,9 @@ sub prune_orphan_cloudinit {
         return $st == -1 ? 255 : ($st >> 8);
     };
 
+    my $quorum = exists $o{quorum_check} ? $o{quorum_check} : \&_prune_check_quorate;
+    $quorum->($root) if $quorum;
+
     if ($o{yes} && !$o{confirm_sole_cluster}) {
         die "--yes needs --confirm-sole-cluster: this tool only sees THIS cluster's guests. If another "
           . "Proxmox VE, PegaProx or a lab uses the same TrueNAS dataset, a volume that looks orphaned here "
@@ -5332,13 +5351,20 @@ sub prune_orphan_cloudinit {
     my %result = (orphans => \@orphans, kept => \@kept, freed => []);
     return \%result if !$o{yes};
 
-    for my $orphan (@orphans) {
+    for (my $i = 0; $i < @orphans; $i++) {
+        my $orphan = $orphans[$i];
         my $fresh = eval {
             _prune_check_no_busy_tasks($tasks) if defined $tasks;
+            $quorum->($root) if $quorum;
             _prune_guest_index($root, local_node => $o{local_node});
         };
         if (!$fresh) {
-            push @{ $result{freed} }, { %$orphan, rc => undef, note => "re-check failed: $@" };
+            my $why = $@;
+            chomp $why;
+            # Stop, and say so for EVERY volume not yet freed, not just the one
+            # we were at: a silent stop would read as "the others were fine".
+            push @{ $result{freed} }, { %$_, rc => undef, note => "re-check failed, not freed: $why" }
+                for @orphans[$i .. $#orphans];
             last;
         }
         if ($fresh->{exists}{ $orphan->{vmid} } || _prune_ref_keys($fresh)->{"$orphan->{store}:$orphan->{vmid}"}) {
@@ -5369,8 +5395,10 @@ sub prune_orphan_cloudinit_cli(@argv) {
                 . "referencing the volume under any of its names). Dry run unless --yes, which frees\n"
                 . "each one with `pvesm free` (through the plugin's free_image guards) and also needs\n"
                 . "--confirm-sole-cluster: no other Proxmox VE, PegaProx or lab may use the same\n"
-                . "dataset. Aborts, listing nothing, on any doubt (unreadable /etc/pve, operations in\n"
-                . "progress, storages sharing a dataset). See wiki/Known-Limitations.md.\n";
+                . "dataset. Aborts, listing nothing, on any doubt (unreadable /etc/pve, node not quorate,\n"
+                . "operations in progress, storages sharing a dataset). Before --yes compare the list with\n"
+                . "the guests you expect: a vmid you do not recognise may belong to another cluster; and\n"
+                . "repeat the dry run if a VM was being created. See wiki/Known-Limitations.md.\n";
             return 0;
         } else {
             print STDERR "unexpected argument '$arg'\n$usage";
