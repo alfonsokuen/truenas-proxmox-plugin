@@ -89,6 +89,21 @@ No re-dispara los namespaces ya conectados.
 Solo con el nodo sano pasar al siguiente. Cuando **los 3** estan en idk22 se
 pueden empezar a usar las claves nuevas del punto 0.3.
 
+## 3b. Paso post-despliegue: cloud-init huerfanos (una vez, con los 3 nodos en idk22)
+
+`qm destroy --purge` no libera el disco cloud-init (PVE solo lo hace si el volid
+termina en `cloudinit`; ver `wiki/Known-Limitations.md`). Tras el despliegue,
+en cualquier nodo y **en dry run**:
+
+```bash
+truenas-proxmox-manage prune-orphan-cloudinit
+```
+
+Debe decir `0 orphaned cloud-init volumes` mientras todas las VMs con cloud-init
+(hoy 120, 122, 126, 127, 128, 129, 131, 9000) existan. Revisar la salida a mano;
+solo si lista un huerfano real, y tras confirmarlo, `... prune-orphan-cloudinit
+--yes`. Repetirlo de vez en cuando (p. ej. tras borrar VMs con cloud-init).
+
 ## 4. Vuelta atras (por nodo)
 
 ```bash

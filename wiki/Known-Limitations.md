@@ -6,6 +6,10 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 
 - [Critical Workflow Limitations](#critical-workflow-limitations)
   - [VM deletion (`qm destroy`)](#vm-deletion-qm-destroy)
+  - [Cloud-init disks are not freed by `qm destroy --purge`](#cloud-init-disks-are-not-freed-by-qm-destroy---purge)
+  - [Slow `pool.dataset.create` can leave an orphan zvol](#slow-pooldatasetcreate-can-leave-an-orphan-zvol)
+  - [A leftover `@vzdump` snapshot or clone makes vzdump fail](#a-leftover-vzdump-snapshot-or-clone-makes-vzdump-fail)
+  - [DH-HMAC-CHAP: generate the key with `nvme gen-dhchap-key`](#dh-hmac-chap-generate-the-key-with-nvme-gen-dhchap-key)
 - [Storage Feature Limitations](#storage-feature-limitations)
   - [Where the plugin's `clone_image()` is invoked](#where-the-plugins-clone_image-is-invoked)
   - [No Volume Shrinking](#no-volume-shrinking)
@@ -71,6 +75,81 @@ is not locally attached, so the destroy loop never hangs. If you are
 running pre-beta8 and see orphan zvols on TrueNAS after
 `qm destroy` on a node where the disk was never activated, upgrade
 to beta8 or later.
+
+### Cloud-init disks are not freed by `qm destroy --purge`
+
+**Limitation.** The cloud-init disk of a VM (`vol-vm-N-cloudinit-ns<uuid>` on
+NVMe/TCP, `vol-vm-N-cloudinit-lun<K>` on iSCSI) stays on TrueNAS after
+`qm destroy N --purge`. The zvol, and its namespace or extent, are left behind.
+This happens the same way on iSCSI and NVMe, and on `2.1.23~alpha1+idk21`.
+
+**Cause (Proxmox, not the plugin).** `destroy_vm` frees a cloud-init drive only
+if `PVE::QemuServer::Drive::drive_is_cloudinit()` recognises it. That function
+matches the end of the volid:
+
+```perl
+$drive->{file} =~ m@[:/](?:vm-\d+-)?cloudinit(?:\.$QEMU_FORMAT_RE)?$@
+```
+
+Our volname ends in `-ns<uuid>` / `-lun<K>`, so it does not match, `destroy_vm`
+treats the drive as one more CD-ROM (`return if drive_is_cdrom($drive, 1)`) and
+never calls `free_image()`.
+
+**Why it is not renamed.** The bare name `vm-N-cloudinit` would match, but a node
+still on idk21 cannot parse it during a rolling upgrade, and `qm rescan` would
+register every existing cloud-init disk as `unusedN`, one `qm set --delete`
+away from destroying a real disk. The plugin keeps the volname as it is.
+
+**Mitigation.** List what is left behind, then free it through the plugin:
+
+```bash
+# dry run (default): lists volumes whose guest exists on no node and that no
+# configuration - snapshots included - references; changes nothing
+truenas-proxmox-manage prune-orphan-cloudinit [--storage ID]
+
+# frees each orphan with `pvesm free` (through free_image's guards), one by one
+truenas-proxmox-manage prune-orphan-cloudinit --yes
+```
+
+It refuses to list anything if `/etc/pve` cannot be read, and re-checks every
+volume right before freeing it. Manual equivalent:
+
+```bash
+pvesm list <storage> | grep cloudinit        # volid in the first column
+ls /etc/pve/nodes/*/qemu-server/N.conf /etc/pve/nodes/*/lxc/N.conf   # guest N must NOT exist
+grep -l '<volid>' /etc/pve/nodes/*/qemu-server/*.conf /etc/pve/nodes/*/lxc/*.conf   # and nothing may reference it
+pvesm free <volid>
+```
+
+Do not free one whose guest exists: that is a live VM's cloud-init disk.
+
+### Slow `pool.dataset.create` can leave an orphan zvol
+
+If TrueNAS takes longer than `tn_broker_timeout` (30 s by default) to answer
+`pool.dataset.create`, the broker returns `no response from upstream` and the
+allocation fails on the Proxmox side, but the zvol may still be created a moment
+later and stay behind with no guest. Seen in the lab with 9-15 s of latency under
+a heavy write load (not verified against idk21). Find such a zvol with
+`pvesm list <storage>` (a volume of a guest that does not own it) and remove it
+with `pvesm free`; raise `tn_broker_timeout` if the array is routinely that slow.
+
+### A leftover `@vzdump` snapshot or clone makes vzdump fail
+
+A `@vzdump` snapshot, and its clone, left behind by hand (or by an interrupted
+backup) make the next `vzdump` of that guest fail with `EEXIST` when it creates
+the snapshot; nothing cleans it up automatically (not verified against idk21).
+Destroy the clone first, then the snapshot, on TrueNAS (or with
+`zfs destroy`), then run the backup again.
+
+### DH-HMAC-CHAP: generate the key with `nvme gen-dhchap-key`
+
+For NVMe/TCP in-band authentication (`tn_nvme_dhchap_secret` /
+`tn_nvme_dhchap_ctrl_secret`), generate each key with the host's own tool and do
+not reuse a key from a note or a vault entry of unknown origin:
+
+```bash
+nvme gen-dhchap-key --hmac=1 --nqn=<host-nqn>     # prints DHHC-1:01:...:
+```
 
 ## Storage Feature Limitations
 

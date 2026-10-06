@@ -75,6 +75,27 @@ truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium
     - Un teardown de clon vzdump que falla ya no se traga: lanza error y los
       llamadores lo registran con el dataset huerfano exacto.
 
+  * Nuevo `truenas-proxmox-manage prune-orphan-cloudinit [--storage ID] [--yes]`
+    (P2). `qm destroy --purge` NO libera el disco cloud-init: PVE solo libera
+    uno cuyo volid TERMINA en `cloudinit` (drive_is_cloudinit) y el nuestro
+    termina en -ns<uuid>/-lun<K>; destroy_vm lo trata como un CD-ROM y no llama
+    a free_image. Igual en idk21, en iSCSI y en NVMe. No se renombra el volumen
+    (rompe el parse en idk21 durante el rolling y `qm rescan` registraria los
+    existentes como unusedN). El comando lista (dry run por defecto) los cloud-init
+    cuyo guest no existe en ningun nodo y que ninguna conf referencia, snapshots
+    incluidos; con --yes los libera con `pvesm free`, uno a uno, re-comprobando
+    antes de cada uno; sin poder leer /etc/pve sale con error y no lista nada.
+    Receta manual y causa en wiki/Known-Limitations.md.
+
+  * install.sh: detect_color_support ya no muere con `SSH_CLIENT: unbound
+    variable` cuando faltan TERM/SSH_* (set -u).
+
+  * Anotado sin codigo (wiki/Known-Limitations.md): un pool.dataset.create mas
+    lento que tn_broker_timeout puede dejar un zvol huerfano (sin verificar
+    contra idk21); un @vzdump y su clon dejados a mano hacen fallar vzdump con
+    EEXIST (sin verificar contra idk21); para DH-HMAC-CHAP generar la clave con
+    `nvme gen-dhchap-key`.
+
   * KNOWN ISSUE (preexistente desde idk21, NO corregido aqui): `qm rescan`
     global registra el disco de un clon enlazado como `unusedN` ademas de su
     `scsi0`, porque _list_images_iscsi lista el volid sin la base. Borrar ese
