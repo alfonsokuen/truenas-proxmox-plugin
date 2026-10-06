@@ -5276,6 +5276,10 @@ sub _is_snapshot_clone_zname {
     return index($zname, SNAPSHOT_CLONE_PREFIX) == 0;
 }
 
+# NOTE (idk22): this fork does NOT create the bare form; new cloud-init disks
+# keep the embedded-metadata volname (t/nvme/29-cloudinit-volname.t). The
+# predicate is kept so a bare "vm-<vmid>-cloudinit" volid still parses.
+#
 # Cloud-init disks must be named exactly "vm-<vmid>-cloudinit" with no
 # "vol-" prefix and no transport-metadata suffix (-lun<N> / -ns<uuid>) --
 # PVE core's drive_is_cloudinit() pattern-matches the volid and only
@@ -9849,9 +9853,10 @@ sub _alloc_image_iscsi {
 
     # 5) Return volname immediately — device discovery is deferred after lock release.
     # activate_volume handles authoritative device discovery before any VM uses the disk.
-    # Cloud-init disks (issue #84) must be named exactly "vm-<vmid>-cloudinit" with
-    # no metadata suffix, so PVE core recognizes and regenerates them on clone.
-    my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-lun$lun";
+    # Cloud-init disks keep the embedded-metadata volname like every other disk
+    # (upstream beta8 names them bare "vm-<vmid>-cloudinit", issue #84); see
+    # t/nvme/29-cloudinit-volname.t for why this fork does not.
+    my $volname = "vol-$zname-lun$lun";
 
     # Defer local I/O operations (iSCSI login, rescan, device polling) to run after CFS lock release
     my $deferred_scfg = $scfg;  # capture for closure
@@ -9964,9 +9969,10 @@ sub _alloc_image_nvme {
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: created namespace with UUID $device_uuid");
 
     # Return volname immediately — defer connect + device discovery.
-    # Cloud-init disks (issue #84) must be named exactly "vm-<vmid>-cloudinit" with
-    # no metadata suffix, so PVE core recognizes and regenerates them on clone.
-    my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-ns$device_uuid";
+    # Cloud-init disks keep the embedded-metadata volname like every other disk
+    # (upstream beta8 names them bare "vm-<vmid>-cloudinit", issue #84); see
+    # t/nvme/29-cloudinit-volname.t for why this fork does not.
+    my $volname = "vol-$zname-ns$device_uuid";
 
     my $deferred_scfg = $scfg;
     my $deferred_uuid = $device_uuid;
@@ -10796,9 +10802,8 @@ sub _list_images_iscsi {
             next MAPPING if !defined $owner || $owner != $vmid;
         }
 
-        # Compose plugin volname + volid. Cloud-init disks (issue #84) are
-        # named exactly "vm-<vmid>-cloudinit" with no metadata suffix.
-        my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-lun$lun";
+        # Compose plugin volname + volid (cloud-init disks included: t/nvme/29).
+        my $volname = "vol-$zname-lun$lun";
         my $volid   = "$storeid:$volname";
 
         # Honor explicit include filter
@@ -10962,10 +10967,9 @@ sub _list_images_nvme {
             next if !defined $owner || $owner != $vmid;
         }
 
-        # Compose volname using device_uuid. Cloud-init disks (issue #84) are
-        # named exactly "vm-<vmid>-cloudinit" with no metadata suffix.
+        # Compose volname using device_uuid (cloud-init disks included: t/nvme/29).
         my $device_uuid = $ns->{device_uuid} // next;
-        my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-ns$device_uuid";
+        my $volname = "vol-$zname-ns$device_uuid";
         my $volid = "$storeid:$volname";
 
         # Honor explicit include filter
