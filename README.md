@@ -89,6 +89,14 @@ apt-get update
 apt-get install -y truenas-proxmox-plugin
 ```
 
+> **Note:** The APT repository only serves **stable releases**.
+> Pre-release builds (`-alpha*`, `-beta*`, `-rc*`) are intentionally
+> excluded so that `apt upgrade` on a production cluster never pulls in
+> an unstable build. To install a beta — or any version newer than what
+> APT currently serves — use **Option 2** below with the matching tag,
+> or run `install.sh` interactively and choose **"Install specific
+> version"** from the menu.
+
 **Option 2: Direct .deb Installation**
 
 Download a release package and install it directly:
@@ -98,6 +106,12 @@ wget https://github.com/truenas/truenas-proxmox-plugin/releases/download/v<RELEA
 dpkg -i truenas-proxmox-plugin_<DEB_VERSION>_all.deb
 apt-get -f install -y
 ```
+
+The release page lists every build (stable and pre-release); the tag
+to use is the one shown in that release's title. Verify against the
+attached `SHA256SUMS` before installing. When a beta is later promoted
+to a stable release and published to the APT repo, `apt upgrade` will
+catch up to it on its own.
 
 **Option 3: Interactive Installer (Existing Workflow)**
 
