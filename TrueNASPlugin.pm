@@ -2921,7 +2921,14 @@ sub _assert_no_child_datasets {
         die "Cannot verify that dataset $full_ds has no child datasets (reading it failed: $err); "
           . "refusing to run a recursive delete. Retry once the TrueNAS API answers.\n";
     }
-    return if !$ds_info || !$ds_info->{children};
+    # Only a dataset object that SAYS it has no children (an empty list) is
+    # permission. undef, a scalar, or an object with no `children` key tells us
+    # nothing, and "nothing" must not unlock a recursive+force delete.
+    if (ref($ds_info) ne 'HASH' || ref($ds_info->{children}) ne 'ARRAY') {
+        die "Cannot verify that dataset $full_ds has no child datasets (the array answered "
+          . (ref($ds_info) eq 'HASH' ? "an object without a children list" : (defined $ds_info ? 'with something that is not a dataset' : 'with nothing'))
+          . "); refusing to run a recursive delete.\n";
+    }
     my @children = grep { ($_->{type} // '') ne 'SNAPSHOT' } @{$ds_info->{children}};
     return if !@children;
     my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
@@ -2963,6 +2970,13 @@ sub _confirm_dataset_gone {
         die "Cannot confirm $full_ds was deleted: the delete failed with "
           . "'$err' and the follow-up query failed with '$probe_err'. "
           . "Retry once the TrueNAS API answers.\n";
+    }
+    # No object AND no error is not an answer: absence is confirmed only by the
+    # array saying so (an ENOENT-class error from the dataset query).
+    if (!$probe_err) {
+        die "Cannot confirm $full_ds was deleted: the delete failed with '$err' and "
+          . "the follow-up query returned nothing at all, which is not the same as "
+          . "the dataset being gone.\n";
     }
     return 1;    # confirmed absent - genuinely idempotent
 }
@@ -3025,8 +3039,7 @@ sub _delete_dataset_with_retry {
             chomp(my $why = $err);
             my $ds_check = eval { _tn_dataset_get($scfg, $full_ds) };
             my $check_err = $@;
-            if (!$ds_check && $check_err
-                && _parse_dataset_error($check_err)->{type} eq 'not_found') {
+            if (!$ds_check && $check_err && _is_dataset_absent_error($check_err)) {
                 _log($scfg, 0, 'warning',
                     "[TrueNAS] Deletion of dataset $full_ds outlived its wait "
                   . "window but the dataset is gone - treating as success ($why)");

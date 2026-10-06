@@ -255,4 +255,38 @@ SKIP: {
         '  ...and rejects what the schema would reject');
 }
 
+# --- 11. third review round: "nothing" is not permission --------------------
+{
+    no strict 'refs'; no warnings 'redefine';
+    my $ret;
+    local *{"${PKG}::_tn_dataset_get"} = sub { $ret };
+    my $a = $PKG->can('_assert_no_child_datasets');
+    for my $case (['undef', undef], ['an object without children', { id => 'x' }], ['a scalar', 'x'],
+                  ['children not a list', { id => 'x', children => 'none' }]) {
+        $ret = $case->[1];
+        ok(!eval { $a->($scfg, 'tank/pve/vm-1-disk-0'); 1 }, "child check: $case->[0] -> refuses");
+    }
+    $ret = { id => 'x', children => [] };
+    ok(eval { $a->($scfg, 'tank/pve/vm-1-disk-0'); 1 }, '  ...an explicit empty children list is permission');
+    $ret = { id => 'x', children => [ { name => 'snap', type => 'SNAPSHOT' } ] };
+    ok(eval { $a->($scfg, 'tank/pve/vm-1-disk-0'); 1 }, '  ...snapshots alone do not block');
+}
+{
+    no strict 'refs'; no warnings 'redefine';
+    local *{"${PKG}::_tn_dataset_get"} = sub { return undef };     # answers, but with nothing, no error
+    my $err = do { eval { $PKG->can('_confirm_dataset_gone')->($scfg, 'tank/pve/vm-1-disk-0', 'boom'); 1 }; $@ };
+    like($err, qr/Cannot confirm/, 'confirm: an undefined answer with no exception is NOT confirmation');
+}
+{
+    no strict 'refs'; no warnings 'redefine';
+    # indeterminate branch: the wait timed out AND the follow-up says "Method does not exist"
+    local *{"${PKG}::_api_call_mutate"} = sub { die "Job timed out after 30 seconds\n" };
+    local *{"${PKG}::_tn_dataset_get"} = sub { die "[-32601] Method does not exist: pool.dataset.get_instance\n" };
+    my $ok = eval { $PKG->can('_delete_dataset_with_retry')->($scfg, 'tank/pve/vm-1-disk-0', 1); 1 };
+    ok(!$ok, 'indeterminate delete + a transport "Method does not exist" is NOT success');
+    local *{"${PKG}::_tn_dataset_get"} = sub { die "[ENOENT] InstanceNotFound: does not exist\n" };
+    ok(eval { $PKG->can('_delete_dataset_with_retry')->($scfg, 'tank/pve/vm-1-disk-0', 1); 1 },
+        '  ...while a real InstanceNotFound after the timeout is success');
+}
+
 done_testing;

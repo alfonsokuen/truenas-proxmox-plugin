@@ -58,6 +58,8 @@ my %fail;       # method => error string to throw
         return [ { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0' } ]
             if $method eq 'nvmet.namespace.query';
         return [] if $method eq 'nvmet.subsys.query';
+        # a real dataset object carries its (here empty) children list
+        return { id => 1, children => [] } if $method eq 'pool.dataset.get_instance';
         return { id => 1 };
     };
     *{"${PKG}::_api_call_mutate"} = sub { goto &{"${PKG}::_api_call"} };

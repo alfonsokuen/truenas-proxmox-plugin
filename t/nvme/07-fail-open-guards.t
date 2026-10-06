@@ -94,7 +94,7 @@ my $wait_result;  # what the stubbed job wait reports; default is a timeout
         # The clone lookup: default is a well-formed empty answer, i.e. a
         # base image with no clones. Cases override it deliberately.
         return [] if $method eq 'pool.dataset.query';
-        return { id => 'tank/pve/some-dataset', type => 'VOLUME' }
+        return { id => 'tank/pve/some-dataset', type => 'VOLUME', children => [] }
             if $method eq 'pool.dataset.get_instance';
         return { id => 1 };
     };
