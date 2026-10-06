@@ -65,10 +65,10 @@ detect_color_support() {
     fi
 
     # Check TERM environment variable for explicit color capability
-    if [[ "$TERM" =~ 256color ]]; then
+    if [[ "${TERM:-}" =~ 256color ]]; then
         echo "256"
         return
-    elif [[ "$TERM" =~ (xterm-color|.*-256|xterm-16color) ]]; then
+    elif [[ "${TERM:-}" =~ (xterm-color|.*-256|xterm-16color) ]]; then
         echo "256"
         return
     fi
@@ -86,9 +86,9 @@ detect_color_support() {
     else
         # Enhanced fallback logic
         # SSH sessions typically support 256 colors
-        if [[ -n "$SSH_CLIENT" || -n "$SSH_TTY" || -n "$SSH_CONNECTION" ]]; then
+        if [[ -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" || -n "${SSH_CONNECTION:-}" ]]; then
             echo "256"
-        elif [[ "$TERM" =~ (xterm|screen|tmux|rxvt|linux|ansi|vt) ]]; then
+        elif [[ "${TERM:-}" =~ (xterm|screen|tmux|rxvt|linux|ansi|vt) ]]; then
             echo "16"
         else
             # Check if we have a TTY - if so, assume basic colors
