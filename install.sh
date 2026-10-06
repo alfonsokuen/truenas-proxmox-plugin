@@ -1087,6 +1087,17 @@ detect_apt_suite() {
 }
 
 apt_bootstrap_install() {
+    # On a node that runs the fork's build this would add upstream's repo and
+    # signing key next to ours and let apt offer upstream's packages, whose
+    # plugin lacks the fork's secrets handling. The fork's repo and key are
+    # installed by install-idk.sh; refuse here, write nothing.
+    if is_idk_fork_install || [[ -f "$APT_SOURCES_PATH_IDK" ]]; then
+        error "This node runs the IDK fork build: not adding upstream's APT repository or key."
+        info "Install or update with install-idk.sh (the fork's own repository)."
+        log "WARN" "apt_bootstrap_install refused on a fork node"
+        return 1
+    fi
+
     local suite
     if ! suite=$(detect_apt_suite); then
         return 1
@@ -2053,12 +2064,13 @@ install_plugin_on_remote_node_via_apt() {
         set -e
         pkg="truenas-proxmox-plugin"
         src="/etc/apt/sources.list.d/truenas-proxmox-plugin.sources"
+        src_idk="/etc/apt/sources.list.d/truenas-proxmox-plugin-idk.sources"
         pmf="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
         if ! dpkg -s "$pkg" >/dev/null 2>&1; then
             echo "node is not dpkg-managed; refusing raw cluster pull"
             exit 1
         fi
-        if [[ ! -f "$src" ]]; then
+        if [[ ! -f "$src" && ! -f "$src_idk" ]]; then
             echo "no plugin APT source configured on node"
             exit 1
         fi
