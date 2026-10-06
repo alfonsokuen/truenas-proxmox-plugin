@@ -60,7 +60,7 @@ use JSON::PP qw(encode_json);
 my $PLUGIN = File::Spec->rel2abs("$FindBin::Bin/../../TrueNASPlugin.pm");
 plan skip_all => "TrueNASPlugin.pm not found at $PLUGIN" unless -f $PLUGIN;
 
-# Same ordering rationale as t/nvme/20-snapshot-import-config.t: load the
+# Same ordering rationale as t/import-snapshots/02-snapshot-import-config.t: load the
 # real PVE::Storage first (if present) so a node with the plugin already
 # installed under /usr/share/perl5/PVE/Storage/Custom does not clobber the
 # file under test.

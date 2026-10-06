@@ -167,10 +167,10 @@ Both are supported. Pick one per storage entry via `tn_transport`.
 | Throughput on 25 Gb+ links | Good, may need multipath | Better with high queue count |
 | Multipath | Standard `multipath-tools` (dm-mp) | Native NVMe multipath (`nvme-cli`) |
 | Auth | CHAP (optional) | DH-HMAC-CHAP (optional) |
-| TrueNAS support | All 25.x | Requires 25.04+ nvmet |
+| TrueNAS support | 25.10 or later | 25.10 or later; TN 25.10.4 is unsafe pending nvmet MDTS fix (GitHub #96) |
 | Namespace identity | LUN number per extent | NGUID per namespace |
 | Snapshot handling | Same via `pool.snapshot.*` | Same via `pool.snapshot.*` |
-| Field maturity | Very mature | Newer; use TrueNAS 25.10 stable or later |
+| Field maturity | Very mature | Newer; shares 25.10 floor with iSCSI, but TN 25.10.4 ships without the `nvmet` MDTS kernel patch (GitHub #96) and can silently corrupt data under NVMe/TCP — until the patch is in a TN point release, use iSCSI for production |
 
 Default to **iSCSI** for most deployments. Move to **NVMe/TCP** when you
 have measurably latency-sensitive workloads and a 25 Gb+ storage fabric.
@@ -346,6 +346,32 @@ What that means afterwards, and why it is opt-in:
   treated exactly as a VM's disks. Bind mounts and device mountpoints are
   ignored (they are not storage volumes); an `mpN` on another storage is
   refused.
+### Snapshots taken on TrueNAS — consistency
+
+Snapshots created outside PVE (periodic snapshot tasks, replication
+targets, manual `zfs snapshot`) are **crash-consistent**, not
+application-consistent. TrueNAS does not know a guest is running on
+the zvol, so there is no guest-agent `fs-freeze`: rolling back to one
+is the guest losing power at that instant. Journaling filesystems
+normally come back clean; databases may need their own recovery.
+When you need a known-good state, take a PVE snapshot with the QEMU
+guest agent enabled (`qm snapshot`) and treat imported snapshots as
+a safety net.
+
+A subtler symptom: PVE only rolls back to the newest snapshot in the
+chain, so a periodic TrueNAS snapshot newer than your deliberate PVE
+snapshot puts itself in the way of that rollback — whether or not
+you import it. `qm rollback` fails with `is not most recent
+snapshot` with nothing in the PVE UI to explain why. Options:
+
+- Adopt periodic snapshots on purpose with
+  `truenas-proxmox-manage import-snapshots <vmid> --match REGEX` and
+  roll back to the deliberate one you want. See [Tools.md](Tools.md).
+- Keep periodic snapshot tasks off the zvols that back PVE guests
+  when you rely on PVE-native rollback.
+
+Both options are legitimate; pick the one that matches how you use
+snapshots.
 
 ---
 

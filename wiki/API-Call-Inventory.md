@@ -6,7 +6,7 @@ surface. Compare against TrueNAS release notes and
 `core.get_methods` output to catch API changes that will break the
 driver.
 
-Generated from alpha branch, plugin version 2.1.21~alpha2+.
+Generated from alpha branch, plugin version 2.1.23~beta7+.
 See "Regeneration" at the bottom for the exact scan procedure.
 
 ---

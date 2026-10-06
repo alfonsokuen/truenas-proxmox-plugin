@@ -73,8 +73,12 @@ sub run_free {
     @calls = ();
     # ($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata)
     my $ok = eval {
-        $free->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-lun1',
+        # The dataset delete is deferred to the cleanup worker the free
+        # returns (PVE forks it after releasing the storage lock); run it
+        # here the way PVE would.
+        my $worker = $free->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-lun1',
                 'vm-101-disk-0', 'tank/pve/vm-101-disk-0', undef);
+        $worker->('UPID:test') if ref($worker) eq 'CODE';
         1;
     };
     return ($ok, $@, [@calls]);

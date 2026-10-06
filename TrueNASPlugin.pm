@@ -3,12 +3,12 @@ use v5.36;
 use strict;
 use warnings;
 
-# Plugin Version. Base upstream real: 2.1.23~alpha1 -- el "2.1.24" que este
+# Plugin Version. Base upstream real: 2.1.23~beta8 -- el "2.1.24" que este
 # fork declaro hasta idk11 NUNCA existio en upstream y ordenaba por ENCIMA de
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23~alpha1+idk21';
+our $VERSION = '2.1.23~beta8+idk22';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
@@ -55,6 +55,18 @@ my $CACHE_TTL = 60; # seconds
 # capacity in the GUI can lag by up to this long, which is what every other
 # storage plugin does.
 my $STATUS_CAPACITY_TTL_S = 30;
+# On-disk (/run/truenas-plugin/status-<key>) capacity-cache TTL. Shared
+# across processes so every `pvesm status` doesn't pay the full
+# pool.dataset.get_instance round-trip (issue #106). Kept short --
+# 15 s -- because tests (disk_discard.pl fill/observe) and users
+# expect `pvesm status` to reflect a ~30 s in-guest write, and a
+# longer TTL masks that growth. 15 s is still 3-30x fewer TN calls
+# than the 10 s in-process cache alone under the cross-node upload
+# probe pattern that motivated #106 (PVE::API2::Storage::Status::
+# upload's synchronous `ssh peer pvesm status --storage local`
+# always misses the in-process cache -- burst probes complete in
+# well under one second and reuse the same on-disk stamp).
+my $STATUS_CAPACITY_STAMP_TTL_S = 15;
 my $TARGET_VISIBLE_SKIP_TTL_S = 60;
 
 # Per-host cache for preflight check results
@@ -72,6 +84,9 @@ my %_status_capacity_cache_stats = (
     hit => 0,
     miss => 0,
     invalidate => 0,
+    stamp_hit => 0,      # on-disk stamp fed a value across processes
+    stamp_write => 0,    # freshly-fetched value written to on-disk stamp
+    stamp_fail => 0,     # on-disk stamp read/write errored (best-effort)
 );
 
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
@@ -110,12 +125,19 @@ use constant {
 
     # Operation delays (seconds)
     DEVICE_SETTLE_DELAY_S     => 1,        # post-connection/logout stabilization
+    # NOTE: the following cleanup-timeout constants were tightened after
+    # test_run6/truenas-2026-08-13 showed vm_disk_buses hitting the 180 s
+    # test-framework limit under cluster load. free_image was eating
+    # 20-50 s per destroy (device-verify + dataset-delete-with-retries) and
+    # 5 bus subtests * 30 s each blew past 180 s. Tightened defaults get
+    # normal-path destroys back to sub-15 s; if TN legitimately needs more
+    # for a specific dataset the retries still cover it.
     JOB_POLL_DELAY_S          => 1,        # job status polling interval
 
     # Job timeouts (seconds)
     SNAPSHOT_DELETE_TIMEOUT_S        => 15,  # snapshot deletion job timeout
-    DATASET_DELETE_TIMEOUT_S         => 30,  # dataset deletion job timeout (increased for reliability)
-    DEVICE_CLEANUP_VERIFY_TIMEOUT_S  => 5,   # device cleanup verification timeout
+    DATASET_DELETE_TIMEOUT_S         => 15,  # dataset deletion job timeout (per-attempt; retries handle transient TN busy)
+    DEVICE_CLEANUP_VERIFY_TIMEOUT_S  => 2,   # device cleanup verification timeout (normal path ~200ms)
     DATASET_DELETE_RETRY_COUNT       => 3,   # max retries for dataset deletion on "busy" errors
 
     # NVMe-oF request size cap (KiB). See _nvme_cap_max_io().
@@ -170,6 +192,15 @@ sub _clear_cache {
         %_preflight_last_ok = ();
         %_target_visible_last_ok = ();
     }
+    # NOTE: do NOT unlink the /run/truenas-plugin/preflight-<key> stamp
+    # here. _clear_cache runs after every extent/targetextent/zvol
+    # mutation, which is completely orthogonal to whether the preflight
+    # signals (pool ONLINE, service RUNNING, dataset exists, space free)
+    # are still valid. Wiping the stamp per-mutation defeats the entire
+    # cross-worker cache and forces the next alloc to re-run the 4 TN
+    # API calls. The stamp expires by TTL (300 s) or by tmpfs reset on
+    # reboot -- that's the correct invalidation surface for preflight
+    # state, not "we changed an extent."
     # Keep portal sync cache aligned with the same host scoping
     if ($storage_id) {
         delete $_portal_sync_last_ok{$storage_id};
@@ -265,7 +296,21 @@ sub _is_connection_error {
     # That bug existed in fe06ea1 and caused every framing/EPIPE failure
     # to be misclassified as non-retryable, which in turn cascaded into
     # preflight storms (see test_run3/truenas-2026-06-26).
-    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|ssl.*error|connection.*failed|WS read|WS write|WS len|WS payload|WebSocket.*closed/i;
+    #
+    # `WebSocket.*closed` was previously in the pattern and caused a
+    # different misclassification: middlewared's JSON-RPC error payloads
+    # include Python object reprs like `RpcWebSocketApp object at 0x...`
+    # followed later by `EventLoop ... closed=False`, so any error whose
+    # trace mentions those class names + closed=False (e.g. a benign
+    # "dataset already exists" from pool.dataset.create) matched
+    # WebSocket.*closed and was retried 3 times before finally dying with
+    # "Max retries (3) exhausted", wasting seconds on the shared cluster
+    # storage lock (cluster_test_run 2026-08-17 3-node run). The WS-
+    # specific broker patterns ('WS read', 'WS write', 'WS len',
+    # 'WS payload') and the generic timeout / connection reset alternatives
+    # already cover every real WS-close failure our broker or upstream
+    # emits, so the WebSocket.*closed slot is gone.
+    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|ssl.*error|connection.*failed|WS read|WS write|WS len|WS payload/i;
 }
 
 # TrueNAS validates the `disk` / `device_path` field on iscsi.extent.create
@@ -300,16 +345,160 @@ sub _is_extent_name_conflict_error {
     return $error =~ /iscsi_extent_create\.name.*must be unique/i;
 }
 
+# Historical create_base extent-rename gap: create_base renamed a zvol
+# vm-<vmid>-disk-N -> base-<vmid>-disk-N and rewrote extent.disk, but
+# did NOT rename the extent itself. The vm-<vmid>-disk-N-<hash> name
+# slot on TN stayed owned by the (now-base) extent. Later VM allocs at
+# the same VMID hash to the same extent name and get
+# "iscsi_extent_create.name: Extent name must be unique". Fix B looks
+# up by name, sees the disk field differs, and correctly refuses to
+# reuse (it can't safely redirect this VM's disk to a base zvol).
+#
+# This helper repairs the stale name in place when the shape matches:
+# a same-name extent whose disk is zvol/<dataset>/base-<vmid>-disk-N.
+# Renaming the extent to its proper base-*-<hash> name frees the
+# vm-*-<hash> slot so the caller's next create can succeed. The rename
+# is bookkeeping-only from the initiator side: extent_id, targetextent
+# mapping, and naa/serial identifiers are all preserved. Nothing on
+# the wire changes; only the TN-side extent name is corrected.
+#
+# Returns 1 if the stale extent was renamed (caller should retry the
+# create). Returns 0 if the shape does not match (genuine hash-slot
+# collision -- caller should give up) or the rename call itself failed.
+sub _iscsi_extent_recover_stale_base_name {
+    my ($scfg, $stale_extent, $expected_zvol_path) = @_;
+    my $stale_disk = $stale_extent->{disk} // '';
+    my ($stale_zname) = $stale_disk =~ m{/(base-\d+-disk-\d+)$};
+    return 0 unless $stale_zname;
+    my $proper_name = _generate_extent_name($scfg, $stale_zname);
+    return 0 if $proper_name eq ($stale_extent->{name} // '');
+    _log($scfg, 0, 'info',
+        "[TrueNAS] iSCSI extent id=$stale_extent->{id} name=" .
+        ($stale_extent->{name} // '<undef>') .
+        " occupies our name slot for $expected_zvol_path but its disk is a " .
+        "base zvol ($stale_disk); renaming stale extent to $proper_name " .
+        "(create_base extent-rename recovery)");
+    eval {
+        _api_call_mutate($scfg, 'iscsi.extent.update',
+            [ $stale_extent->{id}, { name => $proper_name } ]);
+    };
+    if ($@) {
+        _log($scfg, 0, 'err',
+            "[TrueNAS] iSCSI stale-extent rename id=$stale_extent->{id} -> " .
+            "$proper_name failed: $@");
+        return 0;
+    }
+    _clear_cache(_cache_host_key($scfg));
+    return 1;
+}
+
 sub _is_not_found_error {
     my ($error) = @_;
     return 0 if !defined $error;
     return $error =~ /404 Not Found|ENOENT|InstanceNotFound|does not exist|not found/i;
 }
 
+# pool.dataset.rename EEXIST classifier. TN returns:
+#   [EEXIST] zfs.resource.rename: 'tank/<pool>/base-<vmid>-disk-N' already exists
+# When create_base's rename hits this, it usually means a prior template of
+# the same VMID left the base dataset on TN. If that base is an orphan (no
+# live clones, no children), the plugin can safely delete it and retry.
+# See _dataset_orphan_check_and_delete and project_create_base_eexist_gap.
+sub _is_dataset_already_exists_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return ($error =~ /ZFSPathAlreadyExistsException|EEXIST/i)
+        && ($error =~ /zfs\.resource\.rename|pool\.dataset\.rename/i)
+        && ($error =~ /already exists/i);
+}
+
+# Check whether $target_dataset is an orphan on TN (no non-snapshot children,
+# no linked clones deriving from its @__base__ snapshot). If it is, delete it
+# and return 1 so the caller can retry the operation that originally hit the
+# EEXIST. Return 0 if the dataset has live children/clones (unsafe to remove),
+# or if the query/delete itself failed.
+sub _dataset_orphan_check_and_delete {
+    my ($scfg, $target_dataset) = @_;
+    my $query = eval {
+        _api_call($scfg, 'pool.dataset.query',
+            [ [[ 'id', '=', $target_dataset ]] ]);
+    };
+    if (my $err = $@) {
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] _dataset_orphan_check_and_delete: query $target_dataset failed: $err");
+        return 0;
+    }
+    my $target = $query && ref($query) eq 'ARRAY' ? $query->[0] : undef;
+    if (!$target) {
+        # Dataset is gone since the EEXIST (another node just cleaned it).
+        # Signal caller to retry.
+        _log($scfg, 0, 'info',
+            "[TrueNAS] $target_dataset gone since the EEXIST; caller can retry");
+        return 1;
+    }
+    my @children = grep {
+        ($_->{type} // '') ne 'SNAPSHOT'
+    } @{ $target->{children} // [] };
+    if (@children) {
+        my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
+        _log($scfg, 0, 'err',
+            "[TrueNAS] $target_dataset has child dataset(s) [$child_names]; " .
+            "cannot delete for orphan recovery");
+        return 0;
+    }
+    # Check for linked clones deriving from the @__base__ snapshot. Any dataset
+    # whose origin.parsed points at $target_dataset@__base__ is a live clone
+    # and destroying the base would break it.
+    my $snap_clones = eval {
+        _api_call($scfg, 'pool.dataset.query',
+            [ [[ 'origin.parsed', '=', "${target_dataset}\@__base__" ]],
+              { select => [ 'id' ] } ]);
+    };
+    # Fail CLOSED: if the clone query itself failed we do not know whether the
+    # base has linked clones, and the delete below is recursive+force. Upstream
+    # only blocked when the query succeeded and found clones, so an erroring
+    # query fell through to destroying a base that live clones may derive from.
+    if (my $qerr = $@) {
+        _log($scfg, 0, 'err',
+            "[TrueNAS] _dataset_orphan_check_and_delete: clone query for " .
+            "$target_dataset failed ($qerr); not deleting");
+        return 0;
+    }
+    if ($snap_clones && ref($snap_clones) eq 'ARRAY' && @$snap_clones) {
+        my $clone_names = join(', ', map { $_->{id} // '<undef>' } @$snap_clones);
+        _log($scfg, 0, 'err',
+            "[TrueNAS] $target_dataset has linked clone(s) [$clone_names] " .
+            "deriving from \@__base__; cannot delete for orphan recovery");
+        return 0;
+    }
+    _log($scfg, 0, 'info',
+        "[TrueNAS] deleting orphaned $target_dataset (no children, no clones) " .
+        "to allow retry of the operation that hit EEXIST");
+    eval {
+        _api_call_mutate($scfg, 'pool.dataset.delete',
+            [ $target_dataset, { recursive => JSON::PP::true, force => JSON::PP::true } ]);
+    };
+    if (my $err = $@) {
+        # A concurrent cleanup may have raced us here -- that's fine, the
+        # ENOENT after our query is exactly what the caller wants.
+        return 1 if $err =~ /does not exist|ENOENT|InstanceNotFound/i;
+        _log($scfg, 0, 'err',
+            "[TrueNAS] delete of orphaned $target_dataset failed: $err");
+        return 0;
+    }
+    return 1;
+}
+
 sub _is_auth_error {
     my ($error) = @_;
     return 0 if !defined $error;
-    return $error =~ /401 Unauthorized|403 Forbidden|authentication.*failed|unauthorized|forbidden|invalid.*key/i;
+    # ENOTAUTHENTICATED / "Not authenticated" surface from TrueNAS 25.10+
+    # after the middleware silently expires an API-key session at 30
+    # days (AA_LEVEL1.max_session_age). Naming them here makes the
+    # classification correct in retry/log paths even though the broker
+    # liveness check (auth.me, issue #98) is the primary place the
+    # condition is detected and handled.
+    return $error =~ /401 Unauthorized|403 Forbidden|authentication.*failed|unauthorized|forbidden|invalid.*key|ENOTAUTHENTICATED|Not authenticated/i;
 }
 
 # What a failed JSON-RPC call dies with. middlewared answers "Method call
@@ -575,6 +764,7 @@ sub plugindata {
             tn_api_retry_max tn_api_retry_delay tn_status_budget_s
             tn_status_probe_backoff_s tn_nvme_max_io_kb tn_op_budget_s
             tn_api_budget_s tn_broker_timeout tn_storage_lock_timeout
+            tn_use_cluster_lock
             tn_device_ready_retries tn_nr_io_queues tn_nvme_ctrl_loss_tmo
             tn_nvme_reconnect_delay tn_nvme_keep_alive_tmo
         ) },
@@ -604,8 +794,8 @@ sub properties {
         # Transport & connection
         tn_api_host => {
             title => 'API Host',
-            description => "TrueNAS hostname or IP.",
-            type => 'string', format => 'pve-storage-server',
+            description => "TrueNAS hostname or IP (IPv6 literals must be bracketed, e.g. [fd00:1::1]).",
+            type => 'string', format => 'pve-storage-portal-dns',
         },
         tn_api_key => {
             title => 'API Key',
@@ -758,7 +948,12 @@ sub properties {
                 . "the plugin registers each node's host NQN (with DH-HMAC-CHAP keys if "
                 . "tn_nvme_dhchap_secret / tn_nvme_dhchap_ctrl_secret are set) on the "
                 . "subsystem and sets allow_any_host=false. Required for DHCHAP auth to "
-                . "actually be enforced by the target.",
+                . "actually be enforced by the target. Caveats: (a) on TrueNAS 26.0.0-BETA.2 a "
+                . "freshly-created subsystem with allow_any_host=false and an empty allow-list "
+                . "is not rendered to the kernel configfs at all, so keep 1 until the "
+                . "allow-list is populated; (b) on 25.10.x, allow_any_host=1 combined with a "
+                . "populated allowed_hosts aborts the configfs render (upstream issue #90): "
+                . "set this to 0 in that case.",
             type => 'boolean',
             optional => 1,
             default => 1,
@@ -885,13 +1080,25 @@ sub properties {
         tn_storage_lock_timeout => {
             title => 'Storage Lock Timeout (s)',
             description => "Cluster lock timeout in seconds for storage operations. " .
-                          "Increase for parallel bulk provisioning. Default: 120.",
+                          "Increase for parallel bulk provisioning. Default: 120. " .
+                          "Only relevant while tn_use_cluster_lock is 1 (the default).",
             type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 600,
+        },
+        tn_use_cluster_lock => {
+            title => 'Serialize With Cluster Lock',
+            description => "Serialize storage operations across nodes via the PVE " .
+                          "CFS cluster lock. Default: 1 (this fork always takes the " .
+                          "lock, bounded by tn_storage_lock_timeout and tn_op_budget_s). " .
+                          "Upstream's default is 0 (bypass: TrueNAS' middleware already " .
+                          "serializes conflicting mutations, and the queue wait for the " .
+                          "CFS lock under multi-node load can push an alloc past " .
+                          "pveproxy's 60 s ceiling). Set 0 only to opt into that.",
+            type => 'boolean', optional => 1, default => 1,
         },
         tn_device_ready_retries => {
             title => 'Device Ready Retries',
             description => "Number of 100ms retries waiting for a block device to appear after connect.",
-            type => 'integer', optional => 1, default => 200, minimum => 0, maximum => 600,
+            type => 'integer', optional => 1, default => 600, minimum => 0, maximum => 1200,
         },
         tn_nr_io_queues => {
             title => 'NVMe I/O Queues',
@@ -1011,6 +1218,7 @@ sub options {
 
         # Concurrency
         tn_storage_lock_timeout => { optional => 1 },
+        tn_use_cluster_lock => { optional => 1 },
 
         # Device readiness
         tn_device_ready_retries => { optional => 1 },
@@ -1122,6 +1330,10 @@ sub check_config {
     if (defined $opts->{tn_api_retry_delay}) {
         die "tn_api_retry_delay must be between 0.1 and 60 seconds (got $opts->{tn_api_retry_delay})\n"
             if $opts->{tn_api_retry_delay} < 0.1 || $opts->{tn_api_retry_delay} > 60;
+    }
+    if (defined $opts->{tn_broker_timeout}) {
+        die "tn_broker_timeout must be between 5 and 300 seconds (got $opts->{tn_broker_timeout})\n"
+            if $opts->{tn_broker_timeout} < 5 || $opts->{tn_broker_timeout} > 300;
     }
 
     # Validate dataset name follows ZFS naming conventions
@@ -1791,8 +2003,12 @@ sub _ws_defaults($scfg) {
 sub _ws_open($scfg) {
     my ($scheme, $port) = _ws_defaults($scfg);
     my $host = $scfg->{tn_api_host};
+    # Normalize bare IPv6 literals to bracketed form (DNS names/IPv4 never contain ':').
+    # Keeps PeerHost/SNI-strip/Host-header all working from the same unambiguous form.
+    $host = "[$host]" if $host =~ /:/ && $host !~ /^\[/;
     my $peer = ($scfg->{tn_prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
+    (my $sni = $host) =~ s/^\[|\]$//g; # SNI/cert-name matching must not include IPv6 brackets
 
     my $sock;
     if ($scheme eq 'wss') {
@@ -1800,7 +2016,7 @@ sub _ws_open($scfg) {
             PeerHost => $peer,
             PeerPort => $port,
             SSL_verify_mode => $scfg->{tn_api_insecure} ? 0x00 : 0x02,
-            SSL_hostname    => $host,
+            SSL_hostname    => $sni,
             Timeout => 15,
         ) or die "WebSocket secure connection failed (wss://): $SSL_ERROR\n  Ensure TrueNAS 25.10+ is running and WebSocket service is enabled.\n";
     } else {
@@ -2677,6 +2893,31 @@ sub _parse_dataset_error {
     };
 }
 
+# A delete that fails with "does not exist" is only idempotent when the dataset
+# really is gone. That phrase matches anywhere in free text, and a transport
+# failure carries it for reasons unrelated to the dataset: a JSON-RPC
+# "-32601 Method does not exist" is enough, and so is whatever the broker
+# reports when it dies mid-call. Measured: kill the broker 150 ms into
+# `pvesm free` and the old branch swallowed the failure - exit status 0, zvol
+# still on the array, namespace still exported. A delete that reports success
+# while the volume is still there is worse than one that fails, because nothing
+# will ever come back to it. So ask the array; die unless it confirms absence.
+sub _confirm_dataset_gone {
+    my ($scfg, $full_ds, $err) = @_;
+    my $still_there = eval { _tn_dataset_get($scfg, $full_ds) };
+    my $probe_err = $@;
+    if ($still_there) {
+        die "Refusing to report success for $full_ds: the delete failed "
+          . "with '$err', but the dataset is still on the array.\n";
+    }
+    if ($probe_err && $probe_err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+        die "Cannot confirm $full_ds was deleted: the delete failed with "
+          . "'$err' and the follow-up query failed with '$probe_err'. "
+          . "Retry once the TrueNAS API answers.\n";
+    }
+    return 1;    # confirmed absent - genuinely idempotent
+}
+
 # Helper function to delete dataset with retry logic on "busy" errors
 sub _delete_dataset_with_retry {
     my ($scfg, $full_ds, $max_retries) = @_;
@@ -2981,6 +3222,36 @@ sub _tn_extents($scfg) {
 
 sub _tn_snapshots($scfg) {
     return _api_call($scfg, 'pool.snapshot.query', []);
+}
+
+# ---------- Narrow-query helpers ----------
+# The full-list _tn_extents / _tn_targetextents scans above serialize every
+# extent / mapping on the TN side and pull them back over the wire, which
+# scales linearly with total volume count on the array. Under concurrent
+# multi-node alloc/free load the cache is invalidated on every mutation, so
+# hot paths that only need one row (find-my-zvol, look-up-by-name,
+# resolve-my-mapping) were paying the full-list cost each time -- observed
+# as multi-second lock hold in cluster_test_run 2026-08-14 3-node runs where
+# vm_disk_buses and disk_thin_discard hit the pveproxy 60 s / test-suite
+# 180 s ceilings. The narrow helpers push the filter to middlewared using
+# TN's query-filter syntax (see t/rate-limit/11-alloc-extent-namespace-reuse.t)
+# so the response carries at most the row(s) we asked for. They deliberately
+# do NOT cache: callers that need a fresh answer (post-mutation lookups,
+# Fix B name-conflict recovery, targetextent stale-cache recheck) all fell
+# into the invalidate-and-refetch pattern anyway.
+sub _tn_extent_query_by_disk($scfg, $zvol_path) {
+    return _api_call($scfg, 'iscsi.extent.query', [ [ [ 'disk', '=', $zvol_path ] ] ]);
+}
+sub _tn_extent_query_by_name($scfg, $name) {
+    return _api_call($scfg, 'iscsi.extent.query', [ [ [ 'name', '=', $name ] ] ]);
+}
+sub _tn_targetextent_query_by_target_extent($scfg, $target_id, $extent_id) {
+    return _api_call($scfg, 'iscsi.targetextent.query',
+        [ [ [ 'target', '=', $target_id ], [ 'extent', '=', $extent_id ] ] ]);
+}
+sub _tn_targetextent_query_by_extent($scfg, $extent_id) {
+    return _api_call($scfg, 'iscsi.targetextent.query',
+        [ [ [ 'extent', '=', $extent_id ] ] ]);
 }
 
 sub _tn_global($scfg) {
@@ -3815,7 +4086,7 @@ sub _tn_snapshot_query_datasets($scfg, $fulls) {
 }
 
 # Decide what may be imported. Pure: no I/O, no PVE, no TrueNAS - which is why
-# every rule below is testable offline in t/nvme/19-snapshot-import-plan.t.
+# every rule below is testable offline in t/import-snapshots/01-snapshot-import-plan.t.
 #
 #   $existing - $conf->{snapshots}
 #   $by_volid - { <volid> => { <snapname> => { ts, txg } } } from the array
@@ -4890,12 +5161,18 @@ sub _find_free_disk_name {
     my $dataset = $scfg->{tn_dataset};
     my $prefix = "vm-$vmid-disk-";
 
-    # Single query: fetch all children of the parent dataset matching our VM's prefix
+    # Single query: fetch all children of the parent dataset matching either
+    # the live (vm-) or templated (base-) disk-name prefix for this VMID.
+    # Templated disks are excluded from consideration here just as much as
+    # live ones do -- otherwise moving a second disk of the same template to
+    # this storage picks an index already used by a previously-moved
+    # (and by-then-renamed-to-base-) disk, and the later create_base rename
+    # collides with it (issue #85).
     # Escape regex special chars in dataset path (TrueNAS uses Python regex)
     (my $dataset_escaped = $dataset) =~ s/([.+*?^()\[\]{}|\\])/\\$1/g;
     my $children = eval {
         _api_call($scfg, 'pool.dataset.query', [
-            [["pool", "=", (split('/', $dataset))[0]], ["name", "~", "^${dataset_escaped}/${prefix}"]]
+            [["pool", "=", (split('/', $dataset))[0]], ["name", "~", "^${dataset_escaped}/(?:vm|base)-${vmid}-disk-"]]
         ]);
     };
     # Fail closed, for the same reason the linked-clone guard does. A query
@@ -4921,9 +5198,8 @@ sub _find_free_disk_name {
 
     for (my $n = 0; $n < 1000; $n++) {
         my $candidate = "${prefix}$n";
-        if (!$existing{"$dataset/$candidate"}) {
-            return $candidate;
-        }
+        next if $existing{"$dataset/${prefix}$n"} || $existing{"$dataset/base-$vmid-disk-$n"};
+        return $candidate;
     }
 
     die sprintf(
@@ -5000,19 +5276,36 @@ sub _is_snapshot_clone_zname {
     return index($zname, SNAPSHOT_CLONE_PREFIX) == 0;
 }
 
+# Cloud-init disks must be named exactly "vm-<vmid>-cloudinit" with no
+# "vol-" prefix and no transport-metadata suffix (-lun<N> / -ns<uuid>) --
+# PVE core's drive_is_cloudinit() pattern-matches the volid and only
+# regenerates cloud-init drives on clone/template if it recognizes this
+# exact form (issue #84). Because the name can't carry embedded metadata,
+# these volumes resolve their transport device dynamically by zvol path
+# at path()/activate_volume time instead of from the volname.
+sub _is_cloudinit_zname {
+    my ($zname) = @_;
+    return $zname =~ /^vm-\d+-cloudinit$/;
+}
+
 # Resolve an iSCSI extent by its disk (zvol) path instead of by name.
 # Returns the first matching extent hashref, or undef if none found.
 sub _resolve_extent_by_disk($scfg, $zname) {
     my $zvol_path = "zvol/" . $scfg->{tn_dataset} . "/" . $zname;
-    my $extents = _tn_extents($scfg) // [];
-    my ($match) = grep { ($_->{disk} // '') eq $zvol_path } @$extents;
-    return $match;
+    my $matches = _tn_extent_query_by_disk($scfg, $zvol_path) // [];
+    return $matches->[0];
 }
 
 sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
     my $zvol_path = "zvol/$full";
+    my $submitted_name = $extent_name // $zname;
     my $payload = {
-        name => $extent_name // $zname, type => 'DISK', disk => $zvol_path, insecure_tpc => JSON::PP::true,
+        name => $submitted_name, type => 'DISK', disk => $zvol_path, insecure_tpc => JSON::PP::true,
+        # No blocksize/pblocksize here on purpose (upstream beta8 sets 4096 for
+        # QEMU 10.1's alignment check, and we do that for NEW disks in
+        # _alloc_image_iscsi only). This helper exposes zvols that already hold
+        # data (snapshot clones, weights): re-presenting a 512-byte-sector disk
+        # as 4096 moves every LBA and makes its GPT/filesystem unreadable.
     };
     # Zvol-visibility retry: TN validates iscsi.extent.create by stat'ing
     # /dev/zvol/<ds>; right after pool.snapshot.clone or pool.dataset.create
@@ -5032,17 +5325,41 @@ sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
         select(undef, undef, undef, 0.2);
     }
     # Fix B: post-hoc reuse on unique-name conflict. See classifier
-    # comment on _is_extent_name_conflict_error above.
+    # comment on _is_extent_name_conflict_error above. Look up by NAME
+    # (exact known value); reuse only when disk field matches ours; log
+    # loudly at level 0 if TN has a same-named extent with a different
+    # disk field.
     if ($err && _is_extent_name_conflict_error($err)) {
         _clear_cache(_cache_host_key($scfg));
-        my $extents_after = _tn_extents($scfg) // [];
-        my ($hit) = grep { ($_->{disk} // '') eq $zvol_path } @$extents_after;
-        if ($hit) {
-            _log($scfg, 1, 'info',
-                "[TrueNAS] _tn_extent_create: name-conflict resolved by reuse " .
-                "id=$hit->{id} for $zvol_path (Fix B post-hoc)");
-            $result = $hit;
-            $err = '';
+        my $by_name_matches = _tn_extent_query_by_name($scfg, $submitted_name) // [];
+        my $by_name = $by_name_matches->[0];
+        if ($by_name) {
+            if (($by_name->{disk} // '') eq $zvol_path) {
+                _log($scfg, 1, 'info',
+                    "[TrueNAS] _tn_extent_create: name-conflict resolved by reuse " .
+                    "id=$by_name->{id} name=$submitted_name for $zvol_path (Fix B)");
+                $result = $by_name;
+                $err = '';
+            } elsif (_iscsi_extent_recover_stale_base_name($scfg, $by_name, $zvol_path)) {
+                # Historical create_base extent-rename gap. Stale extent
+                # renamed to its proper base-*-<hash>; retry our create.
+                $result = eval { _api_call_mutate($scfg, 'iscsi.extent.create', [ $payload ]) };
+                $err = $@;
+                if (!$err) {
+                    _log($scfg, 0, 'info',
+                        "[TrueNAS] _tn_extent_create: retry after stale-base rename succeeded for $submitted_name");
+                }
+            } else {
+                _log($scfg, 0, 'err',
+                    "[TrueNAS] _tn_extent_create: extent name '$submitted_name' " .
+                    "already on TN (id=$by_name->{id}) with disk='" .
+                    ($by_name->{disk} // '<undef>') . "', we expected disk='$zvol_path'. " .
+                    "Refusing to reuse.");
+            }
+        } else {
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] _tn_extent_create: TN said name '$submitted_name' is not unique " .
+                "but a follow-up iscsi.extent.query does not surface it.");
         }
     }
     die $err if $err;
@@ -5057,11 +5374,9 @@ sub _tn_extent_delete($scfg, $extent_id) {
     return $result;
 }
 sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
-    # Check if this mapping already exists
-    my $maps = _tn_targetextents($scfg) // [];
-    my ($existing_map) = grep {
-        (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
-    } @$maps;
+    # Check if this mapping already exists (narrow query: 0 or 1 row)
+    my $existing_matches = _tn_targetextent_query_by_target_extent($scfg, $target_id, $extent_id) // [];
+    my $existing_map = $existing_matches->[0];
 
     if ($existing_map) {
         # Mapping already exists - idempotent behavior
@@ -5077,14 +5392,14 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
 
     if ($err) {
         if ($err =~ /Extent is already in use/i) {
-            # Cache may be stale — force-refresh and check if already correctly mapped
-            # (can happen when another cluster node created the mapping after our cache was populated)
-            my $host_key = _cache_host_key($scfg);
-            _clear_cache($host_key);
-            my $fresh_maps = _tn_targetextents($scfg) // [];
-            my ($found) = grep {
-                (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
-            } @$fresh_maps;
+            # Cache may be stale -- narrow-query TN directly to check whether
+            # the mapping is now visible (a concurrent cluster node may have
+            # created it after our first check). Invalidate the full-list
+            # cache too so unrelated readers on this process pick up the
+            # new state on their next miss.
+            _clear_cache(_cache_host_key($scfg));
+            my $fresh_matches = _tn_targetextent_query_by_target_extent($scfg, $target_id, $extent_id) // [];
+            my $found = $fresh_matches->[0];
             if ($found) {
                 _log($scfg, 2, 'debug', "[TrueNAS] Target-extent mapping already exists (stale cache) for extent_id=$extent_id (LUN $found->{lunid})");
                 return $found;
@@ -5115,17 +5430,25 @@ sub _handle_fk_stale_extent {
 }
 
 sub _current_lun_for_zname($scfg, $zname) {
-    my $extents = _tn_extents($scfg) // [];
     my $zvol_path = "zvol/$scfg->{tn_dataset}/$zname";
-    my ($extent) = grep { ($_->{disk} // '') eq $zvol_path } @$extents;
+    my $ext_matches = _tn_extent_query_by_disk($scfg, $zvol_path) // [];
+    my $extent = $ext_matches->[0];
     return undef if !$extent || !defined $extent->{id};
     my $target_id = _resolve_target_id($scfg);
-    my $maps = _tn_targetextents($scfg) // [];
-    my ($tx) = grep {
-        (($_->{target} // -1) == $target_id)
-        && (($_->{extent} // -1) == $extent->{id})
-    } @$maps;
+    my $tx_matches = _tn_targetextent_query_by_target_extent($scfg, $target_id, $extent->{id}) // [];
+    my $tx = $tx_matches->[0];
     return defined($tx) ? $tx->{lunid} : undef;
+}
+
+# Resolve the LUN to use for a volume: the embedded one if the volname
+# carries it, otherwise looked up by zvol path. Cloud-init volumes
+# (issue #84) have no embedded metadata and always take the lookup path.
+sub _resolve_iscsi_lun($scfg, $zname, $known_lun) {
+    return $known_lun if defined $known_lun;
+    my $lun = _current_lun_for_zname($scfg, $zname);
+    die "Could not locate iSCSI LUN for '$zname' (IQN " . ($scfg->{tn_target_iqn} // '') . ")\n"
+        if !defined $lun;
+    return $lun;
 }
 
 # Pre-flight validation checks before volume allocation
@@ -5135,18 +5458,49 @@ sub _preflight_check_alloc {
     my ($scfg, $size_bytes) = @_;
     my $api_host_key = _cache_host_key($scfg);
 
-    # Skip redundant preflight checks when allocating multiple disks rapidly
-    if (time() - ($_preflight_last_ok{$api_host_key} // 0) < 30) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _preflight_check_alloc: skipping (recently validated " . (time() - $_preflight_last_ok{$api_host_key}) . "s ago)");
+    # Skip redundant preflight checks when allocating multiple disks rapidly.
+    # TTL 300 s. Uses BOTH an in-process %_preflight_last_ok hash AND a
+    # /run/truenas-plugin/preflight-<key> stamp file so the cache survives
+    # across pvedaemon worker respawns (each worker starts fresh in-process,
+    # so the in-process cache alone missed the mark: cluster_test_run
+    # 2026-08-17 alpha10 TIMING data showed every VM 222 alloc still paying
+    # the full 6 s because disk-0 and disk-1 hit different pvedaemon PIDs).
+    # All four preflight signals (TN reachable, pool ONLINE, service
+    # RUNNING, sufficient space) also surface as clear TN-side errors on
+    # the actual pool.dataset.create if they go wrong mid-window -- this
+    # cache is a rate-limit on redundant health chatter, not a correctness
+    # gate. /run is tmpfs, so a reboot clears the stamps automatically.
+    my $stamp_file = _preflight_stamp_path($api_host_key);
+    my $stamp_mtime = (stat($stamp_file))[9];
+    my $shared_age = defined $stamp_mtime ? time() - $stamp_mtime : undef;
+    my $inproc_age = time() - ($_preflight_last_ok{$api_host_key} // 0);
+    my $age = defined $shared_age ? ($shared_age < $inproc_age ? $shared_age : $inproc_age) : $inproc_age;
+    # TTL bumped 300 -> 3600 s after alpha14 TIMING data showed cache
+    # expiring between test bursts (test framework's ~5 min inter-burst
+    # gap crossed the 300 s TTL, so every burst's first alloc paid the
+    # full 10-13 s preflight and queued the whole 3-node cluster past
+    # the pveproxy 60 s ceiling). Preflight's signals (pool ONLINE,
+    # service RUNNING, dataset exists) are stable over hour timescales
+    # and free-space accounting stays fresh via pvestatd's 10 s status()
+    # polling -- the cache is a rate-limit on redundant health chatter,
+    # not a correctness gate.
+    if ($age < 3600) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _preflight_check_alloc: skipping (recently validated ${age}s ago)");
         return [];
     }
 
     my @errors;
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
-    # Check 1: TrueNAS API is reachable
+    # Check 1: TrueNAS API is reachable AND we're actually authenticated.
+    # 'core.ping' would satisfy reachable-ness but is no_auth_required, so
+    # a broker connection whose session has silently expired at 30 days
+    # (issue #98) would falsely report the API as healthy. 'auth.me'
+    # requires auth, so it fails cleanly if the session is gone -- and
+    # the broker's own liveness check on the next call will drop and
+    # re-auth the pool entry.
     eval {
-        _api_call($scfg, 'core.ping', []);
+        _api_call($scfg, 'auth.me', []);
     };
     if ($@) {
         push @errors, "TrueNAS API is unreachable: $@";
@@ -5291,10 +5645,120 @@ sub _preflight_check_alloc {
         push @errors, "Cannot verify parent dataset: $@";
     }
 
-    # Cache successful result for 30s to speed up multi-disk creation
-    $_preflight_last_ok{$api_host_key} = time() if !@errors;
+    # Cache successful result: touch a stamp file in /run so sibling
+    # pvedaemon workers on this node see the pass, and set in-process
+    # hash for the fast path in subsequent calls from this worker.
+    _log($scfg, 0, 'info', "[TrueNAS] TIMING preflight-end errors=" . scalar(@errors));
+    if (!@errors) {
+        $_preflight_last_ok{$api_host_key} = time();
+        my $stamp_file = _preflight_stamp_path($api_host_key);
+        _log($scfg, 0, 'info', "[TrueNAS] TIMING preflight-stamp path=$stamp_file");
+        eval {
+            my $dir = $stamp_file; $dir =~ s{/[^/]+$}{};
+            if (! -d $dir) {
+                mkdir($dir, 0755) or die "mkdir($dir): $!";
+            }
+            my $fh;
+            open($fh, '>', $stamp_file) or die "open($stamp_file): $!";
+            close($fh);
+            utime(undef, undef, $stamp_file) or die "utime: $!";
+        };
+        if (my $err = $@) {
+            _log($scfg, 0, 'warning', "[TrueNAS] TIMING preflight-stamp WRITE FAILED: $err");
+        } else {
+            _log($scfg, 0, 'info', "[TrueNAS] TIMING preflight-stamp WROTE OK");
+        }
+    }
 
     return \@errors;
+}
+
+# Filesystem path for the preflight-cache stamp. Keyed on the same
+# host+key digest used by the in-process cache, so multiple storages
+# pointing at different TN hosts don't false-share the pass.
+sub _preflight_stamp_path {
+    my ($host_key) = @_;
+    my $safe = $host_key;
+    $safe =~ s/[^A-Za-z0-9._-]/_/g;
+    return "/run/truenas-plugin/preflight-$safe";
+}
+
+# Filesystem path for the status()-capacity cache stamp. The stamp
+# holds the JSON-encoded pool.dataset.get_instance result so a fresh
+# process (i.e. every `pvesm status` invocation) can pick up a recent
+# value without hitting TrueNAS again. Keyed on the same host+storeid+
+# dataset triple as the in-process cache method so entries don't
+# false-share across storages pointing at different TN hosts.
+sub _status_stamp_path {
+    my ($status_method) = @_;
+    my $safe = $status_method;
+    $safe =~ s/[^A-Za-z0-9._-]/_/g;
+    return "/run/truenas-plugin/status-$safe";
+}
+
+# Read the on-disk status stamp for $status_method. Returns the cached
+# dataset hashref on hit within $STATUS_CAPACITY_STAMP_TTL_S, undef
+# otherwise. Never dies; a corrupt / unreadable stamp is treated as
+# a miss (and stats counter bumped so tuning can spot it).
+sub _read_status_stamp {
+    my ($scfg, $status_method) = @_;
+    my $path = _status_stamp_path($status_method);
+    my $mtime = (stat($path))[9];
+    return undef if !defined $mtime;
+    my $age = time() - $mtime;
+    return undef if $age < 0 || $age >= $STATUS_CAPACITY_STAMP_TTL_S;
+    my $decoded = eval {
+        open(my $fh, '<', $path) or die "open: $!";
+        local $/;
+        my $blob = <$fh>;
+        close($fh);
+        decode_json($blob);
+    };
+    if ($@ || ref($decoded) ne 'HASH') {
+        $_status_capacity_cache_stats{stamp_fail}++;
+        _log($scfg, 2, 'debug', "[TrueNAS] status-cache: stamp read failed at $path: " . ($@ // 'not a hash'));
+        return undef;
+    }
+    return $decoded;
+}
+
+# Atomically write the pool.dataset.get_instance result to the on-disk
+# status stamp. Uses tmp+rename so a concurrent reader never sees a
+# partial JSON blob. Best-effort: filesystem trouble never bubbles up
+# to the caller's status() path.
+sub _write_status_stamp {
+    my ($scfg, $status_method, $ds) = @_;
+    my $path = _status_stamp_path($status_method);
+    my $rc = eval {
+        my $dir = $path;
+        $dir =~ s{/[^/]+$}{};
+        if (!-d $dir) {
+            require File::Path;
+            File::Path::make_path($dir, { mode => 0700 });
+        }
+        my $tmp = "$path.$$";
+        open(my $fh, '>', $tmp) or die "open $tmp: $!";
+        chmod 0600, $tmp;
+        print $fh encode_json($ds);
+        close($fh) or die "close $tmp: $!";
+        rename($tmp, $path) or die "rename $tmp -> $path: $!";
+        1;
+    };
+    if ($@ || !$rc) {
+        $_status_capacity_cache_stats{stamp_fail}++;
+        _log($scfg, 2, 'debug', "[TrueNAS] status-cache: stamp write failed at $path: " . ($@ // 'unknown'));
+        return;
+    }
+    $_status_capacity_cache_stats{stamp_write}++;
+}
+
+# Remove the on-disk status stamp (best-effort). Called by
+# _invalidate_status_capacity_cache so any mutation that already
+# invalidates the in-process cache also drops the shared entry.
+sub _unlink_status_stamp {
+    my ($status_method) = @_;
+    my $path = _status_stamp_path($status_method);
+    unlink($path);
 }
 
 # Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
@@ -5591,8 +6055,11 @@ sub _iscsi_login_all($scfg) {
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
                  "iscsiadm login failed ($portal)");
     }
-    # attempt direct login for any extra portals not already in -m node
-    for my $p (@extra) {
+    # attempt direct login for any configured portal not already in -m node.
+    # $primary must get the same guaranteed fallback as @extra, otherwise it
+    # silently ends up with no session if sendtargets discovery from it alone
+    # doesn't produce a matching node record (issue #91).
+    for my $p ($primary, @extra) {
         # Skip login if this portal is already connected
         next if _portal_connected($scfg, $p, \@session_lines);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],
@@ -5658,6 +6125,39 @@ sub _dm_map_for_leaf($leaf) {
     return undef;
 }
 
+sub _iscsi_repair_empty_node_records {
+    my ($iqn) = @_;
+    return unless defined $iqn && length $iqn;
+    my $base = "/var/lib/iscsi/nodes/$iqn";
+    return unless -d $base;
+    # Structure: $base/<portal>,<port>,<tpgt>/default
+    my @removed;
+    if (opendir(my $dh, $base)) {
+        while (defined(my $portal = readdir($dh))) {
+            next if $portal =~ /^\.\.?$/;
+            my $rec = "$base/$portal/default";
+            next unless -f $rec;
+            my $sz = -s $rec;
+            if (defined $sz && $sz == 0) {
+                if (unlink $rec) {
+                    push @removed, $rec;
+                    # Best-effort: drop parent dir if now empty. Next -o new
+                    # recreates it.
+                    rmdir "$base/$portal";
+                }
+            }
+        }
+        closedir $dh;
+    }
+    if (@removed) {
+        syslog('warning',
+            "[TrueNAS] iscsi_repair: removed " . scalar(@removed) .
+            " empty node-record file(s) under $base (corruption from prior " .
+            "iscsiadm -o delete race). Fresh records will be created on -o new.");
+    }
+    return scalar(@removed);
+}
+
 sub _logout_target_all_portals {
     my ($scfg) = @_;
     my $iqn = $scfg->{tn_target_iqn};
@@ -5666,7 +6166,13 @@ sub _logout_target_all_portals {
     push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, ($scfg->{tn_portals}//''));
     for my $p (@portals) {
         eval { PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'--logout'], errfunc=>sub{} ) };
-        eval { PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'-o','delete'], errfunc=>sub{} ) };
+        # Do NOT `-o delete` the node record here. The record persists across
+        # session logout and is needed for the next login (via -o new + login
+        # in _login_target_all_portals, or via activate_volume). Concurrent
+        # free_image calls racing this delete with a later --op new leaves
+        # empty node-record files at /var/lib/iscsi/nodes/<iqn>/<portal>/default
+        # -- observed on 2026-08-14 during test_run6 3-node cluster runs
+        # where every subsequent iscsiadm login failed "No records found".
     }
 }
 sub _login_target_all_portals {
@@ -5675,6 +6181,17 @@ sub _login_target_all_portals {
     my @portals = ();
     push @portals, _normalize_portal($scfg->{tn_discovery_portal}) if $scfg->{tn_discovery_portal};
     push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, ($scfg->{tn_portals}//''));
+
+    # Repair corrupted node-record state before touching iscsiadm. An empty
+    # /var/lib/iscsi/nodes/<iqn>/<portal>,3260,<tpgt>/default is what the
+    # pre-alpha4 `-o delete` race leaves behind (see _logout_target_all_portals
+    # comment). `iscsiadm -o new` treats an empty file as an existing record
+    # and refuses to overwrite it, so every subsequent --login returns
+    # "iscsiadm: No records found" and the plugin busy-loops in the caller's
+    # retry harness for minutes. Unlink zero-byte record files first; -o new
+    # then creates a fresh, populated one below.
+    _iscsi_repair_empty_node_records($iqn);
+
     for my $p (@portals) {
         eval {
             # Ensure node record exists & autostarts, then login
@@ -5737,10 +6254,102 @@ sub _iscsi_rescan_sd_capacity($scfg) {
     return $rescanned;
 }
 
-sub _device_for_lun($scfg, $lun) {
-    # Wait briefly for by-path to appear if needed
+# alpha19: verify the sd device backing a specific LUN reports size > 0 after
+# rescan. Under 3-node concurrent load with recycled LUNs, the kernel keeps
+# the same sdX bound to a LUN number even after TN unmaps + remaps the LUN
+# to a new zvol; without a fresh READ CAPACITY the sd stays at size=0 and
+# any write fails with EIO. First try rescan on the same sd (cheap). If it
+# stays at 0, delete the stale sd and force a session-level --rescan so
+# the kernel re-attaches a fresh sd to the current LUN mapping. Die loud
+# if we still cannot get a live device — better than letting the caller
+# proceed against a zero-length block device.
+sub _iscsi_ensure_lun_ready {
+    my ($scfg, $lun, $device_path) = @_;
+    return unless defined $device_path && -e $device_path;
+
+    my $resolve_sd = sub {
+        my $target = readlink($device_path);
+        return unless $target;
+        return $1 if $target =~ m{/(sd[a-z]+)$};
+        return;
+    };
+
+    my $sd = $resolve_sd->();
+    return unless $sd;  # not an sd device (multipath, direct block, etc.) — caller handles
+
+    my $read_size = sub {
+        my $s = shift;
+        my $size_file = "/sys/block/$s/size";
+        my $sz = 0;
+        if (open my $fh, '<', $size_file) {
+            my $line = <$fh>;
+            close $fh;
+            $sz = $line + 0 if defined $line;
+        }
+        return $sz;
+    };
+
+    my $rescan_sd = sub {
+        my $s = shift;
+        my $rescan_file = "/sys/block/$s/device/rescan";
+        if (open my $rfh, '>', $rescan_file) {
+            print $rfh "1\n";
+            close $rfh;
+            return 1;
+        }
+        return 0;
+    };
+
+    # Phase 1: retry rescan on the current sd up to 10 times (~3 s).
+    for my $attempt (1..10) {
+        my $size = $read_size->($sd);
+        if ($size > 0) {
+            _log($scfg, 2, 'debug', "[TrueNAS] _iscsi_ensure_lun_ready: LUN $lun sd=$sd ready size=$size (attempt=$attempt)")
+                if $attempt > 1;
+            return 1;
+        }
+        $rescan_sd->($sd);
+        usleep(300_000);
+    }
+
+    # Phase 2: sd is genuinely dead. Delete it, force session rescan,
+    # re-resolve the by-path (kernel may attach a new sdY).
+    _log($scfg, 1, 'warning', "[TrueNAS] _iscsi_ensure_lun_ready: LUN $lun sd=$sd stuck at size=0 after 10 rescans, purging stale device");
+    if (open my $dfh, '>', "/sys/block/$sd/device/delete") {
+        print $dfh "1\n";
+        close $dfh;
+    }
+    usleep(500_000);
+    _try_run(['iscsiadm','-m','session','--rescan'], "iscsi session rescan after stale-sd purge (LUN $lun)");
+    eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+    usleep(300_000);
+
+    if (!-e $device_path) {
+        die "[TrueNAS] LUN $lun: by-path $device_path vanished after stale-sd purge\n";
+    }
+    my $new_sd = $resolve_sd->();
+    if (!$new_sd) {
+        die "[TrueNAS] LUN $lun: by-path $device_path not backed by sd after stale-sd purge\n";
+    }
+    my $new_size = $read_size->($new_sd);
+    if ($new_size > 0) {
+        _log($scfg, 1, 'info', "[TrueNAS] _iscsi_ensure_lun_ready: LUN $lun recovered on new sd=$new_sd size=$new_size (was sd=$sd size=0)");
+        return 1;
+    }
+    die "[TrueNAS] LUN $lun: sd=$new_sd still size=0 after stale-sd purge — device unusable\n";
+}
+
+sub _device_for_lun($scfg, $lun, $max_retries_override = undef) {
+    # Wait briefly for by-path to appear if needed. Callers that want a
+    # single non-blocking check (e.g. alloc_image's deferred discovery,
+    # which runs its own outer retry loop) pass max_retries_override = 1
+    # so we do NOT stack 60 s of internal polling inside their 250-ms
+    # outer step. Without this, an 8-attempt outer loop x 60 s inner
+    # timeout = 480 s worst case, blowing past the pveproxy 60 s window
+    # and cascading into cross-cluster VM-config lock timeouts
+    # (cluster_test_run 2026-08-17 3-node vm_additional_disk_vtpm).
     my $by;
-    my $max_retries = $scfg->{tn_device_ready_retries} // 200; # up to ~20s with 100ms sleep
+    my $max_retries = $max_retries_override // $scfg->{tn_device_ready_retries} // 600;
     for (my $i = 1; $i <= $max_retries; $i++) {
         $by = _find_by_path_for_lun($scfg, $lun);
         last if $by && -e $by;
@@ -5786,6 +6395,15 @@ sub _device_for_lun($scfg, $lun) {
 }
 
 # ======== NVMe/TCP Helper Functions ========
+
+# Upstream's name for _nvme_allow_any_host_json (same default: open access,
+# same JSON boolean). Kept so upstream call sites and tests that name it keep
+# working, with ONE definition of the policy instead of two that could drift.
+# Upstream issue #90: attr_allow_any_host=1 plus a populated allowed_hosts
+# aborts the configfs render on TN 25.10.x - set tn_nvme_allow_any_host=0 there.
+sub _nvme_allow_any_host_flag($scfg) {
+    return _nvme_allow_any_host_json($scfg);
+}
 
 # Get or read host NQN from /etc/nvme/hostnqn
 sub _nvme_get_hostnqn {
@@ -7019,12 +7637,21 @@ sub _nvme_selector_linux_device_count {
 sub _nvme_publication_mismatch_reason {
     my ($linux_device_count, $api_namespace_count) = @_;
 
+    # alpha23: dropped the raw count-inequality reason
+    # 'linux_api_namespace_count_mismatch'. In a shared NVMe-oF subsystem
+    # (multi-node PVE cluster), each host's kernel enumerates only the
+    # namespaces its controller has been notified of. TN's API returns
+    # the TOTAL for the subsystem, which includes namespaces created by
+    # ALL nodes. Kernel-count < api-count is the STEADY-STATE norm here,
+    # not a fault. The genuine faults are: (a) no linux devices visible
+    # at all despite TN reporting namespaces, or (b) a single stale device
+    # against a multi-namespace subsystem. Everything else — including
+    # "TN reports more than this host sees" — is treated as "not visible
+    # yet on this host" and the caller keeps retrying with rescan/reconnect.
     return 'api_namespace_not_visible_in_linux'
         if defined($api_namespace_count) && $api_namespace_count > 0 && $linux_device_count == 0;
     return 'single_visible_device_but_api_reports_multiple_namespaces'
         if defined($api_namespace_count) && $linux_device_count == 1 && $api_namespace_count > 1;
-    return 'linux_api_namespace_count_mismatch'
-        if defined($api_namespace_count) && $linux_device_count != $api_namespace_count;
     return 'namespace_metadata_did_not_match_visible_devices';
 }
 
@@ -7034,7 +7661,8 @@ my %NVME_SELECTOR_REASON_LABELS = (
     namespace_uuid_not_returned                           => 'TrueNAS API did not return the target namespace UUID',
     api_namespace_not_visible_in_linux                    => 'subsystem is connected in TrueNAS but no Linux block devices are visible',
     single_visible_device_but_api_reports_multiple_namespaces => 'one Linux block device is visible but TrueNAS reports multiple namespaces',
-    linux_api_namespace_count_mismatch                    => 'Linux-visible namespace count does not match the TrueNAS API namespace count',
+    # (Removed alpha23: 'linux_api_namespace_count_mismatch' — count
+    # inequality is normal in shared NVMe-oF subsystems, not a fault.)
     namespace_metadata_did_not_match_visible_devices      => 'TrueNAS metadata did not match any visible Linux NVMe namespace device',
     subsystem_not_visible                                 => 'NVMe subsystem is not visible in Linux sysfs',
 );
@@ -7623,7 +8251,10 @@ sub _nvme_device_for_uuid {
     my $reconnect_attempted = 0;
     my $last_result;
 
-    for (my $i = 0; $i < 50; $i++) {
+    # alpha23: 100 → 150 iterations (10s → 15s budget). Still well under
+    # pveproxy's 60s cap. The extra headroom absorbs TN configfs-sync
+    # lag under sustained 3-node create pressure.
+    for (my $i = 0; $i < 150; $i++) {
         # Search for device by subsystem NQN
         my $result = eval { _nvme_find_device_by_subsystem($scfg, $device_uuid) };
         $last_result = $result if $result && ref($result) eq 'HASH';
@@ -7638,6 +8269,20 @@ sub _nvme_device_for_uuid {
         if ($device && -b $device) {
             _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: device ready at $device (match: " . ($match_tier // 'unknown') . ")");
             return $device;
+        }
+
+        # alpha22: force nvme ns-rescan every ~500ms (5 iterations at 100ms).
+        # Under multi-node concurrent create load, the target namespace may
+        # be freshly created on TN while another host's controller has not
+        # yet been prodded to rediscover it. The previous fixed-iteration
+        # rescan schedule (i==15, i==30 only) left ~1.5s gaps in which the
+        # kernel would return the same stale namespace list on every check;
+        # activate_volume would then run out its 50-iteration budget and
+        # die with "Could not locate NVMe device" even though the
+        # namespace was live on TN. nvme ns-rescan is a cheap IOCTL, safe
+        # to fire this often.
+        if ($i > 0 && $i % 5 == 0) {
+            eval { _nvme_rescan_subsystem_controllers($scfg) };
         }
 
         # Progressive interventions to help device discovery
@@ -7698,6 +8343,63 @@ sub _nvme_device_for_uuid {
             # Another settle with trigger
             eval { run_command(['udevadm', 'trigger'], outfunc => sub {}, errfunc => sub {}) };
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        } elsif (($i == 75 || $i == 125) && !$reconnect_attempted && $allow_reconnect
+                 && _nvme_is_connected($scfg)) {
+            # alpha23/24: two-tier reconnect for the "target UUID exists on TN
+            # but this host's kernel hasn't seen it" case under multi-node
+            # concurrent creates.
+            #
+            # First tier (i==75, ~7.5s): SAFE — skip if any subsystem device
+            # is in use by another process on this host, to avoid disrupting
+            # running VMs writing to other namespaces on the shared subsystem.
+            # In steady-state cluster testing this gate almost always blocks
+            # (there is always some VM using something), so it rarely fires.
+            #
+            # Second tier (i==125, ~12.5s): LAST RESORT — force reconnect
+            # regardless of the fuser check. Rationale: at this point the
+            # activate_volume for the target VM is going to fail if we do
+            # nothing (~2.5s left of the budget, all previous interventions
+            # exhausted). A brief NVMe controller drop causes queued I/O on
+            # other VMs — kernel NVMe controller-loss handling normally
+            # resumes cleanly on reconnect within a couple of seconds. The
+            # trade is "one confirmed activate_volume failure now" vs "a few
+            # hundred ms of I/O pause on other VMs, then everything works".
+            # The failure is worse than the pause.
+            my $tn_has_uuid = 0;
+            eval {
+                my $q = _api_call($scfg, 'nvmet.namespace.query',
+                    [[["device_uuid", "=", $device_uuid]]]);
+                $tn_has_uuid = 1 if $q && @$q;
+            };
+            if ($tn_has_uuid) {
+                my $is_last_resort = ($i == 125);
+                my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
+                my $in_use = _nvme_check_devices_in_use($scfg, @dev_paths);
+                if ($in_use && !$is_last_resort) {
+                    _log($scfg, 1, 'warning',
+                        "[TrueNAS] nvme_device_for_uuid: target $device_uuid confirmed on TN "
+                        . "but not visible after ~7.5s; "
+                        . scalar(@dev_paths) . " subsystem device(s) in use, "
+                        . "deferring reconnect to i==125 last-resort");
+                } else {
+                    $reconnect_attempted = 1;
+                    my $when = $is_last_resort ? 'i==125 last-resort' : 'i==75 halfway';
+                    my $note = $in_use ? " (forcing despite $in_use device(s) in use)" : '';
+                    _log($scfg, 1, 'warning',
+                        "[TrueNAS] nvme_device_for_uuid: $when reconnect for target $device_uuid"
+                        . $note);
+                    eval { _nvme_disconnect($scfg) };
+                    usleep(500_000);
+                    eval { _nvme_connect($scfg) };
+                    if ($@) {
+                        _log($scfg, 0, 'err',
+                            "[TrueNAS] nvme_device_for_uuid: $when reconnect failed: $@");
+                    } else {
+                        _log($scfg, 1, 'info',
+                            "[TrueNAS] nvme_device_for_uuid: $when reconnect completed");
+                    }
+                }
+            }
         } elsif ($i == 35 && !$reconnect_attempted && $allow_reconnect
                  && $ever_saw_devices && !$nguid_ever_matched
                  && _nvme_is_connected($scfg)) {
@@ -7733,6 +8435,104 @@ sub _nvme_device_for_uuid {
         }
 
         usleep(DEVICE_READY_TIMEOUT_US);  # 100ms
+    }
+
+    # alpha26: emergency reconnect after retry budget exhausted.
+    #
+    # If we get here, the 150-iteration loop failed to locate the target
+    # UUID's device. The most common cause under multi-node concurrent
+    # load is stale kernel namespace state — the NVMe controller has
+    # cached namespaces from prior VM lifecycles whose NGUIDs no longer
+    # match anything TN currently publishes. ns-rescan does not evict
+    # dead namespaces; only a full disconnect+reconnect flushes the
+    # controller and re-enumerates from scratch.
+    #
+    # The mid-loop reconnect gates (i==10/25/35 stale-NGUID, i==75
+    # halfway, i==125 last-resort) all failed to fire on the failures
+    # observed 2026-08-21: earlier gates were blocked by the fuser
+    # in-use check, and the i==75/125 gates were held back by their
+    # own tn_has_uuid inline query returning empty transiently under
+    # TN API load.
+    #
+    # This block runs unconditionally if allow_reconnect=1 and we
+    # haven't already reconnected in the loop. No fuser check (loop is
+    # about to fail anyway; the brief NVMe I/O pause on other VMs is
+    # the lesser evil). No tn_has_uuid gate (already proved TN
+    # metadata was queryable — that's what set $last_result with
+    # namespace_meta or reason 'namespace_metadata_did_not_match_visible_devices').
+    # alpha28: emergency block ignores reconnect_attempted. Alpha27
+    # diagnostic proved that when this block ran under mismatch failures,
+    # it ALWAYS skipped with "reconnect_attempted=1" — some earlier
+    # mid-loop reconnect (usually i==10 stale-NGUID) had already fired
+    # but too early: TN had not yet finished publishing the target
+    # namespace when it ran, so the reconnect grabbed a still-stale
+    # kernel view. By the time the loop exhausted, TN was ready but
+    # kernel needed a SECOND reconnect to see it. The single-reconnect
+    # cap was silently killing recovery.
+    #
+    # The only remaining safety concern with unconditional emergency
+    # reconnect: cost is ~500ms NVMe controller drop for other VMs on
+    # the shared subsystem, running at the moment the loop exhausts.
+    # Trade-off: 500ms I/O pause vs a guaranteed failure. The pause
+    # wins.
+    if (!$allow_reconnect) {
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
+            . "(allow_reconnect=0) — caller did not opt in");
+    } elsif (!_nvme_is_connected($scfg)) {
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
+            . "(_nvme_is_connected=0) — subsystem not currently connected");
+    } else {
+        # Before the emergency reconnect, sweep orphan namespaces off our
+        # subsystem. Under multi-node load the publication-mismatch that
+        # brings us here is often caused by an accumulating pile of
+        # orphaned namespace records on TN whose backing datasets no
+        # longer exist. Reconnecting the kernel does not shrink that
+        # pile; TN still publishes the ballooned namespace list and the
+        # next device lookup can still mis-match. Reap first, then
+        # reconnect -- the reconnect's re-enumeration will then reflect
+        # the trimmed namespace set.
+        eval {
+            my $reaped = _nvme_reap_orphan_namespaces($scfg);
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] nvme_device_for_uuid: pre-reconnect reap removed $reaped orphan namespace(s)")
+                if $reaped;
+        };
+        my $note = $reconnect_attempted
+            ? " (SECOND reconnect — prior mid-loop reconnect fired too early)"
+            : "";
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] nvme_device_for_uuid: EMERGENCY RECONNECT after 150-iteration budget "
+            . "exhausted for UUID $device_uuid$note — flushing stale kernel namespace cache");
+        eval { _nvme_disconnect($scfg) };
+        usleep(500_000);
+        eval { _nvme_connect($scfg) };
+        if ($@) {
+            _log($scfg, 0, 'err',
+                "[TrueNAS] nvme_device_for_uuid: emergency reconnect failed: $@");
+        } else {
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] nvme_device_for_uuid: emergency reconnect completed, "
+                . "re-scanning for target UUID");
+            eval { _nvme_rescan_subsystem_controllers($scfg) };
+            eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+            # Brief post-reconnect retry: ~2s (20 iters × 100ms).
+            for (my $j = 0; $j < 20; $j++) {
+                my $result = eval { _nvme_find_device_by_subsystem($scfg, $device_uuid) };
+                my $device = _nvme_selector_selected_device_path($result);
+                if ($device && -b $device) {
+                    _log($scfg, 0, 'warning',
+                        "[TrueNAS] nvme_device_for_uuid: RECOVERED via emergency reconnect at j=$j, "
+                        . "device ready at $device");
+                    return $device;
+                }
+                usleep(DEVICE_READY_TIMEOUT_US);
+            }
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] nvme_device_for_uuid: emergency reconnect completed but target "
+                . "UUID still not visible after 2s — falling through to error");
+        }
     }
 
     # Device didn't appear - provide detailed troubleshooting.
@@ -8066,6 +8866,308 @@ sub _nvme_namespaces_for_device_path {
     ]) // [];
 }
 
+# alpha21: idempotent namespace create.
+#
+# The plain nvmet.namespace.create call goes through _api_call_mutate which
+# retries up to 3 times on connection errors. If TN successfully creates the
+# namespace but the WS response is dropped mid-flight (frequent under
+# 3-node concurrent load), the retry fires and TN creates a SECOND namespace
+# for the same device_path. Unlike iSCSI extents, nvmet has no
+# name-uniqueness constraint, so both survive as duplicates. Over a full
+# test run this compounded to ~2.83 namespace rows per zvol (68 rows for
+# 24 live zvols, plus 28 fully-orphan rows from prior alloc failures).
+#
+# Kernel-side each nvmet namespace is bound to configfs; when TN accumulates
+# duplicate records the configfs writer falls behind and only some end up
+# published to the target port. Connected hosts then see far fewer namespaces
+# than the DB claims exist (observed: 9 kernel-visible vs 96 DB rows), and
+# activate_volume dies with "namespace publication mismatch".
+#
+# Contract: given a subsys_id + zvol_path, return exactly one namespace row
+# for that zvol_path (device_uuid, nsid, etc.). If one already exists,
+# return it (reuse). Otherwise create — with retries disabled — and on ANY
+# error re-query in case the create succeeded server-side before the error
+# was raised. If the re-query finds a namespace, use it; only re-raise the
+# error if nothing landed. Callers pass the same $ns_payload they were
+# building for the raw create; only subsys_id/device_path/device_type are
+# used from it — device_uuid is assigned by TN.
+sub _nvme_create_namespace_idempotent {
+    my ($scfg, $ns_payload) = @_;
+
+    my $zvol_path = $ns_payload->{device_path}
+        or die "_nvme_create_namespace_idempotent: device_path missing from payload";
+
+    # Reuse if already present.
+    my $existing = _nvme_namespaces_for_device_path($scfg, $zvol_path);
+    if ($existing && @$existing) {
+        _log($scfg, 1, 'info',
+            "[TrueNAS] _nvme_create_namespace_idempotent: reusing existing namespace uuid="
+            . ($existing->[0]{device_uuid} // '<unknown>') . " for $zvol_path");
+        return $existing->[0];
+    }
+
+    # alpha30: pick a monotonic-high nsid to avoid TN nsid recycling.
+    #
+    # Under multi-node create/destroy churn, TN's nvmet auto-assigns the
+    # LOWEST FREE nsid on create. Under short-lived VMs this rapidly
+    # recycles low nsids. The kernel side then sees:
+    #   nsid=3 device_uuid=<OLD-DELETED-NAMESPACE-UUID>
+    # even after TN's DB has committed:
+    #   nsid=3 device_uuid=<NEW-NAMESPACE-UUID>
+    # because TN's configfs sync (DB -> /sys/kernel/config/nvmet/...) does
+    # not always land the nsid=3 rewrite before a connecting host reads
+    # the port's namespace list. Kernel then can't match the target UUID
+    # to any visible namespace at nsid=3 — activate_volume fails with
+    # "namespace_metadata_did_not_match_visible_devices" and NO amount of
+    # rescan/reconnect fixes it (evidence: alpha28's emergency reconnect
+    # completes but the stale UUID at nsid=3 persists).
+    #
+    # Fix: pass explicit nsid = max_nsid_in_subsystem + jitter, so every
+    # new namespace lands at a nsid that has NEVER been used in this
+    # subsystem's lifetime. Kernel has no cached mapping for the new
+    # nsid, so its post-connect enumeration reflects TN's current DB.
+    # Jitter (random 1..8) reduces the collision window between concurrent
+    # nodes both computing max+1.
+    #
+    # Ceiling: TN subsystem NN=1024. If max ever exceeds ceiling, we fall
+    # back to letting TN auto-assign (accept the recycle-bug risk again).
+    # Under Max's test-suite churn this ceiling is well above what we see.
+    if (!defined $ns_payload->{nsid}) {
+        my $subsys_id = $ns_payload->{subsys_id};
+        if ($subsys_id) {
+            my $ns_list = eval {
+                _api_call($scfg, 'nvmet.namespace.query',
+                    [[["subsys.id", "=", $subsys_id]]]);
+            };
+            if (!$@ && ref($ns_list) eq 'ARRAY') {
+                my $max = 0;
+                for my $n (@$ns_list) {
+                    $max = $n->{nsid} if defined($n->{nsid}) && $n->{nsid} > $max;
+                }
+                my $jitter = int(rand(8)) + 1;   # 1..8
+                my $picked = $max + $jitter;
+                if ($picked < 1024) {
+                    $ns_payload = { %$ns_payload, nsid => $picked };
+                    _log($scfg, 1, 'info',
+                        "[TrueNAS] _nvme_create_namespace_idempotent: picked explicit nsid=$picked "
+                        . "(max_used=$max, jitter=$jitter) for $zvol_path");
+                } else {
+                    _log($scfg, 1, 'warning',
+                        "[TrueNAS] _nvme_create_namespace_idempotent: max_used_nsid=$max near "
+                        . "subsystem NN ceiling — falling back to TN auto-assignment for $zvol_path");
+                }
+            }
+        }
+    }
+
+    # Create with retries disabled so a lost response cannot duplicate.
+    # zvol-visibility retry is the caller's responsibility (it needs to
+    # inspect the specific validator error message).
+    my $ns = eval {
+        _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ],
+            { retry_opts => { retry_max => 0 } });
+    };
+    if (my $err = $@) {
+        # Response may have been lost after TN committed. Re-query.
+        my $recheck = _nvme_namespaces_for_device_path($scfg, $zvol_path);
+        if ($recheck && @$recheck) {
+            _log($scfg, 1, 'info',
+                "[TrueNAS] _nvme_create_namespace_idempotent: create errored ($err) "
+                . "but namespace uuid=" . ($recheck->[0]{device_uuid} // '<unknown>')
+                . " exists for $zvol_path — treating as success");
+            return $recheck->[0];
+        }
+        # alpha30: nsid collision from concurrent nodes both picking the
+        # same max+jitter value. Recompute and retry once with a fresh
+        # max + fresh jitter.
+        if (defined $ns_payload->{nsid}
+            && $err =~ /nsid.*already|nsid.*in use|duplicate.*nsid/i) {
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] _nvme_create_namespace_idempotent: nsid=$ns_payload->{nsid} "
+                . "collision, recomputing and retrying once");
+            delete $ns_payload->{nsid};
+            my $subsys_id = $ns_payload->{subsys_id};
+            if ($subsys_id) {
+                my $ns_list = eval {
+                    _api_call($scfg, 'nvmet.namespace.query',
+                        [[["subsys.id", "=", $subsys_id]]]);
+                };
+                if (!$@ && ref($ns_list) eq 'ARRAY') {
+                    my $max = 0;
+                    for my $n (@$ns_list) {
+                        $max = $n->{nsid} if defined($n->{nsid}) && $n->{nsid} > $max;
+                    }
+                    my $picked = $max + int(rand(16)) + 1;
+                    $ns_payload = { %$ns_payload, nsid => $picked } if $picked < 1024;
+                }
+            }
+            $ns = eval {
+                _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ],
+                    { retry_opts => { retry_max => 0 } });
+            };
+            return $ns if !$@;
+            $err = $@;
+        }
+        die $err;
+    }
+    return $ns;
+}
+
+# Reap orphan NVMe namespaces on our subsystem: those whose device_path
+# points at a zvol under our tn_dataset prefix but whose backing dataset
+# no longer exists on TN. These accumulate when a namespace teardown
+# fails partway (network glitch, TN transient) and the plugin surfaces a
+# warn but does not persist a retry ledger. Over many operations the
+# orphans build up on TN, the publication-mismatch detector in
+# _nvme_device_for_uuid then reports "TrueNAS API namespace count: N,
+# Linux-visible block devices: M" and dies for every subsequent VM
+# activation. Confirmed in Max R. Carrara's test_run7 2026-08-26 3-node
+# cluster runs: 253-274 mismatch cascades per node, all traced to
+# monotonically-growing orphan namespace counts (4 -> 8 -> 25 -> 49 in
+# one subrun).
+#
+# Scope: only namespaces under our subsystem AND under our storage's
+# tn_dataset prefix. Namespaces belonging to other storage configs
+# sharing the subsystem, and ephemeral vzdump snapshot clones (issue
+# #42), are left alone.
+#
+# Returns the number of namespaces reaped, or undef on setup failure.
+# Never dies -- best-effort cleanup, called from deferred paths.
+sub _nvme_reap_orphan_namespaces {
+    my ($scfg) = @_;
+
+    my $nqn = $scfg->{tn_subsystem_nqn};
+    return undef unless defined $nqn && length $nqn;
+
+    my $ds_prefix = $scfg->{tn_dataset};
+    return undef unless defined $ds_prefix && length $ds_prefix;
+
+    my $reap_prefix = "zvol/$ds_prefix/";
+
+    my $subsystems = eval {
+        _api_call($scfg, 'nvmet.subsys.query', [
+            [ [ 'subnqn', '=', $nqn ] ]
+        ]);
+    };
+    if ($@ || !$subsystems || !@$subsystems) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] reap_orphan_namespaces: subsystem query failed: " . ($@ // 'no subsystem'));
+        return undef;
+    }
+    my $subsys_id = $subsystems->[0]{id};
+
+    my $namespaces = eval {
+        _api_call($scfg, 'nvmet.namespace.query',
+            [ [ [ 'subsys.id', '=', $subsys_id ] ] ]);
+    };
+    if ($@ || ref($namespaces) ne 'ARRAY') {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] reap_orphan_namespaces: namespace query failed: " . ($@ // 'not an array'));
+        return undef;
+    }
+
+    my $datasets = eval {
+        _api_call($scfg, 'pool.dataset.query',
+            [ [ [ 'id', '^', "$ds_prefix/" ] ] ]);
+    };
+    if ($@ || ref($datasets) ne 'ARRAY') {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] reap_orphan_namespaces: dataset query failed: " . ($@ // 'not an array'));
+        return undef;
+    }
+    # An empty answer is not "every dataset is gone": a storage with namespaces
+    # has datasets, so an empty list means the query came back wrong (the
+    # array is mid-restart, a transient middleware state). Treating it as
+    # truth would delete every namespace under the prefix.
+    if (!@$datasets && @$namespaces) {
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] reap_orphan_namespaces: dataset query returned nothing while "
+            . scalar(@$namespaces) . " namespace(s) exist; not reaping on an empty answer");
+        return undef;
+    }
+    my %ds_exists = map { ($_->{id} // '') => 1 } @$datasets;
+
+    my @orphans;
+    for my $ns (@$namespaces) {
+        my $dp = $ns->{device_path} // '';
+        next unless length $dp;
+        next unless index($dp, $reap_prefix) == 0;  # only our storage's slice
+        (my $ds_id = $dp) =~ s{^zvol/}{};
+        next if $ds_exists{$ds_id};                 # backing dataset still there -- keep
+        my ($zname) = $dp =~ m{/([^/]+)$};
+        next if $zname && _is_snapshot_clone_zname($zname);  # issue #42 clones own their cleanup
+        # A list that is merely partial would still make a live dataset look
+        # gone, so ask about this exact dataset: only a definite "does not
+        # exist" makes the namespace an orphan; a hit, an unrelated error or
+        # an empty answer all mean we do not know, and not knowing keeps it.
+        my $probe = eval { _tn_dataset_get($scfg, $ds_id) };
+        my $probe_err = $@;
+        if ($probe || !$probe_err || $probe_err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] reap_orphan_namespaces: cannot confirm $ds_id is gone; keeping id=" . ($ns->{id} // '?'));
+            next;
+        }
+        push @orphans, $ns;
+    }
+
+    return 0 unless @orphans;
+
+    _log($scfg, 0, 'info',
+        "[TrueNAS] reap_orphan_namespaces: found " . scalar(@orphans) .
+        " orphan namespace(s) in subsys id=$subsys_id under $ds_prefix/ " .
+        "(referencing deleted datasets); deleting");
+
+    my $reaped = 0;
+    for my $ns (@orphans) {
+        my $ns_id = $ns->{id};
+        my $dp    = $ns->{device_path} // '<undef>';
+        my $uuid  = $ns->{device_uuid} // '<undef>';
+        my $nsid  = $ns->{nsid}        // '<undef>';
+        eval {
+            _api_call($scfg, 'nvmet.namespace.delete', [ $ns_id ]);
+        };
+        if (my $err = $@) {
+            if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+                $reaped++;
+                _log($scfg, 1, 'info',
+                    "[TrueNAS] reap_orphan_namespaces: id=$ns_id already gone");
+            } else {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] reap_orphan_namespaces: failed to delete id=$ns_id " .
+                    "nsid=$nsid uuid=$uuid device_path=$dp: $err");
+            }
+        } else {
+            $reaped++;
+            _log($scfg, 0, 'info',
+                "[TrueNAS] reap_orphan_namespaces: deleted orphan id=$ns_id " .
+                "nsid=$nsid uuid=$uuid device_path=$dp");
+        }
+    }
+
+    return $reaped;
+}
+
+# Resolve the NVMe device_uuid to use for a volume: the embedded one if the
+# volname carries it, otherwise looked up by zvol path. Cloud-init volumes
+# (issue #84) have no embedded metadata and always take the lookup path.
+# Cached (short TTL, cleared by the normal _clear_cache mutation hooks) so
+# that path() and activate_volume back-to-back for the same cloud-init
+# volume don't each pay a separate nvmet.namespace.query round trip.
+sub _resolve_nvme_uuid($scfg, $zname, $known_uuid) {
+    return $known_uuid if defined $known_uuid;
+    my $device_path = "zvol/" . $scfg->{tn_dataset} . '/' . $zname;
+    my $storage_id = _cache_host_key($scfg);
+    my $cache_method = "ns_by_path:$device_path";
+    my $ns = _get_cached($storage_id, $cache_method);
+    if (!$ns) {
+        $ns = _nvme_namespaces_for_device_path($scfg, $device_path);
+        _set_cache($storage_id, $cache_method, $ns);
+    }
+    my $uuid = @$ns ? $ns->[0]{device_uuid} : undef;
+    die "Could not locate NVMe namespace for '$zname'\n" if !defined $uuid;
+    return $uuid;
+}
+
 # Delete NVMe namespace
 sub _nvme_delete_namespace {
     my ($scfg, $zname, $full_ds) = @_;
@@ -8108,10 +9210,24 @@ sub _nvme_delete_namespace {
 
 # ======== Required storage interface ========
 # volname format:
-#   iSCSI:    vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
-#   NVMe/TCP: vol-<zname>-ns<uuid>, where uuid is the device_uuid from TrueNAS
+#   iSCSI:      vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
+#   NVMe/TCP:   vol-<zname>-ns<uuid>, where uuid is the device_uuid from TrueNAS
+#   Cloud-init: vm-<vmid>-cloudinit, no "vol-" prefix and no metadata suffix --
+#               required verbatim by PVE core's drive_is_cloudinit() (issue #84).
+#               Device is resolved dynamically by zvol path, see
+#               _resolve_iscsi_lun / _resolve_nvme_uuid.
 sub parse_volname {
     my ($class, $volname) = @_;
+
+    # Cloud-init disk: plain "vm-<vmid>-cloudinit", no prefix/suffix. The
+    # classification goes through the same predicate alloc_image/list_images
+    # use, so the two can't drift on what counts as a cloud-init volname;
+    # the digit extraction below is safe because that predicate already
+    # guarantees the ^vm-\d+-cloudinit$ shape.
+    if (_is_cloudinit_zname($volname)) {
+        my ($vmid) = $volname =~ /^vm-(\d+)-cloudinit$/;
+        return ('images', $volname, $vmid, undef, undef, undef, 'raw', undef);
+    }
 
     # Slash-encoded linked-clone form (PVE convention):
     #   <base_volid>/<clone_volid>
@@ -8151,6 +9267,18 @@ sub parse_volname {
         elsif ($zname =~ m/^base-(\d+)-/) { $vmid = $1; $isBase = 1; }
         # For NVMe, metadata = device_uuid
         return ('images', $zname, $vmid, undef, undef, $isBase, 'raw', $uuid);
+    }
+
+    # Plain PVE stem: vm-<vmid>-disk-<N> or base-<vmid>-disk-<N>.
+    # PVE core (libpve-storage-perl Storage.pm volume_import_start) calls
+    # parse_volname on the SOURCE's bare stem to extract vmid during
+    # cross-storage migration — before our volume_import even runs. If
+    # we die here, the migration bails and never reaches our import
+    # side. Accept the stem; downstream alloc_image will pick the real
+    # -lun<N> / -ns<uuid> suffix.
+    if ($volname =~ m/^(vm|base)-(\d+)-disk-\d+(?:\.raw)?$/) {
+        my $isBase = $1 eq 'base' ? 1 : undef;
+        return ('images', $volname, $2, undef, undef, $isBase, 'raw', undef);
     }
 
     die "unable to parse volname '$volname'\n";
@@ -8255,7 +9383,7 @@ sub path {
             my $ns = _nvme_namespaces_for_device_path($scfg, "zvol/$clone_full");
             my $uuid = @$ns ? $ns->[0]{device_uuid} : undef;
             die "snapshot namespace not active for $volname\@$snapname\n" if !$uuid;
-            my $dev = _nvme_device_for_uuid($scfg, $uuid);
+            my $dev = _nvme_device_for_uuid($scfg, $uuid, allow_reconnect => 1);
             return (_untaint_dev($dev), $vmid, 'images');
         } else {
             die "Unknown transport mode: $mode\n";
@@ -8263,19 +9391,56 @@ sub path {
     }
 
     if ($mode eq 'iscsi') {
-        # iSCSI: metadata is LUN number
+        # iSCSI: metadata is LUN number. Cloud-init volumes (issue #84) carry
+        # no embedded metadata and always take the re-resolve path below.
         my $lun = $metadata;
         _iscsi_login_all($scfg);
         my $dev;
-        eval { $dev = _device_for_lun($scfg, $lun); };
-        if ($@ || !$dev) {
-            # try to re-resolve LUN mapping from TrueNAS
-            my $real_lun = eval { _current_lun_for_zname($scfg, $zname) };
+        my $lookup_err;
+        # Short retry (500 ms) — activate_volume is the authoritative
+        # wait-for-device point with the full retry budget; path() is
+        # called from many contexts (including PVE's destroy_vm's
+        # remove_owned_drive closure at QemuServer.pm:1839) where the
+        # device may not be locally attached and blocking for 60 s would
+        # abort the whole destroy before free_image runs, leaking zvols
+        # on TrueNAS (issue #88). If _device_for_lun times out here we
+        # fall back to the deterministic /dev/disk/by-path/... string
+        # so remove_owned_drive keeps a non-empty $path and proceeds to
+        # call vdisk_free -> free_image, which is what actually cleans
+        # TN state up.
+        if (defined $lun) {
+            eval { $dev = _device_for_lun($scfg, $lun, 5); };
+            $lookup_err = $@;
+        }
+        if (!$dev) {
+            # No embedded LUN, or the embedded one may be stale: re-resolve
+            # the current mapping via the shared helper. This CAN succeed
+            # even when the device isn't attached locally, because it
+            # asks TrueNAS for the LUN number rather than the Linux
+            # device.
+            my $real_lun = eval { _resolve_iscsi_lun($scfg, $zname, undef) };
             if (defined $real_lun && (!defined($lun) || $real_lun != $lun)) {
-                $dev = _device_for_lun($scfg, $real_lun);
-            } else {
-                die $@ if $@; # bubble up original cause
-                die "Could not locate device for LUN $lun (IQN $scfg->{tn_target_iqn})\n";
+                eval { $dev = _device_for_lun($scfg, $real_lun, 5); };
+            }
+            if (!$dev) {
+                # Device isn't locally attached. Return the deterministic
+                # by-path string so callers that don't need a live device
+                # (destroy_vm's remove_owned_drive, size probes, config
+                # renderers) get a usable identifier rather than dying
+                # with a 60-second timeout. Callers that DO need a live
+                # device (VM start, qm start) go through activate_volume
+                # first, which authoritatively waits for the device.
+                my $resolved_lun = defined $real_lun ? $real_lun : $lun;
+                if (defined $resolved_lun) {
+                    my $portal = $scfg->{tn_discovery_portal} // '';
+                    my $iqn    = $scfg->{tn_target_iqn}       // '';
+                    if ($portal ne '' && $iqn ne '') {
+                        $dev = "/dev/disk/by-path/ip-${portal}-iscsi-${iqn}-lun-${resolved_lun}";
+                        _log($scfg, 2, 'debug',
+                            "[TrueNAS] path: device not locally attached for LUN $resolved_lun; " .
+                            "returning deterministic by-path $dev (activate_volume required for live use)");
+                    }
+                }
             }
         }
         return (_untaint_dev($dev), $vmid, 'images');
@@ -8319,9 +9484,28 @@ sub path {
 sub alloc_image {
     my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib) = @_;
 
+    # Wall-clock instrumentation (level 0 -- always visible). Prefixed
+    # TIMING so operators can grep and diff. Emitted at each phase
+    # boundary; timestamps let us attribute slow allocs to preflight,
+    # TN dataset.create, TN extent/tx create, or the transport wrapper
+    # under real cluster load. Remove once we've conclusively pinned
+    # down the 596-under-contention bottleneck in cluster_test_run
+    # 3-node runs.
+    my $t0 = Time::HiRes::time();
+    my $t_last = $t0;
+    my $lap = sub {
+        my ($label) = @_;
+        my $now = Time::HiRes::time();
+        _log($scfg, 0, 'info', sprintf(
+            "[TrueNAS] TIMING alloc vmid=%s %s: +%.3fs (total %.3fs)",
+            $vmid, $label, $now - $t_last, $now - $t0));
+        $t_last = $now;
+    };
+
     # Level 0: Always log (errors only logged elsewhere)
     # Level 1: Light - function entry with key parameters
     _log($scfg, 1, 'info', "[TrueNAS] alloc_image: vmid=$vmid, name=" . ($name // 'undef') . ", size=$size_kib KiB");
+    $lap->('entry');
 
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
     die "invalid size\n" if !defined($size_kib) || $size_kib <= 0;
@@ -8354,6 +9538,7 @@ sub alloc_image {
     # Pre-flight checks: validate all prerequisites before expensive operations
     _log($scfg, 1, 'info', "[TrueNAS] alloc_image: running pre-flight checks for $bytes bytes");
     my $errors = _preflight_check_alloc($scfg, $bytes);
+    $lap->('preflight');
     if (@$errors) {
         my $error_msg = "Pre-flight validation failed:\n  - " . join("\n  - ", @$errors);
         _log($scfg, 0, 'err', "[TrueNAS] alloc_image: pre-flight check failed for VM $vmid: " . join("; ", @$errors));
@@ -8433,6 +9618,7 @@ sub alloc_image {
     if ($create_attempt >= $max_create_retries && $create_error) {
         die "Failed to create zvol after $max_create_retries attempts (last error: $create_error)\n";
     }
+    $lap->('pool.dataset.create');
 
     # If pool.dataset.create returns a job ID, wait for it to complete
     # This ensures the zvol is fully created before we try to use it
@@ -8443,6 +9629,7 @@ sub alloc_image {
             die "Failed to create zvol $full_ds: " . ($job_result->{error} // 'Unknown error') . "\n";
         }
         _log($scfg, 1, 'info', "[TrueNAS] alloc_image: zvol $full_ds created successfully");
+        $lap->('zvol.job.wait');
     }
 
     _invalidate_status_capacity_cache($storeid, $scfg);
@@ -8464,6 +9651,18 @@ sub alloc_image {
 sub _alloc_image_iscsi {
     my ($class, $scfg, $zname, $full_ds, $zvol_path) = @_;
 
+    my $t0 = Time::HiRes::time();
+    my $t_last = $t0;
+    my $lap = sub {
+        my ($label) = @_;
+        my $now = Time::HiRes::time();
+        _log($scfg, 0, 'info', sprintf(
+            "[TrueNAS] TIMING alloc_iscsi zname=%s %s: +%.3fs (total %.3fs)",
+            $zname, $label, $now - $t_last, $now - $t0));
+        $t_last = $now;
+    };
+    $lap->('entry');
+
     # Create an iSCSI extent for that zvol (device-backed)
     # TrueNAS expects a 'disk' like "zvol/<pool>/<zname>"
     my $extent_name = _generate_extent_name($scfg, $zname);
@@ -8472,6 +9671,8 @@ sub _alloc_image_iscsi {
         type => 'DISK',
         disk => $zvol_path,
         insecure_tpc => JSON::PP::true, # typical default for modern OS initiators
+        blocksize => 4096,
+        pblocksize => JSON::PP::true,
     };
     my $extent_id;
 
@@ -8485,14 +9686,15 @@ sub _alloc_image_iscsi {
     # _clone_image_iscsi already applies the same check; align the alloc
     # path with it.
     {
-        my $extents_idx = _tn_extents($scfg) // [];
-        my ($existing_extent) = grep { ($_->{disk} // '') eq $zvol_path } @$extents_idx;
+        my $reuse_matches = _tn_extent_query_by_disk($scfg, $zvol_path) // [];
+        my $existing_extent = $reuse_matches->[0];
         if ($existing_extent) {
             $extent_id = $existing_extent->{id};
             _log($scfg, 1, 'info',
                 "[TrueNAS] _alloc_image_iscsi: reusing existing extent id=$extent_id for $zvol_path");
         }
     }
+    $lap->('extent.reuse_check');
 
     if (!defined $extent_id) {
         # pool.dataset.create returns as soon as ZFS finishes, but TN validates
@@ -8519,22 +9721,52 @@ sub _alloc_image_iscsi {
                 "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
             select(undef, undef, undef, 0.2);
         }
-        # Fix B: post-hoc reuse on unique-name conflict. If the create
-        # returned "name must be unique", the extent may already exist --
-        # either because a concurrent path won the race, or because our
-        # own _api_call_mutate retried a connection failure whose first
-        # attempt actually committed server-side. Look up by disk path;
-        # if it matches, reuse the id instead of dying.
+        # Fix B: post-hoc reuse on unique-name conflict. The plugin knows
+        # the exact name it tried; look the extent up by name (most direct
+        # match) and reuse if its disk field is ours. If TN has an extent
+        # with our name but a DIFFERENT disk field, log loudly at level 0
+        # so operators can see what's on TN even without tn_debug set --
+        # that shape is exactly the diagnostic gap that made Max R.
+        # Carrara's (Proxmox) test_run6 cluster failures unattributable.
         if ($err && _is_extent_name_conflict_error($err)) {
             _clear_cache(_cache_host_key($scfg));  # force fresh view
-            my $extents_after = _tn_extents($scfg) // [];
-            my ($hit) = grep { ($_->{disk} // '') eq $zvol_path } @$extents_after;
-            if ($hit) {
-                _log($scfg, 1, 'info',
-                    "[TrueNAS] _alloc_image_iscsi: name-conflict resolved by reuse " .
-                    "id=$hit->{id} for $zvol_path (Fix B post-hoc)");
-                $ext = $hit;
-                $err = '';
+            my $by_name_matches = _tn_extent_query_by_name($scfg, $extent_name) // [];
+            my $by_name = $by_name_matches->[0];
+            if ($by_name) {
+                if (($by_name->{disk} // '') eq $zvol_path) {
+                    _log($scfg, 1, 'info',
+                        "[TrueNAS] _alloc_image_iscsi: name-conflict resolved by reuse " .
+                        "id=$by_name->{id} name=$extent_name for $zvol_path (Fix B)");
+                    $ext = $by_name;
+                    $err = '';
+                } elsif (_iscsi_extent_recover_stale_base_name($scfg, $by_name, $zvol_path)) {
+                    # Historical create_base extent-rename gap. Stale
+                    # base extent renamed; retry our create once.
+                    $ext = eval {
+                        _api_call_mutate($scfg, 'iscsi.extent.create', [ $extent_payload ]);
+                    };
+                    $err = $@;
+                    if (!$err) {
+                        _log($scfg, 0, 'info',
+                            "[TrueNAS] _alloc_image_iscsi: retry after stale-base rename succeeded for $extent_name");
+                    }
+                } else {
+                    # An extent with our deterministic name exists but points
+                    # at a different disk. Fix B cannot safely reuse it (that
+                    # would silently redirect this VM's disk to whatever the
+                    # foreign extent is backing). Report the actual TN state.
+                    _log($scfg, 0, 'err',
+                        "[TrueNAS] _alloc_image_iscsi: extent name '$extent_name' " .
+                        "already on TN (id=$by_name->{id}) with disk='" .
+                        ($by_name->{disk} // '<undef>') . "', we expected disk='$zvol_path'. " .
+                        "Refusing to reuse -- another zvol may be sharing our hash slot, " .
+                        "or TN normalized the disk field. Investigate iscsi.extent.query.");
+                }
+            } else {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] _alloc_image_iscsi: TN said name '$extent_name' is not unique " .
+                    "but a follow-up iscsi.extent.query does not surface it. Possible cache " .
+                    "or replication lag on TN; falling through to failure.");
             }
         }
         if ($err) {
@@ -8548,6 +9780,7 @@ sub _alloc_image_iscsi {
         # Invalidate cache so subsequent targetextents lookup sees current state
         _clear_cache(_cache_host_key($scfg));
     }
+    $lap->('extent.create');
     if (!defined $extent_id) {
         eval { _tn_dataset_delete($scfg, $full_ds) };
         die sprintf(
@@ -8593,13 +9826,12 @@ sub _alloc_image_iscsi {
 
         # Fallback: re-fetch if create response didn't include lunid
         if (!defined $lun) {
-            my $maps = _tn_targetextents($scfg) // [];
-            my ($existing_map) = grep {
-                (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
-            } @$maps;
+            my $tx_matches = _tn_targetextent_query_by_target_extent($scfg, $target_id, $extent_id) // [];
+            my $existing_map = $tx_matches->[0];
             $lun = $existing_map->{lunid} if $existing_map;
         }
     }
+    $lap->('targetextent.create');
     if (!defined $lun) {
         die sprintf(
             "Could not determine assigned LUN for disk '%s'\n\n" .
@@ -8621,12 +9853,15 @@ sub _alloc_image_iscsi {
 
     # 5) Return volname immediately — device discovery is deferred after lock release.
     # activate_volume handles authoritative device discovery before any VM uses the disk.
-    my $volname = "vol-$zname-lun$lun";
+    # Cloud-init disks (issue #84) must be named exactly "vm-<vmid>-cloudinit" with
+    # no metadata suffix, so PVE core recognizes and regenerates them on clone.
+    my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-lun$lun";
 
     # Defer local I/O operations (iSCSI login, rescan, device polling) to run after CFS lock release
     my $deferred_scfg = $scfg;  # capture for closure
     my $deferred_lun = $lun;
     _defer_after_lock(sub {
+        $lap->('deferred.start');
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image deferred: starting iSCSI device discovery for LUN $deferred_lun");
 
         # When sessions are already active, skip the disruptive session rescan and multipath
@@ -8656,11 +9891,15 @@ sub _alloc_image_iscsi {
         }
         eval { run_command(['udevadm','settle'], outfunc => sub {}); };
 
-        # Best-effort device verification with reduced retries
+        # Best-effort device verification with reduced retries. Pass
+        # max_retries_override=1 to _device_for_lun so its internal poll
+        # collapses to a single non-blocking check -- our outer 8x250ms
+        # loop is the retry budget for this deferred, best-effort path,
+        # and the full 60 s inner timeout would stack on top of it.
         my $device_ready = 0;
         for my $attempt (1..8) {
             eval {
-                my $dev = _device_for_lun($deferred_scfg, $deferred_lun);
+                my $dev = _device_for_lun($deferred_scfg, $deferred_lun, 1);
                 if ($dev && -e $dev && -b $dev) {
                     _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image deferred: device $dev ready for LUN $deferred_lun (attempt $attempt)");
                     $device_ready = 1;
@@ -8676,6 +9915,7 @@ sub _alloc_image_iscsi {
         if (!$device_ready) {
             _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: device not yet visible for LUN $deferred_lun (activate_volume will handle)");
         }
+        $lap->('deferred.end');
     });
 
     return $volname;
@@ -8696,45 +9936,29 @@ sub _alloc_image_nvme {
         enabled => JSON::PP::true,
     };
 
+    # alpha21: idempotent create defuses retry-storm duplicates (see
+    # _nvme_create_namespace_idempotent header). Zvol-visibility retry
+    # (waiting for /dev/zvol/<ds> to appear) stays here — that error
+    # is not a retryable connection error, so the outer WS layer would
+    # not retry it anyway.
     my $ns;
     my $ns_err;
-
-    # Idempotency: if a namespace already points at this exact zvol path,
-    # reuse it instead of creating a duplicate. Matches the extent-reuse
-    # check on the iSCSI side and defuses orphans left by a prior failed
-    # free_image (or a concurrent cluster node that got there first).
-    my $existing_ns = _nvme_namespaces_for_device_path($scfg, $zvol_path) // [];
-    if (@$existing_ns) {
-        $ns = $existing_ns->[0];
+    my $max_zvol_wait_attempts = 15;
+    for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+        $ns = eval { _nvme_create_namespace_idempotent($scfg, $ns_payload_alloc) };
+        $ns_err = $@;
+        last if !$ns_err;
+        last if !_is_zvol_not_ready_error($ns_err);
         _log($scfg, 1, 'info',
-            "[TrueNAS] _alloc_image_nvme: reusing existing namespace uuid=" .
-            ($ns->{device_uuid} // '<unknown>') . " for $zvol_path");
+            "[TrueNAS] _alloc_image_nvme: $zvol_path not visible as block device yet " .
+            "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+        select(undef, undef, undef, 0.2);
     }
-
-    if (!$ns) {
-        # pool.dataset.create returns as soon as ZFS finishes, but TN validates
-        # nvmet.namespace.create by checking that zvol/<ds> is a block device --
-        # the /dev/zvol symlink may still be waiting on udev. Poll-retry on that
-        # specific validator error only, up to ~3 s. Same shape as _clone_image_nvme.
-        my $max_zvol_wait_attempts = 15;
-        for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
-            $ns = eval {
-                _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload_alloc ]);
-            };
-            $ns_err = $@;
-            last if !$ns_err;
-            last if !_is_zvol_not_ready_error($ns_err);
-            _log($scfg, 1, 'info',
-                "[TrueNAS] _alloc_image_nvme: $zvol_path not visible as block device yet " .
-                "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
-            select(undef, undef, undef, 0.2);
-        }
-        if (my $err = $ns_err) {
-            # Cleanup: delete the zvol if namespace creation failed. The nested
-            # eval clobbers $@, so capture the original error first.
-            eval { _tn_dataset_delete($scfg, $full_ds) };
-            die "Failed to create NVMe namespace for disk '$zname': $err\n";
-        }
+    if (my $err = $ns_err) {
+        # Cleanup: delete the zvol if namespace creation failed. The nested
+        # eval clobbers $@, so capture the original error first.
+        eval { _tn_dataset_delete($scfg, $full_ds) };
+        die "Failed to create NVMe namespace for disk '$zname': $err\n";
     }
     my $device_uuid = $ns->{device_uuid};
     unless ($device_uuid) {
@@ -8743,26 +9967,64 @@ sub _alloc_image_nvme {
     }
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: created namespace with UUID $device_uuid");
 
-    # Return volname immediately — defer connect + device discovery
-    my $volname = "vol-$zname-ns$device_uuid";
+    # Return volname immediately — defer connect + device discovery.
+    # Cloud-init disks (issue #84) must be named exactly "vm-<vmid>-cloudinit" with
+    # no metadata suffix, so PVE core recognizes and regenerates them on clone.
+    my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-ns$device_uuid";
 
     my $deferred_scfg = $scfg;
     my $deferred_uuid = $device_uuid;
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
+        # alpha32: instrument every phase at level 0 so we can see which
+        # step of the deferred block holds the VM config lock the longest.
+        # LOCKHOLD tag makes it grep-friendly against the "can't lock
+        # file" test failures. Each phase logs elapsed time from block
+        # entry.
+        my $t0 = Time::HiRes::time();
+        my $lap_defer = sub {
+            my ($phase) = @_;
+            _log($deferred_scfg, 0, 'info', sprintf(
+                "[TrueNAS] LOCKHOLD alloc_nvme_deferred uuid=%s phase=%s elapsed=%.3fs",
+                $deferred_uuid, $phase, Time::HiRes::time() - $t0));
+        };
+        $lap_defer->('entry');
+
+        # Our resync writes back the subsystem's own allow_any_host (see
+        # _nvme_resync_configfs); upstream's ping wrote the configured value.
         _nvme_resync_configfs($deferred_scfg, $deferred_subsys_id, 'alloc_image_nvme deferred');
+        $lap_defer->('subsys.update');
 
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image_nvme deferred: connecting and discovering device for UUID $deferred_uuid");
         eval { _nvme_connect($deferred_scfg); };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: NVMe connect failed (activate_volume will retry): $@");
+            $lap_defer->('nvme_connect_failed_exit');
             return;
         }
+        $lap_defer->('nvme_connect');
         # Settle + rescan to detect new namespace (mirrors clone_image_nvme deferred path)
         usleep(200_000);  # 200ms initial settle
         eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        $lap_defer->('udevadm_settle');
         eval { _nvme_rescan_subsystem_controllers($deferred_scfg) };
-        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
+        $lap_defer->('nvme_rescan');
+        # alpha31: allow_reconnect=0 in the DEFERRED path. This runs while
+        # the VM's config lock (/var/lock/qemu-server/lock-<vmid>.conf) is
+        # still held by the calling qm operation. If _nvme_device_for_uuid
+        # triggers a reconnect (stale-NGUID gate at i==10 fires often under
+        # multi-node testing), the kernel does a full controller
+        # remove+add and udev re-enumerates every namespace under the
+        # subsystem (~30 devices). The subsequent udevadm settle inside
+        # _nvme_device_for_uuid blocks 10-13s waiting for udev to drain,
+        # and we STILL hold the config lock during that. Any concurrent
+        # qm op on the same VMID from the test framework times out on
+        # lock-<vmid>.conf. Pre-warm is best-effort — if the device is
+        # not yet visible here, activate_volume (which is called OUTSIDE
+        # the config lock via a fresh worker) has allow_reconnect=1 and
+        # will do the reconnect cleanly then.
+        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 0) };
+        $lap_defer->('device_for_uuid');
         if ($dev) {
             _log($deferred_scfg, 1, q{info}, "[TrueNAS] alloc_image_nvme deferred: device ready at $dev");
             # And wait for the by-id link, not just the block device. path()
@@ -8778,6 +10040,7 @@ sub _alloc_image_nvme {
         } else {
             _log($deferred_scfg, 0, q{warning}, "[TrueNAS] alloc_image_nvme deferred: device not yet visible (activate_volume will handle)");
         }
+        $lap_defer->('exit');
     });
 
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: volume created successfully: $volname");
@@ -8889,13 +10152,19 @@ sub free_image {
     }
 
     # Level 2: Verbose - parsed details
-    _log($scfg, 2, 'debug', "[TrueNAS] free_image: zname=$zname, metadata=$metadata, full_ds=$full_ds");
+    _log($scfg, 2, 'debug', "[TrueNAS] free_image: zname=$zname, metadata=" . ($metadata // 'none') . ", full_ds=$full_ds");
 
     # Dispatch to transport-specific deletion
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
-        return _free_image_iscsi($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
+        # Cloud-init volumes (issue #84) carry no embedded LUN; resolve one
+        # best-effort so _free_image_iscsi can still pre-clean the local
+        # SCSI device before the TrueNAS-side delete. Failure here must not
+        # block deletion (the zvol/extent lookup below is independent of
+        # LUN), so a failed resolve just leaves $lun undef as before.
+        my $lun = $metadata // eval { _resolve_iscsi_lun($scfg, $zname, undef) };
+        return _free_image_iscsi($class, $storeid, $scfg, $volname, $zname, $full_ds, $lun);
     } elsif ($mode eq 'nvme-tcp') {
         return _free_image_nvme($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
     } else {
@@ -8933,15 +10202,17 @@ sub _free_image_iscsi {
         _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: captured " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) for cleanup") if @scsi_devices_to_cleanup;
     }
 
-    # Resolve target/extent/mapping on TrueNAS (moved up: needed for WWID validation below)
+    # Resolve target/extent/mapping on TrueNAS (moved up: needed for WWID validation below).
+    # Use narrow queries: we only ever want the row that matches THIS zvol.
     my $target_id = _resolve_target_id($scfg);
-    my $extents = _tn_extents($scfg) // [];
     my $zvol_path_match = "zvol/$scfg->{tn_dataset}/$zname";
-    my ($extent) = grep { ($_->{disk}//'') eq $zvol_path_match } @$extents;
-    my $maps = _tn_targetextents($scfg) // [];
-    my ($tx) = ($extent && $target_id)
-        ? grep { (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent->{id}) } @$maps
-        : ();
+    my $ext_matches = _tn_extent_query_by_disk($scfg, $zvol_path_match) // [];
+    my $extent = $ext_matches->[0];
+    my $tx;
+    if ($extent && $target_id) {
+        my $tx_matches = _tn_targetextent_query_by_target_extent($scfg, $target_id, $extent->{id}) // [];
+        $tx = $tx_matches->[0];
+    }
 
     # Best-effort: flush the local multipath map for this LUN's WWID.
     # Derive WWID directly from the TrueNAS extent NAA (already fetched above) rather than
@@ -9031,12 +10302,13 @@ sub _free_image_iscsi {
         # Invalidate cache to get fresh targetextent data — a destination LUN may have been
         # created since the cache was last populated (e.g., during a disk move operation)
         _clear_cache(_cache_host_key($scfg));
-        # Check how many LUNs are currently mapped to this target
+        # Check how many LUNs are currently mapped to this target. Narrow-
+        # query by target only (server-side filter), then count.
         my $active_luns = 0;
         eval {
-            my $all_maps = _tn_targetextents($scfg) // [];
-            my @target_maps = grep { ($_->{target}//-1) == $target_id } @$all_maps;
-            $active_luns = scalar(@target_maps);
+            my $target_maps = _api_call($scfg, 'iscsi.targetextent.query',
+                [ [ [ 'target', '=', $target_id ] ] ]) // [];
+            $active_luns = scalar(@$target_maps);
         };
 
         # Only logout if this is the last LUN (or unknown count) — full logout during a
@@ -9066,9 +10338,9 @@ sub _free_image_iscsi {
                 _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: could not delete targetextent id=$id (may be in use by other cluster nodes)");
             }
         }
-        # Retry extent delete (re-query extent by disk path)
-        $extents = _tn_extents($scfg) // [];
-        ($extent) = grep { ($_->{disk}//'') eq $zvol_path_match } @$extents;
+        # Retry extent delete (re-query extent by disk path, narrow)
+        my $retry_matches = _tn_extent_query_by_disk($scfg, $zvol_path_match) // [];
+        $extent = $retry_matches->[0];
         if ($extent && defined $extent->{id}) {
             my $eid = $extent->{id};
             eval {
@@ -9090,11 +10362,12 @@ sub _free_image_iscsi {
         $need_force_logout = 1;  # signal deferred cleanup: skip session rescan
     }
 
-    # 5) Delete the zvol dataset using retry logic with exponential backoff
-    # The new helper function handles "busy" errors robustly with retry logic
+    # 5) Safety check before deferring the dataset delete: verify dataset has
+    # no child datasets (only snapshots allowed). Must run SYNCHRONOUSLY so we
+    # can fail the free_image call cleanly if a manually-created child dataset
+    # is present. Recursive deletion in the cleanup_worker would otherwise
+    # destroy those children silently.
     eval {
-        # Safety check: Verify dataset has no child datasets (only snapshots allowed)
-        # This prevents accidental deletion of manually created child datasets
         my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
         if ($ds_info && $ds_info->{children}) {
             my @children = grep { $_->{type} ne 'SNAPSHOT' } @{$ds_info->{children}};
@@ -9104,27 +10377,10 @@ sub _free_image_iscsi {
                     "Recursive deletion would destroy these child datasets. Please remove them manually first.";
             }
         }
-
-        # Use the new retry helper - it handles async jobs, retries, and error parsing
-        _delete_dataset_with_retry($scfg, $full_ds);
     };
+    die $@ if $@;
 
-    # Handle any errors from dataset deletion
-    if ($@) {
-        my $err = $@ // '';
-        if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
-            # Dataset already gone — treat as success (idempotent)
-        } else {
-            # Re-raise so Proxmox reports the failure; zvol is still present on TrueNAS
-            die "Failed to delete dataset $full_ds: $err\n";
-        }
-    }
-
-    # Invalidate cached iSCSI extent/targetextent state now that the zvol and
-    # its mappings are destroyed. Without this, a list_images() served by the
-    # same pvedaemon worker within the 60s cache TTL keeps walking the stale
-    # mapping cache and reports the just-purged volume as still present
-    # (disk_purge.pl test 9).
+    # Invalidate cache eagerly (list_images should not see the stale mapping).
     _clear_cache(_cache_host_key($scfg));
 
     # 6) Defer post-deletion cleanup after lock release (session rescan, self-healing, logout check)
@@ -9167,7 +10423,33 @@ sub _free_image_iscsi {
         }
     });
 
-    return undef;
+    # Return a cleanup_worker coderef for the slow pool.dataset.delete step.
+    # PVE::Storage::vdisk_free (Storage.pm:~1220) forks whatever we return as
+    # an 'imgdel' UPID task AFTER releasing the cfs storage lock, so the
+    # calling qm destroy returns quickly. Under cluster load the dataset
+    # delete can block 20-50 s waiting for other nodes to release the
+    # extent's underlying zvol; keeping that on the caller's synchronous
+    # path was making vm_disk_buses exceed its 180 s test-framework limit
+    # (test_run6/truenas-2026-08-13, run-37 iter 1 and 2). The imgdel task
+    # is idempotent -- if the next iteration's alloc_image runs before it
+    # completes, the plugin's find-free-disk-name auto-increment handles
+    # the residual zvol without a name collision.
+    my $delete_scfg = $scfg;
+    my $delete_full_ds = $full_ds;
+    return sub {
+        my $upid = shift;  # PVE passes the imgdel UPID
+        eval {
+            _delete_dataset_with_retry($delete_scfg, $delete_full_ds);
+        };
+        if (my $err = $@) {
+            if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # looks gone; make sure before calling it done
+                _confirm_dataset_gone($delete_scfg, $delete_full_ds, $err);
+            } else {
+                die "Failed to delete dataset $delete_full_ds: $err\n";
+            }
+        }
+    };
 }
 
 # NVMe-specific deletion
@@ -9315,10 +10597,10 @@ sub _free_image_nvme {
         }
     }
 
-    # 3) Delete the zvol dataset using retry logic with exponential backoff
-    # The new helper function handles "busy" errors robustly with retry logic
+    # 3) Safety check (sync) then defer dataset delete to cleanup_worker.
+    # Same rationale as _free_image_iscsi: hoist the slow pool.dataset.delete
+    # out of the caller's synchronous path so qm destroy returns quickly.
     eval {
-        # Safety check: Verify dataset has no child datasets (only snapshots allowed)
         my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
         if ($ds_info && $ds_info->{children}) {
             my @children = grep { $_->{type} ne 'SNAPSHOT' } @{$ds_info->{children}};
@@ -9328,54 +10610,45 @@ sub _free_image_nvme {
                     "Recursive deletion would destroy these child datasets. Please remove them manually first.";
             }
         }
-
-        # Use the new retry helper - it handles async jobs, retries, and error parsing
-        _delete_dataset_with_retry($scfg, $full_ds);
     };
+    die $@ if $@;
 
-    # Handle any errors from dataset deletion
-    if ($@) {
-        my $err = $@ // '';
-        if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
-            # The message says the dataset is gone. Confirm that it is, rather
-            # than believing the string: this pattern matches anywhere in free
-            # text, and a transport-level failure can carry those words for
-            # reasons that have nothing to do with the dataset. A JSON-RPC
-            # "-32601 Method does not exist" is enough, and so is whatever the
-            # broker reports when it dies mid-call. Measured: kill the broker
-            # 150 ms into `pvesm free` and this branch swallowed the failure -
-            # exit status 0, zvol still on the array, namespace still exported
-            # and still published in the kernel. A delete that reports success
-            # while the volume is still there is worse than one that fails,
-            # because nothing will ever come back to it.
-            my $still_there = eval { _tn_dataset_get($scfg, $full_ds) };
-            my $probe_err = $@;
-            if ($still_there) {
-                die "Refusing to report success for $full_ds: the delete failed "
-                  . "with '$err', but the dataset is still on the array.\n";
-            }
-            if ($probe_err && $probe_err !~ /does not exist|ENOENT|InstanceNotFound/i) {
-                # We could not find out. That is not the same as "it is gone",
-                # and guessing here is how volumes get forgotten.
-                die "Cannot confirm $full_ds was deleted: the delete failed with "
-                  . "'$err' and the follow-up query failed with '$probe_err'. "
-                  . "Retry once the TrueNAS API answers.\n";
-            }
-            # Confirmed absent - genuinely idempotent.
-        } else {
-            # Re-raise so Proxmox reports the failure; zvol is still present on TrueNAS
-            die "Failed to delete dataset $full_ds: $err\n";
-        }
-    }
-
-    # 4) Defer udev cleanup after lock release
+    # 4) Defer udev cleanup after lock release, then reap any orphan
+    # namespaces on our subsystem. Under multi-node load a namespace
+    # teardown occasionally fails partway (network glitch, TN transient);
+    # the plugin logs a warn but has no persistent retry ledger, so the
+    # namespace lives on TN forever. Over many operations these
+    # accumulate and the publication-mismatch detector in
+    # _nvme_device_for_uuid starts failing every activate_volume that
+    # runs against the ballooned namespace list. Reap here so orphans
+    # get cleaned up at the natural rate of one-per-free without
+    # slowing the caller (deferred block runs after the lock releases).
+    # See _nvme_reap_orphan_namespaces for the full rationale.
     my $deferred_scfg = $scfg;
     _defer_after_lock(sub {
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image_nvme deferred: udev settle");
         eval { run_command(['udevadm','settle'], outfunc=>sub{}) };
+        eval { _nvme_reap_orphan_namespaces($deferred_scfg) };
     });
 
-    return undef;
+    # Return cleanup_worker for the slow dataset delete (see _free_image_iscsi
+    # for full rationale).
+    my $delete_scfg = $scfg;
+    my $delete_full_ds = $full_ds;
+    return sub {
+        my $upid = shift;
+        eval {
+            _delete_dataset_with_retry($delete_scfg, $delete_full_ds);
+        };
+        if (my $err = $@) {
+            if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # looks gone; make sure before calling it done
+                _confirm_dataset_gone($delete_scfg, $delete_full_ds, $err);
+            } else {
+                die "Failed to delete dataset $delete_full_ds: $err\n";
+            }
+        }
+    };
 }
 
 # Heuristic: returns true if our target session shows no "Attached SCSI devices" with LUNs.
@@ -9429,8 +10702,21 @@ sub _list_images_iscsi {
     my $res = [];
 
     # ---- fetch fresh TrueNAS state (minimal caching for target_id only) ----
-    my $extents    = _tn_extents($scfg) // [];
-    my $maps       = _tn_targetextents($scfg) // [];
+    # Bypass the per-worker _tn_extents / _tn_targetextents caches: list_images
+    # must reflect the current TN state, and the caches are per-pvedaemon-worker.
+    # After free_image runs in worker A, worker A clears its own cache but B's
+    # cache still shows the deleted extent+mapping. free_image also defers the
+    # pool.dataset.delete to an imgdel task (see the "PVE::Storage::vdisk_free
+    # forks whatever we return as an 'imgdel' UPID task AFTER releasing the cfs
+    # storage lock" comment near line 6208), so the ground-truth dataset query
+    # below can't filter the phantom out either -- the dataset is genuinely
+    # still on TN when list_images runs immediately after purge. The disk_purge
+    # test asserts that the purged volid disappears from storage content
+    # listing; without bypassing the cache here it intermittently reappears.
+    # Cost: two extra TN API calls per list_images invocation. list_images is
+    # not in a hot loop -- it's called on demand from storage-content queries.
+    my $extents    = _api_call($scfg, 'iscsi.extent.query', []) // [];
+    my $maps       = _api_call($scfg, 'iscsi.targetextent.query', []) // [];
     my $target_id  = $cache->{target_id} //= _resolve_target_id($scfg);
 
     # Index extents by id for quick lookups
@@ -9499,9 +10785,14 @@ sub _list_images_iscsi {
         my $lun = $tx->{lunid};
         next MAPPING if !defined $lun;
 
-        # Owner (vmid) from our naming convention
+        # Owner (vmid) from our naming convention. Must match both live
+        # disks (vm-<vmid>-...) and templated/base disks (base-<vmid>-...) --
+        # otherwise core's find_free_diskname() never sees a template's
+        # existing base-<vmid>-disk-N volumes on this storage and reuses a
+        # colliding index when a second disk of the same template is moved
+        # here (issue #85).
         my $owner;
-        $owner = $1 if $zname =~ /^vm-(\d+)-/;
+        $owner = $1 if $zname =~ /^(?:vm|base)-(\d+)-/;
 
         # Honor $vmid filter
         if (defined $vmid) {
@@ -9509,8 +10800,9 @@ sub _list_images_iscsi {
             next MAPPING if !defined $owner || $owner != $vmid;
         }
 
-        # Compose plugin volname + volid
-        my $volname = "vol-$zname-lun$lun";
+        # Compose plugin volname + volid. Cloud-init disks (issue #84) are
+        # named exactly "vm-<vmid>-cloudinit" with no metadata suffix.
+        my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-lun$lun";
         my $volid   = "$storeid:$volname";
 
         # Honor explicit include filter
@@ -9660,18 +10952,24 @@ sub _list_images_nvme {
         # are not Proxmox-managed volumes and must not appear in list_images.
         next if _is_snapshot_clone_zname($zname);
 
-        # Owner (vmid) from naming convention
+        # Owner (vmid) from naming convention. Must match both live disks
+        # (vm-<vmid>-...) and templated/base disks (base-<vmid>-...) --
+        # otherwise core's find_free_diskname() never sees a template's
+        # existing base-<vmid>-disk-N volumes on this storage and reuses a
+        # colliding index when a second disk of the same template is moved
+        # here (issue #85).
         my $owner;
-        $owner = $1 if $zname =~ /^vm-(\d+)-/;
+        $owner = $1 if $zname =~ /^(?:vm|base)-(\d+)-/;
 
         # Honor $vmid filter
         if (defined $vmid) {
             next if !defined $owner || $owner != $vmid;
         }
 
-        # Compose volname using device_uuid
+        # Compose volname using device_uuid. Cloud-init disks (issue #84) are
+        # named exactly "vm-<vmid>-cloudinit" with no metadata suffix.
         my $device_uuid = $ns->{device_uuid} // next;
-        my $volname = "vol-$zname-ns$device_uuid";
+        my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-ns$device_uuid";
         my $volid = "$storeid:$volname";
 
         # Honor explicit include filter
@@ -9740,6 +11038,9 @@ sub _invalidate_status_capacity_cache {
     my $host_key = _cache_host_key($scfg);
     my $method = _status_capacity_cache_method($effective_storeid, $scfg);
     _invalidate_cache_key($host_key, $method);
+    # Drop the on-disk stamp too so a stale value can't outlive a
+    # mutation that just invalidated the in-process cache.
+    _unlink_status_stamp($method);
     $_status_capacity_cache_stats{invalidate}++;
     _log($scfg, 2, 'debug', "[TrueNAS] status-cache: invalidate key=$method");
 }
@@ -9883,18 +11184,45 @@ sub status {
             $_status_capacity_cache_stats{hit}++;
             _log($scfg, 2, 'debug', "[TrueNAS] status-cache: hit key=$status_method");
         } else {
-            $_status_capacity_cache_stats{miss}++;
-            _log($scfg, 2, 'debug', "[TrueNAS] status-cache: miss key=$status_method");
-            $ds = _tn_dataset_get($scfg, $scfg->{tn_dataset}, { retry_max => 0 });
-            _set_cache($host_key, $status_method, $ds);
+            # Cross-process stamp check (issue #106). status() is
+            # frequently called from short-lived processes (every
+            # `pvesm status` is a fresh Perl interpreter), so the
+            # in-process cache always misses in exactly the path that
+            # PVE's cross-node upload probe hits. The on-disk stamp
+            # in /run/truenas-plugin/status-<key> is shared across
+            # processes and lets a fresh invocation reuse a value
+            # that any process wrote within STATUS_CAPACITY_STAMP_TTL_S.
+            $ds = _read_status_stamp($scfg, $status_method);
+            if ($ds) {
+                $_status_capacity_cache_stats{stamp_hit}++;
+                _log($scfg, 2, 'debug', "[TrueNAS] status-cache: stamp-hit key=$status_method");
+                # Seed the in-process cache so any second call in the
+                # same process (rare, but pvestatd's own polling in
+                # the resident daemon does re-enter this path) still
+                # gets the fast in-process short-TTL path.
+                _set_cache($host_key, $status_method, $ds);
+            } else {
+                $_status_capacity_cache_stats{miss}++;
+                _log($scfg, 2, 'debug', "[TrueNAS] status-cache: miss key=$status_method");
+                # retry_max => 2 (was 0): a single 60 s broker deadline on
+                # pool.dataset.get_instance under concurrent cluster load was
+                # marking storage inactive on transient slowness, which then
+                # cascaded into "storage is not active" failures on unrelated
+                # tests. Two retries add up to 3 x 60 s = 180 s worst case, but
+                # normal path is 1 attempt and the STATUS_CAPACITY_TTL_S cache
+                # keeps pvestatd from re-hitting this every poll.
+                $ds = _tn_dataset_get($scfg, $scfg->{tn_dataset}, { retry_max => 2 });
+                _set_cache($host_key, $status_method, $ds);
+                _write_status_stamp($scfg, $status_method, $ds);
 
-            # Pool health check on cache miss only (non-fatal — log warning if degraded)
-            my $pool = _tn_pool_health($scfg);
-            if ($pool && !$pool->{healthy}) {
-                my ($pool_name) = split('/', $scfg->{tn_dataset}, 2);
-                _log($scfg, 0, 'warning',
-                    "[TrueNAS] status: pool '$pool_name' is not healthy (status: " .
-                    ($pool->{status} // 'UNKNOWN') . ")");
+                # Pool health check on cache miss only (non-fatal — log warning if degraded)
+                my $pool = _tn_pool_health($scfg);
+                if ($pool && !$pool->{healthy}) {
+                    my ($pool_name) = split('/', $scfg->{tn_dataset}, 2);
+                    _log($scfg, 0, 'warning',
+                        "[TrueNAS] status: pool '$pool_name' is not healthy (status: " .
+                        ($pool->{status} // 'UNKNOWN') . ")");
+                }
             }
         }
 
@@ -10413,8 +11741,12 @@ sub _clone_snapshot_zvol {
 
     my $clone_result = eval { _tn_dataset_clone($scfg, $source_snapshot, $clone_full) };
     if (my $err = $@) {
-        # Already present from a prior activate — reuse it.
-        if ($err =~ /already exists/i) {
+        # Already present from a prior activate - reuse it. Match both the
+        # older "dataset already exists" and TN 25.10.x's
+        # ZFSPathAlreadyExistsException ("Path already exists on the pool"):
+        # missing the latter was upstream issue #59 (every later backup died
+        # at this line until someone destroyed the leftover clone by hand).
+        if ($err =~ /already exists|ZFSPathAlreadyExistsException/i) {
             _log($scfg, 1, 'info', "[TrueNAS] clone $clone_full already present "
                 . "(PVE activates a backup snapshot twice) - reusing it");
             return;
@@ -10497,36 +11829,29 @@ sub _expose_snapshot_device {
             die "Failed to query NVMe subsystem $nqn\n" if !$subsystems || !@$subsystems;
             my $subsys_id = $subsystems->[0]{id};
 
-            my $existing = _nvme_namespaces_for_device_path($scfg, $zvol_path);
-            my $device_uuid = @$existing ? $existing->[0]{device_uuid} : undef;
-
-            if (!defined $device_uuid) {
-                my $ns_payload = {
-                    subsys_id   => $subsys_id,
-                    device_path => $zvol_path,
-                    device_type => 'ZVOL',
-                };
-                # Zvol-visibility retry: right after _clone_snapshot_zvol
-                # returns, udev may not have created /dev/zvol/<ds> yet.
-                # Poll-retry on that specific validator error only, up to ~3 s.
-                my $ns;
-                my $ns_err;
-                my $max_zvol_wait_attempts = 15;
-                for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
-                    $ns = eval { _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]) };
-                    $ns_err = $@;
-                    last if !$ns_err;
-                    last if !_is_zvol_not_ready_error($ns_err);
-                    _log($scfg, 1, 'info',
-                        "[TrueNAS] _expose_snapshot_device: $zvol_path not visible as block device yet " .
-                        "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
-                    select(undef, undef, undef, 0.2);
-                }
-                die $ns_err if $ns_err;
-                $device_uuid = $ns->{device_uuid}
-                    // die "No device_uuid returned from namespace creation\n";
-                _nvme_resync_configfs($scfg, $subsys_id, 'expose_snapshot_device');
+            # alpha21: idempotent create defuses retry-storm duplicates.
+            my $ns_payload = {
+                subsys_id   => $subsys_id,
+                device_path => $zvol_path,
+                device_type => 'ZVOL',
+            };
+            my $ns;
+            my $ns_err;
+            my $max_zvol_wait_attempts = 15;
+            for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+                $ns = eval { _nvme_create_namespace_idempotent($scfg, $ns_payload) };
+                $ns_err = $@;
+                last if !$ns_err;
+                last if !_is_zvol_not_ready_error($ns_err);
+                _log($scfg, 1, 'info',
+                    "[TrueNAS] _expose_snapshot_device: $zvol_path not visible as block device yet " .
+                    "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+                select(undef, undef, undef, 0.2);
             }
+            die $ns_err if $ns_err;
+            my $device_uuid = $ns->{device_uuid}
+                // die "No device_uuid returned from namespace creation\n";
+            _nvme_resync_configfs($scfg, $subsys_id, 'expose_snapshot_device');
 
             _nvme_connect($scfg);
             eval { _nvme_rescan_subsystem_controllers($scfg) };
@@ -10601,10 +11926,9 @@ sub _teardown_snapshot_device {
 
             # Delete targetextent mapping (force=true), then the extent.
             if ($extent && $target_id) {
-                my $maps = _tn_targetextents($scfg) // [];
-                my ($tx) = grep {
-                    (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent->{id})
-                } @$maps;
+                my $tx_matches = _tn_targetextent_query_by_target_extent(
+                    $scfg, $target_id, $extent->{id}) // [];
+                my $tx = $tx_matches->[0];
                 if ($tx && defined $tx->{id}) {
                     eval { _api_call($scfg,'iscsi.targetextent.delete',[ $tx->{id}, JSON::PP::true ]) };
                 }
@@ -10662,11 +11986,15 @@ sub activate_volume {
             usleep(UDEV_SETTLE_TIMEOUT_US);
         }
 
-        # Wait for the specific LUN device to appear (up to ~20s, configurable)
-        my $lun = $metadata;
+        # Wait for the specific LUN device to appear (up to ~20s, configurable).
+        # Cloud-init volumes (issue #84) carry no embedded LUN; resolve by zname.
+        my $lun = _resolve_iscsi_lun($scfg, $zname, $metadata);
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for LUN $lun device");
         eval {
             my $dev = _device_for_lun($scfg, $lun);
+            # alpha19: by-path may exist but its backing sd may be a stale
+            # zero-size device from a prior LUN mapping. Verify + heal.
+            _iscsi_ensure_lun_ready($scfg, $lun, $dev);
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
         };
         if ($@) {
@@ -10679,10 +12007,65 @@ sub activate_volume {
         }
 
     } elsif ($mode eq 'nvme-tcp') {
-        _nvme_connect($scfg);
+        # alpha32: LOCKHOLD instrumentation for activate_volume NVMe path.
+        # This runs UNDER the VM config lock (qm start, qm clone target, etc).
+        my $t0_av = Time::HiRes::time();
+        my $lap_av = sub {
+            my ($phase) = @_;
+            _log($scfg, 0, 'info', sprintf(
+                "[TrueNAS] LOCKHOLD activate_volume vmid=%s uuid=%s phase=%s elapsed=%.3fs",
+                $vmid // '?', $metadata, $phase, Time::HiRes::time() - $t0_av));
+        };
+        $lap_av->('entry');
 
-        # Wait for the specific namespace device to appear (up to 5s)
-        my $device_uuid = $metadata;
+        _nvme_connect($scfg);
+        $lap_av->('nvme_connect');
+
+        # alpha29: force TN to re-sync nvmet configfs before we wait for the
+        # target device. TrueNAS 25.10's nvmet.namespace.create returns as
+        # soon as its DB row is written, BEFORE the corresponding configfs
+        # entry under /sys/kernel/config/nvmet/subsystems/*/namespaces/*
+        # is created. The existing subsys.update workaround (which pokes
+        # TN into flushing DB->configfs) lives in _defer_after_lock inside
+        # alloc_image / clone_image / expose_snapshot — those only run on
+        # the CREATING node. Under a multi-node cluster where the VM is
+        # started on a DIFFERENT node than the one that allocated the disk
+        # (e.g. cluster_migration, live-migrate, or when the alloc/start
+        # request happened to be routed to different pvedaemons), that
+        # node's activate_volume runs BEFORE any subsys.update has fired
+        # against TN. Kernel connects, but sees the pre-namespace configfs
+        # state and never notices the new namespace. Emergency reconnect
+        # in _nvme_device_for_uuid doesn't help — reconnecting still gets
+        # a configfs snapshot that predates the target namespace.
+        #
+        # Fix: fire subsys.update ourselves here. Idempotent, cheap (one
+        # API call), only runs on activate_volume. If TN already synced,
+        # this is a no-op; if it hadn't, this forces it. Then the
+        # subsequent _nvme_device_for_uuid loop sees the target promptly.
+        eval {
+            my $nqn = $scfg->{tn_subsystem_nqn};
+            my $subs = _api_call($scfg, 'nvmet.subsys.query', [[["subnqn","=",$nqn]]]);
+            if ($subs && @$subs) {
+                my $subsys_id = $subs->[0]{id};
+                # Re-sync (issue #12) writing back the subsystem's OWN
+                # allow_any_host, never the configured one: in whitelist mode
+                # the configured value would close a subsystem this node has
+                # not been authorized on yet (see _nvme_resync_configfs).
+                # It is non-fatal and logs its own failure.
+                _nvme_resync_configfs($scfg, $subsys_id, 'activate_volume pre-wait');
+                _log($scfg, 2, 'debug',
+                    "[TrueNAS] activate_volume: pre-wait subsys.update sent for subsys $subsys_id");
+            }
+        };
+        if ($@) {
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] activate_volume: pre-wait subsys.update failed (non-fatal): $@");
+        }
+        $lap_av->('pre_wait_subsys_update');
+
+        # Wait for the specific namespace device to appear (up to 5s).
+        # Cloud-init volumes (issue #84) carry no embedded UUID; resolve by zname.
+        my $device_uuid = _resolve_nvme_uuid($scfg, $zname, $metadata);
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for device UUID $device_uuid");
         eval {
             my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
@@ -10694,6 +12077,7 @@ sub activate_volume {
             # The device is about to carry I/O: cap it before qemu-img or QEMU opens it.
             _nvme_cap_max_io($scfg, 'activate', $dev);
         };
+        $lap_av->('device_for_uuid_exit');
         if ($@) {
             my $err = $@;
             $err = 'Unknown error while locating NVMe device' if !defined($err) || $err eq '';
@@ -10787,6 +12171,230 @@ sub clone_image {
     }
 }
 
+# ========================================================================
+# volume_export / volume_import — stream a raw volume between storages.
+#
+# Implementing these closes PVE's "cannot migrate from storage type" refusal
+# for cross-storage disk moves (`qm move_disk`, `pct move_volume`,
+# `qmrestore` from VMA, `pct restore`, cross-storage replication). PVE's
+# storage-migrate protocol pipes volume_export -> volume_import between
+# plugins; without them PVE has no way to move data onto our storage from
+# a plugin that doesn't speak our native transport.
+#
+# We only implement `raw+size` for `images` volumes. Snapshots in the
+# stream (zfs-send style replication) are a separate protocol and
+# intentionally not advertised here.
+# ========================================================================
+
+sub volume_export_formats {
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
+
+    # We stream raw bytes of a point-in-time volume. We do not implement
+    # replication streams, snapshot-chain exports, or incremental deltas.
+    return () if defined($base_snapshot);
+    return () if $with_snapshots;
+
+    my ($vtype, undef, undef, undef, undef, undef, $format) = $class->parse_volname($volname);
+    # Only block-level 'images' volumes have a raw byte stream to export.
+    # 'rootdir' is a formatted filesystem on top of a zvol — exporting it
+    # as a raw blob would ship the whole formatted container including
+    # unused extent, which is not what PVE's import side expects for
+    # 'tar+size'. Omit for now; LXC rootdir moves fall back to PVE's
+    # existing LXC code paths.
+    return () if $vtype ne 'images';
+    return () if ($format // 'raw') ne 'raw';
+
+    return ('raw+size');
+}
+
+sub volume_import_formats {
+    my ($class, $scfg, $storeid, $volname, $snapshot, $base_snapshot, $with_snapshots) = @_;
+
+    return () if defined($base_snapshot);
+    return () if $with_snapshots;
+
+    my ($vtype, undef, undef, undef, undef, undef, $format) = $class->parse_volname($volname);
+    return () if $vtype ne 'images';
+    return () if ($format // 'raw') ne 'raw';
+
+    return ('raw+size');
+}
+
+# abs_path() returns what readlink found on disk, which perl -T (the PVE
+# daemons run tainted) marks as tainted, and a tainted argument makes the later
+# exec of dd die with "Insecure dependency". Resolve, then untaint through the
+# same strict /dev/ pattern path() uses.
+sub _real_dev_path($dev) {
+    return _untaint_dev(abs_path($dev) // $dev);
+}
+
+# Copy exactly $bytes from the stream to the block device at $path. dd would
+# happily stop at EOF and report success, leaving a disk that is partly zeroes
+# after a connection drop mid-migration, so count what actually arrived and die
+# if it is short. All-zero chunks are skipped with a seek (the zvol is fresh
+# and reads as zero), which is what dd conv=sparse did.
+sub _stream_to_device($fh, $path, $bytes) {
+    my $chunk = 4 * 1024 * 1024;
+    open(my $out, '+<:raw', $path) or die "volume_import: cannot open $path: $!\n";
+    binmode($fh);
+    my $done = 0;
+    while ($done < $bytes) {
+        my $want = $bytes - $done;
+        $want = $chunk if $want > $chunk;
+        my $buf = '';
+        while (length($buf) < $want) {
+            my $n = sysread($fh, $buf, $want - length($buf), length($buf));
+            die "volume_import: read from stream failed: $!\n" if !defined $n;
+            last if $n == 0;
+        }
+        die "volume_import: stream ended after " . ($done + length($buf))
+          . " of $bytes bytes announced by its header; the volume is incomplete\n"
+            if length($buf) < $want;
+        if ($buf =~ /[^\0]/) {
+            sysseek($out, $done, 0) // die "volume_import: seek on $path failed: $!\n";
+            my $off = 0;
+            while ($off < length($buf)) {
+                my $w = syswrite($out, $buf, length($buf) - $off, $off);
+                die "volume_import: write to $path failed: $!\n" if !defined $w;
+                $off += $w;
+            }
+        }
+        $done += length($buf);
+    }
+    close($out) or die "volume_import: close of $path failed: $!\n";
+    return $done;
+}
+
+sub volume_export {
+    my ($class, $scfg, $storeid, $fh, $volname, $format, $snapshot, $base_snapshot, $with_snapshots)
+        = @_;
+
+    die "volume export format '$format' not supported by TrueNASPlugin (only raw+size)\n"
+        if $format ne 'raw+size';
+    die "snapshot/with-snapshots export not supported by TrueNASPlugin\n"
+        if defined($base_snapshot) || $with_snapshots;
+    die "snapshot export not supported by TrueNASPlugin\n"
+        if defined($snapshot);
+
+    my ($vtype) = $class->parse_volname($volname);
+    die "volume_export: only 'images' vtype supported, got '$vtype'\n"
+        if $vtype ne 'images';
+
+    # Make sure the LUN is attached locally so dd can read it.
+    $class->activate_volume($storeid, $scfg, $volname, undef, {});
+
+    my ($dev) = $class->path($scfg, $volname, $storeid);
+    die "volume_export: no device path for $volname\n" if !$dev;
+
+    my $real = _real_dev_path($dev);
+    die "volume_export: $real is not a block device\n" if ! -b $real;
+
+    my $size = $class->volume_size_info($scfg, $storeid, $volname, 10);
+    die "volume_export: could not determine size for $volname\n" if !$size;
+
+    _log($scfg, 1, 'info',
+        "[TrueNAS] volume_export: streaming $volname ($size bytes) from $real");
+
+    PVE::Storage::Plugin::write_common_header($fh, $size);
+
+    # dd straight from the block device. No qemu-img — the destination's
+    # import side handles format conversion, and avoiding qemu-img here
+    # also keeps us clear of Proxmox#7197 (qemu-img sparse-write EINVAL
+    # on 4K-logical iSCSI LUNs under QEMU 10.1).
+    run_command(
+        # count_bytes: send exactly the size the header announced; a device
+        # that grew since volume_size_info would otherwise desync the stream.
+        ['dd', "if=$real", 'bs=4M', "count=$size", 'iflag=count_bytes', 'status=progress'],
+        output => '>&' . fileno($fh),
+    );
+
+    return;
+}
+
+sub volume_import {
+    my (
+        $class,
+        $scfg,
+        $storeid,
+        $fh,
+        $volname,
+        $format,
+        $snapshot,
+        $base_snapshot,
+        $with_snapshots,
+        $allow_rename,
+    ) = @_;
+
+    die "volume import format '$format' not supported by TrueNASPlugin (only raw+size)\n"
+        if $format ne 'raw+size';
+    die "snapshot/with-snapshots import not supported by TrueNASPlugin\n"
+        if defined($base_snapshot) || $with_snapshots;
+
+    # pvesm import passes user-supplied volnames like "vm-9962-disk-0"
+    # (no "-lunN" suffix). Our strict parse_volname rejects that. First
+    # try strict, then fall back to a stem regex to extract VMID so
+    # alloc_image can pick the LUN.
+    my ($vtype, $vmid);
+    eval {
+        my (undef, $name, $v, undef, undef, undef, $fmt) = $class->parse_volname($volname);
+        $vtype = 'images';  # strict form only occurs for images volnames in our plugin
+        $vmid  = $v;
+        die "volume_import: only 'raw' format supported, got '$fmt'\n"
+            if ($fmt // 'raw') ne 'raw';
+    };
+    if ($@) {
+        # Lenient fallback: match common PVE disk-name stems.
+        if ($volname =~ /^(?:vm|base)-(\d+)-disk-\d+(?:\.raw)?$/) {
+            $vtype = 'images';
+            $vmid  = $1;
+        } else {
+            die "volume_import: cannot parse volname '$volname' (expected vm-<vmid>-disk-<N>): $@";
+        }
+    }
+    die "volume_import: only 'images' vtype supported, got '$vtype'\n"
+        if $vtype ne 'images';
+
+    my $bytes = PVE::Storage::Plugin::read_common_header($fh);
+    # alloc_image expects size in KiB; round up so a non-KiB-aligned
+    # source doesn't under-allocate on the destination.
+    my $size_kib = int(($bytes + 1023) / 1024);
+
+    _log($scfg, 1, 'info',
+        "[TrueNAS] volume_import: allocating $size_kib KiB for vmid=$vmid "
+      . "(stem='$volname', $bytes bytes)");
+
+    # Always let alloc_image pick the final name (vm-<vmid>-disk-<N>-lun<K>).
+    # The incoming $volname is a stem from pvesm/storage_migrate; the real
+    # on-TN layout dictates the suffix. Callers get the final volid in
+    # our return value.
+    my $allocname = $class->alloc_image($storeid, $scfg, $vmid, 'raw', undef, $size_kib);
+    die "volume_import: alloc_image returned no name\n" if !$allocname;
+
+    my $new_volname = $allocname;
+
+    # Stream the raw bytes onto the newly-allocated LUN.
+    eval {
+        $class->activate_volume($storeid, $scfg, $new_volname, undef, {});
+
+        my ($dev) = $class->path($scfg, $new_volname, $storeid);
+        die "volume_import: no device path for $new_volname\n" if !$dev;
+
+        my $real = _real_dev_path($dev);
+        die "volume_import: $real is not a block device\n" if ! -b $real;
+
+        _stream_to_device($fh, $real, $bytes);
+    };
+    if (my $err = $@) {
+        _log($scfg, 0, 'err',
+            "[TrueNAS] volume_import: streaming failed, rolling back alloc for $new_volname: $err");
+        eval { $class->free_image($storeid, $scfg, $new_volname, 0, 'raw') };
+        warn "[TrueNAS] volume_import: rollback free_image failed: $@\n" if $@;
+        die $err;
+    }
+
+    return "$storeid:$new_volname";
+}
+
 # iSCSI-specific clone implementation
 sub _clone_image_iscsi {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name) = @_;
@@ -10847,9 +12455,9 @@ sub _clone_image_iscsi {
     # 2) Create iSCSI extent for the cloned zvol
     my $zvol_path = 'zvol/' . $target_full;
 
-    # Check if extent for this zvol already exists (by disk path)
-    my $extents = _tn_extents($scfg) // [];
-    my ($existing_extent) = grep { ($_->{disk} // '') eq $zvol_path } @$extents;
+    # Check if extent for this zvol already exists (by disk path, narrow query)
+    my $existing_matches = _tn_extent_query_by_disk($scfg, $zvol_path) // [];
+    my $existing_extent = $existing_matches->[0];
 
     my $extent_name = _generate_extent_name($scfg, $target_zname);
     my $extent_id;
@@ -10866,6 +12474,9 @@ sub _clone_image_iscsi {
             type => 'DISK',
             disk => $zvol_path,
             insecure_tpc => JSON::PP::true,
+            # Deliberately no blocksize/pblocksize: a clone carries its
+            # source's data, laid out for the source's sector size (see
+            # _tn_extent_create). Only freshly allocated disks get 4096.
         };
 
         # pool.snapshot.clone returns as soon as ZFS finishes the clone, but
@@ -10893,19 +12504,42 @@ sub _clone_image_iscsi {
             select(undef, undef, undef, 0.2);
         }
         # Fix B: post-hoc reuse on unique-name conflict; see the same
-        # pattern in _alloc_image_iscsi. Defuses both concurrent-path
-        # races and _api_call_mutate self-retry-after-committed-first-
-        # attempt for the linked-clone path.
+        # pattern in _alloc_image_iscsi. Look up by NAME (exact known
+        # value); reuse only when disk field matches ours; log loudly
+        # at level 0 if TN has a same-named extent with a different disk.
         if ($err && _is_extent_name_conflict_error($err)) {
             _clear_cache(_cache_host_key($scfg));
-            my $extents_after = _tn_extents($scfg) // [];
-            my ($hit) = grep { ($_->{disk} // '') eq $zvol_path } @$extents_after;
-            if ($hit) {
-                _log($scfg, 1, 'info',
-                    "[TrueNAS] _clone_image_iscsi: name-conflict resolved by reuse " .
-                    "id=$hit->{id} for $zvol_path (Fix B post-hoc)");
-                $ext = $hit;
-                $err = '';
+            my $by_name_matches = _tn_extent_query_by_name($scfg, $extent_name) // [];
+            my $by_name = $by_name_matches->[0];
+            if ($by_name) {
+                if (($by_name->{disk} // '') eq $zvol_path) {
+                    _log($scfg, 1, 'info',
+                        "[TrueNAS] _clone_image_iscsi: name-conflict resolved by reuse " .
+                        "id=$by_name->{id} name=$extent_name for $zvol_path (Fix B)");
+                    $ext = $by_name;
+                    $err = '';
+                } elsif (_iscsi_extent_recover_stale_base_name($scfg, $by_name, $zvol_path)) {
+                    # Historical create_base extent-rename gap. Stale
+                    # base extent renamed; retry our create once.
+                    $ext = eval {
+                        _api_call_mutate($scfg, 'iscsi.extent.create', [ $extent_payload ]);
+                    };
+                    $err = $@;
+                    if (!$err) {
+                        _log($scfg, 0, 'info',
+                            "[TrueNAS] _clone_image_iscsi: retry after stale-base rename succeeded for $extent_name");
+                    }
+                } else {
+                    _log($scfg, 0, 'err',
+                        "[TrueNAS] _clone_image_iscsi: extent name '$extent_name' " .
+                        "already on TN (id=$by_name->{id}) with disk='" .
+                        ($by_name->{disk} // '<undef>') . "', we expected disk='$zvol_path'. " .
+                        "Refusing to reuse.");
+                }
+            } else {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] _clone_image_iscsi: TN said name '$extent_name' is not unique " .
+                    "but a follow-up iscsi.extent.query does not surface it.");
             }
         }
         if ($err) {
@@ -10944,10 +12578,8 @@ sub _clone_image_iscsi {
 
         # Fallback: re-fetch if create response didn't include lunid
         if (!defined $lun) {
-            my $maps = _tn_targetextents($scfg) // [];
-            my ($existing_map) = grep {
-                (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
-            } @$maps;
+            my $tx_matches = _tn_targetextent_query_by_target_extent($scfg, $target_id, $extent_id) // [];
+            my $existing_map = $tx_matches->[0];
             $lun = $existing_map->{lunid} if $existing_map;
         }
     }
@@ -11066,18 +12698,16 @@ sub _clone_image_nvme {
 
     _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: namespace payload = " . encode_json($ns_payload));
 
-    # pool.snapshot.clone returns as soon as ZFS finishes, but TN validates
-    # nvmet.namespace.create by checking that zvol/<ds> is a block device --
-    # the /dev/zvol symlink may still be waiting on udev. Poll-retry on that
-    # specific validator error only, up to ~3 s, so real errors still surface
-    # immediately. Mirror of the iSCSI clone path.
+    # alpha21: idempotent create defuses retry-storm duplicates AND fixes
+    # the pre-existing gap where _clone_image_nvme had no existing-namespace
+    # check (unlike _alloc_image_nvme and _expose_snapshot_device). A
+    # concurrent-clone race on the same target zvol would previously leave
+    # two namespaces; now the second caller reuses the first.
     my $ns;
     my $ns_err;
     my $max_zvol_wait_attempts = 15;
     for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
-        $ns = eval {
-            _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
-        };
+        $ns = eval { _nvme_create_namespace_idempotent($scfg, $ns_payload) };
         $ns_err = $@;
         last if !$ns_err;
         last if !_is_zvol_not_ready_error($ns_err);
@@ -11112,10 +12742,22 @@ sub _clone_image_nvme {
         _nvme_resync_configfs($deferred_scfg, $deferred_subsys_id, 'clone_image_nvme deferred');
 
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] clone_image_nvme deferred: discovering device for UUID $deferred_uuid");
+        # alpha32: same LOCKHOLD instrumentation as alloc deferred.
+        my $t0 = Time::HiRes::time();
+        my $lap_defer_clone = sub {
+            my ($phase) = @_;
+            _log($deferred_scfg, 0, 'info', sprintf(
+                "[TrueNAS] LOCKHOLD clone_nvme_deferred uuid=%s phase=%s elapsed=%.3fs",
+                $deferred_uuid, $phase, Time::HiRes::time() - $t0));
+        };
+        $lap_defer_clone->('entry');
         usleep(200_000);  # 200ms initial settle
         eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        $lap_defer_clone->('udevadm_settle');
         eval { _nvme_rescan_subsystem_controllers($deferred_scfg) };
-        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
+        $lap_defer_clone->('nvme_rescan');
+        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 0) };
+        $lap_defer_clone->('device_for_uuid');
         if ($dev) {
             _log($deferred_scfg, 1, q{info}, "[TrueNAS] clone_image_nvme deferred: device ready at $dev");
             # And wait for the by-id link, not just the block device. path()
@@ -11131,6 +12773,7 @@ sub _clone_image_nvme {
         } else {
             _log($deferred_scfg, 0, q{warning}, "[TrueNAS] clone_image_nvme deferred: device not yet visible (activate_volume will handle)");
         }
+        $lap_defer_clone->('exit');
     });
 
     return $clone_volname;
@@ -11207,12 +12850,21 @@ sub create_base {
     my ($transport_id, $rewire_method, $rewire_payload);
     my $share_label;
     if ($mode eq 'iscsi') {
-        my $extents = _tn_extents($scfg) // [];
-        my ($extent) = grep { ($_->{disk} // '') eq $old_zvol_path } @$extents;
+        my $matches = _tn_extent_query_by_disk($scfg, $old_zvol_path) // [];
+        my $extent = $matches->[0];
         die "create_base: no iSCSI extent found for $old_zvol_path\n" unless $extent;
         $transport_id   = $extent->{id};
         $rewire_method  = 'iscsi.extent.update';
-        $rewire_payload = { disk => $new_zvol_path };
+        # Rename the extent alongside the disk-field rewrite. Without
+        # the rename, the vm-<vmid>-disk-N-<hash> extent-name slot on
+        # TN stays owned by this (now-base) extent forever; the next
+        # VM allocated at the same VMID hashes to the same name and
+        # gets "iscsi_extent_create.name: Extent name must be unique".
+        # See _iscsi_extent_recover_stale_base_name for the recovery
+        # path that unwinds historical TN state where this rename was
+        # skipped.
+        my $new_extent_name = _generate_extent_name($scfg, $new_zname);
+        $rewire_payload = { disk => $new_zvol_path, name => $new_extent_name };
         $share_label    = "iSCSI extent id=$transport_id";
     } else {
         # nvme-tcp
@@ -11279,15 +12931,16 @@ sub create_base {
     # cause that points the reader at entirely the wrong thing. With retries
     # off, a failure here means "unknown", and the handler below has to find
     # out what actually happened by looking.
-    eval {
+    my $rename_ok = eval {
         _api_call_mutate(
             $scfg,
             'pool.dataset.rename',
             [ $old_full, { new_name => $new_full, force => JSON::PP::true } ],
             { retry_opts => { retry_max => 0 } },
         );
+        1;
     };
-    my $rename_err = $@;
+    my $rename_err = $rename_ok ? undef : $@;
     if ($rename_err) {
         # With retries off, a failure here means "unknown", not "it did not
         # happen" - so find out by looking. Ask about both names: present at
@@ -11307,6 +12960,32 @@ sub create_base {
             $rename_err = undef;
         }
     }
+
+    # On-EEXIST recovery (upstream): TN answers
+    #   [EEXIST] zfs.resource.rename: '<pool>/base-<vmid>-disk-N' already exists
+    # when the target base dataset is left over from a prior template of the
+    # same VMID. If the leftover is an orphan (no children, no linked clones)
+    # remove it and retry the rename once, still without retries for the same
+    # reason as above. Otherwise fall through with the original error.
+    if ($rename_err && _is_dataset_already_exists_error($rename_err) &&
+        _dataset_orphan_check_and_delete($scfg, $new_full)) {
+        _log($scfg, 0, 'info',
+            "[TrueNAS] create_base: retrying rename $old_full -> $new_full after orphan cleanup");
+        $rename_ok = eval {
+            _api_call_mutate(
+                $scfg,
+                'pool.dataset.rename',
+                [ $old_full, { new_name => $new_full, force => JSON::PP::true } ],
+                { retry_opts => { retry_max => 0 } },
+            );
+            1;
+        };
+        $rename_err = $rename_ok ? undef : $@;
+        _log($scfg, 0, 'info',
+            "[TrueNAS] create_base: rename retry after orphan cleanup succeeded for $new_full")
+            if $rename_ok;
+    }
+
     if ($rename_err) {
         if ($mode eq 'nvme-tcp') {
             # Re-enable namespace so we don't leave it disabled.
@@ -11592,8 +13271,19 @@ sub cluster_lock_storage {
         };
     }
 
-    # Run the locked callback via parent implementation
-    my $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $wrapped, @param);
+    # The CFS storage lock is ALWAYS taken by default, with this fork's own
+    # timeout and operation budget. Upstream beta8 bypasses it by default and
+    # takes it only with tn_use_cluster_lock=1; this fork deliberately keeps
+    # the serialization (storage ops across nodes stay ordered, and the
+    # rollback re-check under the lock keeps its meaning). tn_use_cluster_lock
+    # is accepted with default 1; setting it to 0 is an explicit opt-in to
+    # upstream's bypass.
+    my $result;
+    if ($scfg->{tn_use_cluster_lock} // 1) {
+        $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $wrapped, @param);
+    } else {
+        $result = $wrapped->(@param);
+    }
 
     # Execute deferred work outside the lock (best-effort, never die)
     if (@_deferred_work) {

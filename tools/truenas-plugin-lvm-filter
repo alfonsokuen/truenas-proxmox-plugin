@@ -1,0 +1,246 @@
+#!/bin/bash
+# truenas-plugin-lvm-filter -- add or remove an LVM global_filter
+# entry that prevents LVM from scanning TrueNAS-served NVMe/TCP
+# namespaces on the Proxmox host. Addresses GitHub issue #4.
+#
+# WHY:
+#   A guest VM whose disk lives on a TN NVMe namespace often has its
+#   own LVM inside (Ubuntu, RHEL and their derivatives default to
+#   LVM). The host's LVM scanner sees the guest's PV signatures at
+#   the outer namespace level and treats them as host-level PVs.
+#   With many namespaces and many VMs cloned from the same template,
+#   this produces duplicate-VG warnings on every LVM invocation
+#   (pvesm, pvesh, qm, pvestatd polls), and can slow storage-list
+#   API calls past the 596s API timeout -- which in turn breaks
+#   external tools such as Veeam's backup/restore scans.
+#
+#   The fix is to teach LVM's global_filter to reject the block
+#   devices that come from TrueNAS. We match by /dev/disk/by-id/
+#   symlinks whose name starts with `nvme-TrueNAS_`. Those symlinks
+#   are populated by udev from the NVMe controller MODEL string
+#   (e.g. `TrueNAS PowerEdge R730xd`, `TrueNAS FREENAS-MINI-2.0`)
+#   -- local NVMe drives never match, so LOCAL LVM is unaffected.
+#
+# WHICH FILE:
+#   /etc/lvm/lvmlocal.conf is read AFTER /etc/lvm/lvm.conf and
+#   OVERRIDES it. On PVE hosts the effective global_filter usually
+#   lives in a "truenasplugin managed" devices { } block in
+#   lvmlocal.conf. Editing lvm.conf alone would be silently
+#   overridden, so this tool targets the EFFECTIVE file: lvmlocal.conf
+#   when it carries a global_filter line, else lvm.conf. It detects
+#   whether the filter is already active via `lvm dumpconfig`, so it
+#   stays idempotent regardless of which file the filter lives in.
+#
+# WHAT THIS SCRIPT DOES:
+#   --install    Append the reject regex to the effective global_filter
+#                list (lvmlocal.conf preferred, else lvm.conf).
+#                Timestamped backup first. Idempotent (no-op if the
+#                filter is already active in the effective config).
+#   --uninstall  Remove only the regex we added; leave the rest of the
+#                global_filter alone. Timestamped backup first.
+#   --status     Report where the filter lives and whether it is active.
+#   --help       Show this help.
+#
+# WHY THIS ISN'T DONE AT PACKAGE INSTALL:
+#   /etc/lvm/lvm.conf is a conffile owned by the `pve-manager`
+#   package and /etc/lvm/lvmlocal.conf is operator-owned. Debian
+#   policy discourages one package silently editing another's conffile,
+#   and doing so at postinst time would surprise operators who did not
+#   consent to a system-wide LVM config change. This script exists so
+#   the sysadmin can opt in (or out) explicitly, with a clear audit
+#   trail (backup file per invocation) and a clean reversal path.
+#
+# The right long-term home for this fix is pve-manager itself, in
+# the same default global_filter that already excludes ZFS zvols
+# and Ceph rbds. Filing an upstream patch is queued as separate
+# follow-up work.
+
+set -eu
+
+LVM_CONF=/etc/lvm/lvm.conf
+LVM_LOCAL_CONF=/etc/lvm/lvmlocal.conf
+# Marker used to identify our-inserted regex on uninstall. The regex
+# itself is already unique enough that a plain string match on it is
+# safe, but keeping a stable marker gives operators grepping the
+# file a clear "yes, this is from us" signal.
+OUR_REGEX='"r|/dev/disk/by-id/nvme-TrueNAS_.*|"'
+MARKER_TAG='truenas-proxmox-plugin issue #4'
+
+usage() { sed -n '2,57p' "$0"; }
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "must be run as root" >&2; exit 1
+    fi
+}
+
+require_lvm_conf() {
+    [ -f "$LVM_CONF" ] || [ -f "$LVM_LOCAL_CONF" ] \
+        || { echo "no LVM config found ($LVM_CONF / $LVM_LOCAL_CONF) -- is LVM installed?" >&2; exit 2; }
+}
+
+# Echo the file whose global_filter line is in effect. lvmlocal.conf is
+# read after (and overrides) lvm.conf, so it wins when it carries a
+# global_filter line; otherwise lvm.conf. Empty + non-zero if neither.
+target_conf() {
+    local f
+    for f in "$LVM_LOCAL_CONF" "$LVM_CONF"; do
+        if [ -f "$f" ] && grep -qE "^[[:space:]]*global_filter[[:space:]]*=" "$f"; then
+            echo "$f"; return 0
+        fi
+    done
+    return 1
+}
+
+# True if the filter is ALREADY ACTIVE in the effective LVM config,
+# regardless of which file it lives in or whether it is anchored (^...).
+is_effective() {
+    command -v lvm >/dev/null 2>&1 || return 1
+    lvm dumpconfig 2>/dev/null | awk '/global_filter/ && /r\|[^"]*nvme-TrueNAS_/{f=1} END{exit f?0:1}'
+}
+
+# True if our regex+marker are present in the given file.
+file_has_ours() {
+    local f="$1"
+    [ -f "$f" ] || return 1
+    grep -F "$OUR_REGEX" "$f" >/dev/null 2>&1 \
+        && grep -F "$MARKER_TAG" "$f" >/dev/null 2>&1
+}
+
+show_status() {
+    local t
+    t=$(target_conf 2>/dev/null || true)
+    if [ -n "$t" ]; then
+        echo "-- effective global_filter source: $t --"
+        grep -nE "^[[:space:]]*global_filter[[:space:]]*=" "$t" || echo "  (no global_filter line)"
+    else
+        echo "-- no active global_filter line in $LVM_LOCAL_CONF or $LVM_CONF --"
+    fi
+    echo
+    if is_effective; then
+        echo "TrueNAS NVMe filter: ACTIVE in the effective LVM config"
+    else
+        echo "TrueNAS NVMe filter: NOT active"
+    fi
+    if file_has_ours "$LVM_LOCAL_CONF"; then
+        echo "  (our marker found in $LVM_LOCAL_CONF)"
+    fi
+    if file_has_ours "$LVM_CONF"; then
+        echo "  (our marker found in $LVM_CONF)"
+    fi
+}
+
+backup() {
+    local b="$1.bak.$(date +%Y%m%d%H%M%S).truenas-plugin"
+    cp -a "$1" "$b"
+    echo "backup: $b"
+}
+
+do_install() {
+    if is_effective; then
+        echo "TrueNAS NVMe filter is already active. Nothing to do."
+        show_status
+        return 0
+    fi
+    local t
+    if ! t=$(target_conf); then
+        echo "No active global_filter line in $LVM_LOCAL_CONF or $LVM_CONF." >&2
+        echo "Cowardly refusing to create one because that could override" >&2
+        echo "defaults set by pve-manager. Add manually inside a devices { ... } section:" >&2
+        echo "    global_filter = [ $OUR_REGEX ]   # $MARKER_TAG" >&2
+        exit 3
+    fi
+
+    backup "$t"
+    # Insert our regex before the closing "]" of the array on the
+    # global_filter line. Handle both "[a,b,c]" and "[ a, b, c ]"
+    # spacings. Add a same-line comment carrying the marker tag.
+    # Pass regex + marker as perl -s vars so double-quotes inside
+    # the regex don't have to be shell-escaped into a perl literal.
+    perl -i -spe '
+        if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(\s*)$/) {
+            my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
+            $body =~ s/\s+$//;
+            $body .= "," unless $body =~ /,\s*$/ || $body =~ /^\s*$/;
+            $_ = "${lead}${body} ${r} ${close} # ${m}\n";
+        }
+    ' -- -r="$OUR_REGEX" -m="$MARKER_TAG" "$t"
+
+    # The perl edit is a silent no-op (exit 0) when the global_filter array
+    # spans multiple lines or the closing ] carries a trailing comment. The
+    # parse check below cannot catch that because nothing changed -- verify
+    # the marker actually landed (it is absent here: idempotency ran first).
+    if ! grep -qF "$MARKER_TAG" "$t"; then
+        echo "ERROR: edit not applied -- global_filter is multi-line or has a" >&2
+        echo "trailing comment after ]. File unchanged (backup kept). Collapse" >&2
+        echo "the array to one line and re-run." >&2
+        exit 5
+    fi
+
+    # Sanity-check the merged config still parses (lvm dumps config on
+    # stdout; exits non-zero on parse error).
+    if ! lvm dumpconfig >/dev/null 2>&1; then
+        echo "WARNING: LVM config appears to no longer parse. Restore backup:" >&2
+        echo "  cp $t.bak.*.truenas-plugin $t" >&2
+        exit 4
+    fi
+
+    echo "Installed in $t. Refresh LVM's device cache with:"
+    echo "  pvscan --cache"
+    echo "  vgscan --cache"
+    echo "  systemctl restart lvm2-monitor"
+    show_status
+}
+
+do_uninstall() {
+    # Find where our marker lives (lvmlocal.conf preferred, else lvm.conf).
+    local t=""
+    if file_has_ours "$LVM_LOCAL_CONF"; then
+        t="$LVM_LOCAL_CONF"
+    elif file_has_ours "$LVM_CONF"; then
+        t="$LVM_CONF"
+    fi
+    if [ -z "$t" ]; then
+        echo "TrueNAS NVMe filter is not installed by this plugin. Nothing to do."
+        return 0
+    fi
+    backup "$t"
+    # Remove our regex (plus any preceding comma or whitespace) and
+    # the tail comment marker. Keep the rest of the list intact.
+    # Pass regex + marker via perl -s so double-quotes need no
+    # shell-escape and \Q...\E works over $r without interpolation
+    # of the literal string as a pattern.
+    perl -i -spe '
+        if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(.*)$/) {
+            my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
+            $body =~ s/,\s*\Q$r\E\s*//g;
+            $body =~ s/\Q$r\E\s*,\s*//g;
+            $body =~ s/\Q$r\E\s*//g;
+            # normalise stray inner whitespace/comma left after removal
+            $body =~ s/^\s+//; $body =~ s/\s+$//;
+            $body =~ s/,\s*,/,/g;
+            $tail =~ s/\s*#\s*\Q$m\E\s*$//;
+            $_ = "${lead}${body}${close}${tail}\n";
+        }
+    ' -- -r="$OUR_REGEX" -m="$MARKER_TAG" "$t"
+
+    if ! lvm dumpconfig >/dev/null 2>&1; then
+        echo "WARNING: LVM config appears to no longer parse. Restore backup:" >&2
+        echo "  cp $t.bak.*.truenas-plugin $t" >&2
+        exit 4
+    fi
+
+    echo "Removed from $t. Refresh LVM's device cache with:"
+    echo "  pvscan --cache"
+    echo "  vgscan --cache"
+    echo "  systemctl restart lvm2-monitor"
+    show_status
+}
+
+case "${1:-}" in
+    --install)   require_root; require_lvm_conf; do_install ;;
+    --uninstall) require_root; require_lvm_conf; do_uninstall ;;
+    --status)                  require_lvm_conf; show_status ;;
+    -h|--help)   usage ;;
+    *)           usage; exit 1 ;;
+esac

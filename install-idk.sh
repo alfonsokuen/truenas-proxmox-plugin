@@ -43,9 +43,15 @@ set -euo pipefail
 # Bump on every change that is meant to reach a node. raw.githubusercontent
 # caches aggressively, so the only way to know which script is running is
 # for the script to say so.
-INSTALLER_VERSION='idk21.0'
+INSTALLER_VERSION='idk22.0'
 PKG_NAME='truenas-proxmox-plugin'
-BASE_VERSION='2.1.23-alpha1'
+# idk12..idk21 were cut from upstream 2.1.23~alpha1, idk22 onward from
+# 2.1.23~beta8; the release tag carries the upstream base it was cut from.
+base_version_for() {
+    local n="${1#idk}"
+    case "$n" in ''|*[!0-9]*) echo '2.1.23-beta8'; return ;; esac
+    if [ "$n" -le 21 ]; then echo '2.1.23-alpha1'; else echo '2.1.23-beta8'; fi
+}
 GH_API_BASE="${IDK_GH_API_BASE:-https://api.github.com}"
 GH_REPO="${IDK_GH_REPO:-alfonsokuen/truenas-proxmox-plugin}"
 DOWNLOAD_BASE="${IDK_DOWNLOAD_BASE:-}"
@@ -232,7 +238,7 @@ release_json() {
     local url
     if [ -n "$opt_version" ]; then
         # GitHub's tag endpoint needs the '+' of the tag percent-encoded.
-        url="${GH_API_BASE}/repos/${GH_REPO}/releases/tags/v${BASE_VERSION}%2B${opt_version}"
+        url="${GH_API_BASE}/repos/${GH_REPO}/releases/tags/v$(base_version_for "$opt_version")%2B${opt_version}"
     else
         url="${GH_API_BASE}/repos/${GH_REPO}/releases/latest"
     fi

@@ -52,7 +52,13 @@
 # shellcheck disable=SC2029
 set -euo pipefail
 
-BASE_VERSION='2.1.23-alpha1'
+# idk12..idk21 were cut from upstream 2.1.23~alpha1, idk22 onward from
+# 2.1.23~beta8; the release tag carries the upstream base it was cut from.
+base_version_for() {
+    local n="${1#idk}"
+    case "$n" in ''|*[!0-9]*) echo '2.1.23-beta8'; return ;; esac
+    if [ "$n" -le 21 ]; then echo '2.1.23-alpha1'; else echo '2.1.23-beta8'; fi
+}
 VAULT_KEY='apt_signing_truenas_plugin'
 MIN_REVISION=15          # idk15 is the first revision worth serving
 SUITES='bookworm trixie'
@@ -242,7 +248,7 @@ log "publishing revisions: $(echo "$revisions" | tr '\n' ' ')"
 # exits 0 when the manifest happens not to cover the file, and a malformed
 # digest line is only a warning there.
 for rev in $revisions; do
-    tag="v${BASE_VERSION}+${rev}"
+    tag="v$(base_version_for "$rev")+${rev}"
     dir="$workdir/rel/$rev"
     mkdir -p "$dir"
     log "downloading $tag"
@@ -403,7 +409,7 @@ log 'GitHub Pages can take a minute to rebuild.'
 # .../releases/latest/download/install-idk.sh and this is what keeps it
 # current.
 newest_rev="$(printf '%s' "$revisions" | tr ' ' '\n' | grep -v '^$' | tail -n1)"
-newest_tag="v${BASE_VERSION}+${newest_rev}"
+newest_tag="v$(base_version_for "$newest_rev")+${newest_rev}"
 if gh release upload "$newest_tag" "$repo_root/install-idk.sh" -R "$repo_slug" --clobber; then
     log "install-idk.sh uploaded to $newest_tag"
     log "one-line install: https://github.com/$repo_slug/releases/latest/download/install-idk.sh"

@@ -512,6 +512,12 @@ Migrating from iSCSI to NVMe/TCP requires creating new storage and moving VM dis
 ### Optimal Configuration
 
 **ZFS Block Size:**
+
+The plugin does not set a default block size; if `tn_zvol_blocksize` is
+omitted, the zvol inherits TrueNAS's `pool.dataset.create` default
+(16K on TrueNAS SCALE 25.10.x). Tuning suggestions for NVMe/TCP
+workloads:
+
 ```ini
 tn_zvol_blocksize 16K  # Default (what the plugin uses when unset) - small random I/O, databases
 tn_zvol_blocksize 64K  # Good general-purpose choice for VM disks

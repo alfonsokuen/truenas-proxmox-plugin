@@ -123,6 +123,12 @@ CFG
     is($cfg->{ids}{tnA}{storeid}, 'tnA',
         '  ...and check_config() really did stash storeid onto it (this is $scfg everywhere else)');
 
+    # Upstream beta8's schema/wizard assume tn_api_key is always inline; this
+    # fork's section has none (the key lives under /etc/pve/priv) and must
+    # still parse as a valid storage.
+    ok(!exists($cfg->{ids}{tnA}{tn_api_key}),
+        'a section WITHOUT an inline tn_api_key parses (the key is priv-only)');
+
     my $out = PVE::Storage::Plugin->write_config('storage.cfg', $cfg);
     unlike($out, qr/^\s*storeid\b/m,
         'write_config: a REAL write never emits a "storeid" line - only options() keys are ever written');

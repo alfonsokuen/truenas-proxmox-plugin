@@ -118,7 +118,9 @@ sub run_free_image {
     %ret  = %{ $opt{ret}  // {} };
     my $scfg = { %SCFG, %{ $opt{scfg} // {} } };
     my $ok = eval {
-        $PKG->free_image('store', $scfg, $opt{volname}, $opt{isBase}, 'raw');
+        my $worker = $PKG->free_image('store', $scfg, $opt{volname}, $opt{isBase}, 'raw');
+        # the dataset delete runs in the cleanup worker PVE forks afterwards
+        $worker->('UPID:test') if ref($worker) eq 'CODE';
         1;
     };
     return ($ok, $ok ? '' : $@, [@calls], [@logs]);
@@ -132,8 +134,12 @@ sub run_free_nvme {
     my $scfg = { %SCFG, %{ $opt{scfg} // {} } };
     # ($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata)
     my $ok = eval {
-        $free_nvme->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-lun1',
+        # The dataset delete is deferred to the cleanup worker the free
+        # returns (PVE forks it after releasing the storage lock); run it
+        # here the way PVE would.
+        my $worker = $free_nvme->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-lun1',
                      'vm-101-disk-0', 'tank/pve/vm-101-disk-0', undef);
+        $worker->('UPID:test') if ref($worker) eq 'CODE';
         1;
     };
     return ($ok, $ok ? '' : $@, [@calls], [@logs]);

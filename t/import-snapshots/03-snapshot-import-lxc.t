@@ -26,7 +26,7 @@
 #   - a CT template is refused, like a VM template;
 #   - there is never a vmstate.
 #
-# Run with:  prove -v t/nvme/21-snapshot-import-lxc.t
+# Run with:  prove -v t/import-snapshots/03-snapshot-import-lxc.t
 
 use strict;
 use warnings;

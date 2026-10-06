@@ -17,9 +17,9 @@
 #   - it refuses a template, a locked config, a snapshot mid-flight
 #     (snapstate) and any non-cdrom disk living outside this plugin;
 #   - a container is no longer refused, but it is not a VM either: it must
-#     not go through PVE::QemuConfig at all (see 21-snapshot-import-lxc.t).
+#     not go through PVE::QemuConfig at all (see 03-snapshot-import-lxc.t).
 #
-# Run with:  prove -v t/nvme/20-snapshot-import-config.t
+# Run with:  prove -v t/import-snapshots/02-snapshot-import-config.t
 
 use strict;
 use warnings;
@@ -425,7 +425,7 @@ sub refuses {
     # A VMID with an /etc/pve/lxc/<vmid>.conf is a container, and a
     # container is not a VM: the QemuConfig stubs in this file must not be
     # reached at all. What a container then DOES is the subject of
-    # 21-snapshot-import-lxc.t; here it only has to stop being a VM.
+    # 03-snapshot-import-lxc.t; here it only has to stop being a VM.
     reset_world();
     my $dir = tempdir(CLEANUP => 1);
     open(my $lxc, '>', "$dir/$VMID.conf") or die $!;

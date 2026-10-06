@@ -133,6 +133,20 @@ Copy the `key` value from step 4's response into `tn_api_key` in `storage.cfg` (
 - **Roles are global, not dataset-scoped.** `DATASET_WRITE`/`DATASET_DELETE` let the key touch *any* dataset on the TrueNAS system, not just the one configured in `tn_dataset`. TrueNAS's RBAC model authorizes at the method level, not per-resource - there's no built-in way to confine a role to a single dataset subtree.
 - **`api_key.create` only takes a `username`.** There's no way to assign roles to a key directly; the key inherits its owning user's roles, which come from group membership + an attached Privilege, as shown above.
 - **This is verified against TrueNAS SCALE 25.10.2.1.** Role names and method-to-role mappings come from that version's `core.get_methods` output. Re-verify with the same command if running a materially newer TrueNAS release.
+- **The `install.sh` wizard's optional "detect available portal IPs" step calls `interface.query`, which requires `READONLY_ADMIN` or `NETWORK_INTERFACE_READ` - neither is in the least-privilege role set above.** A least-privilege key still authenticates fine (the wizard's health check uses `auth.me` and never `system.info`, as of the `alpha` branch), but the auto-suggested portal-IP list will be empty. Enter the portal IP by hand instead. Both roles would broaden the key's reach beyond what the plugin needs; adding them just to placate the wizard is not recommended.
+
+## install.sh vs. the plugin runtime
+
+This document scopes to methods the plugin itself calls at runtime. `install.sh` (the interactive installer/wizard/health-check tool) has a slightly broader footprint because it inspects the TrueNAS system to auto-suggest values and to display version information. Everything install.sh does with a least-privilege key still works; a few nice-to-have panels degrade gracefully:
+
+| install.sh call | Role needed | Least-privilege behavior |
+| --- | --- | --- |
+| `auth.me` (health check) | none (any authenticated key) | works |
+| `system.info` (best-effort version display in `test_truenas_api`) | `READONLY_ADMIN` or `SYSTEM_GENERAL_READ` | version string omitted; connectivity still confirmed |
+| `interface.query` (portal-IP auto-suggest) | `READONLY_ADMIN` or `NETWORK_INTERFACE_READ` | operator types the portal IP by hand |
+| `iscsi.global.config`, `iscsi.portal.query`, `iscsi.target.query`, `iscsi.extent.query`, `iscsi.targetextent.query`, `pool.query`, `pool.dataset.query`, `service.query`, `nvmet.subsys.query`, `nvmet.port.query`, `nvmet.namespace.query`, `core.ping` | Covered by the plugin's runtime role set above | works |
+
+Prior to the `alpha` branch fix for issue #113, the health check used `system.info` and would fail against a least-privilege key with a misleading "authentication failed" message. Upgrade to the current `alpha` tip if you are running an older `install.sh`.
 
 ## See also
 

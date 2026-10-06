@@ -63,13 +63,16 @@ ok(!$retryable->($_), "not retryable: $_") for (
     "zfs_create('pool/x') failed: already exists",
     'IntegrityError: FOREIGN KEY constraint failed',
     'JSON-RPC error [EINVAL]: Invalid params',
+    # middlewared's traceback names RpcWebSocketApp and closed=False; upstream
+    # beta3 dropped the /WebSocket.*closed/ alternative because of it.
+    'RpcWebSocketApp object at 0x7f ... EventLoop closed=False',
 );
 
 # --- transport failures: still retried --------------------------------------
 ok($retryable->($_), "retryable: $_") for (
     'WS read timeout after 30s',
     'connection reset by peer',
-    'WebSocket connection closed unexpectedly',
+    'WS payload read failed',
     'broker: read failed: Broken pipe',
     '503 Service Unavailable',
 );

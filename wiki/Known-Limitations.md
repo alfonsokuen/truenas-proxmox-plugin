@@ -5,16 +5,16 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 ## Table of Contents
 
 - [Critical Workflow Limitations](#critical-workflow-limitations)
-  - [VM Deletion Behavior](#vm-deletion-behavior)
+  - [VM deletion (`qm destroy`)](#vm-deletion-qm-destroy)
 - [Storage Feature Limitations](#storage-feature-limitations)
-  - [No Fast Clone Support](#no-fast-clone-support)
+  - [Where the plugin's `clone_image()` is invoked](#where-the-plugins-clone_image-is-invoked)
   - [No Volume Shrinking](#no-volume-shrinking)
   - [Resize Headroom Limit](#resize-headroom-limit)
 - [Content Type Limitations](#content-type-limitations)
-  - [Block Content Only](#block-content-only)
+  - [Supported content types](#supported-content-types)
+  - [Not supported (and probably shouldn't be, in this plugin)](#not-supported-and-probably-shouldnt-be-in-this-plugin)
 - [Snapshot Limitations](#snapshot-limitations)
-  - [No Backup Integration](#no-backup-integration)
-  - [Snapshots Don't Enable Fast Clones](#snapshots-dont-enable-fast-clones)
+  - [vzdump captures live state, not snapshot history](#vzdump-captures-live-state-not-snapshot-history)
 - [Live Migration Limitations](#live-migration-limitations)
   - [Requires Shared Storage](#requires-shared-storage)
   - [vmstate Storage Considerations](#vmstate-storage-considerations)
@@ -31,6 +31,8 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 - [Security Limitations](#security-limitations)
   - [No Mutual CHAP](#no-mutual-chap)
   - [API Key Storage](#api-key-storage)
+  - [No SCSI persistent reservations for HA fencing](#no-scsi-persistent-reservations-for-ha-fencing)
+  - [`rename_volume` not implemented](#rename_volume-not-implemented)
 - [Performance Limitations](#performance-limitations)
   - [Clone Performance](#clone-performance)
   - [Snapshot Overhead](#snapshot-overhead)
@@ -49,144 +51,48 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
 
 ## Critical Workflow Limitations
 
-### VM Deletion Behavior
+### VM deletion (`qm destroy`)
 
-**Different VM deletion methods have different cleanup behaviors.**
+**Works correctly.** `qm destroy VMID --purge` cleans the Proxmox-side
+config *and* calls the plugin's `free_image()` for every disk the VM
+owned, which removes the zvol, the iSCSI extent, and the target-extent
+mapping on TrueNAS. The same path runs when you delete the VM from
+the web UI — both go through `PVE::QemuServer::destroy_vm` →
+`foreach_volume_full` → `path()` → `remove_owned_drive` → `free_image()`.
 
-#### ✅ GUI Deletion (Recommended)
-
-**Method**: Delete VMs through Proxmox web interface
-
-**Behavior**:
-- Properly calls storage plugin cleanup methods
-- Achieves 100% cleanup of Proxmox volumes AND TrueNAS zvols/snapshots
-- Removes iSCSI extents and targetextents
-- No orphaned resources
-
-**Recommendation**: **This is the required method for production use**
-
-#### ❌ CLI `qm destroy` Command
-
-**Method**: Using `qm destroy VMID` command
-
-**Behavior**:
-- Does NOT call storage plugin cleanup methods
-- Leaves orphaned zvols on TrueNAS
-- Leaves orphaned iSCSI extents and targetextents
-- Proxmox removes internal references but TrueNAS storage remains unconsumed
-
-**Impact**:
-- Wasted storage space on TrueNAS
-- Orphaned iSCSI configuration
-- Manual cleanup required
-
-#### Manual Cleanup Required After `qm destroy`
-
-If you used `qm destroy`, clean up manually:
-
-```bash
-# 1. List remaining volumes for deleted VM
-pvesm list truenas-storage | grep vm-VMID
-
-# 2. Free each volume
-pvesm free truenas-storage:vm-VMID-disk-0-lunX
-pvesm free truenas-storage:vm-VMID-disk-1-lunY
-
-# 3. If plugin cleanup fails, manual TrueNAS cleanup:
-# On TrueNAS:
-zfs list -t volume | grep vm-VMID
-zfs destroy tank/proxmox/vm-VMID-disk-0
-zfs destroy tank/proxmox/vm-VMID-disk-1
-
-# In TrueNAS web UI: Shares > Block Shares (iSCSI) > Extents
-# Delete extents for vm-VMID manually
-```
-
-#### Automation Scripts
-
-If you use automation scripts that call `qm destroy`, add cleanup:
-
-```bash
-#!/bin/bash
-VMID=$1
-STORAGE="truenas-storage"
-
-# Get list of disks before deletion
-DISKS=$(pvesm list $STORAGE | grep "vm-$VMID" | awk '{print $1}')
-
-# Destroy VM
-qm destroy $VMID
-
-# Clean up storage
-for disk in $DISKS; do
-    echo "Cleaning up $disk"
-    pvesm free "$disk" || echo "Warning: Failed to free $disk"
-done
-```
-
-### Why This Happens
-
-Proxmox's `qm destroy` command:
-1. Removes VM configuration from `/etc/pve/qemu-server/`
-2. Removes internal volume references
-3. **Does NOT** call storage plugin's `free_image()` method
-4. **Does NOT** perform storage-specific cleanup
-
-The web UI delete button:
-1. Calls `qm destroy` with proper cleanup flags
-2. Explicitly calls storage plugin cleanup methods
-3. Ensures complete resource deallocation
+Earlier plugin releases (pre-2.1.23~beta8) had a bug where `path()`
+could hang 60 seconds and abort the destroy loop before `free_image`
+ran, leaking state when the destroy ran on a node that had never
+activated the disk locally (cross-node destroy of an orphan, destroy
+after a leaked config-migrate, destroy on a node with the iSCSI
+session down). That is tracked as #88 and is fixed in beta8:
+`path()` now returns a deterministic by-path string when the device
+is not locally attached, so the destroy loop never hangs. If you are
+running pre-beta8 and see orphan zvols on TrueNAS after
+`qm destroy` on a node where the disk was never activated, upgrade
+to beta8 or later.
 
 ## Storage Feature Limitations
 
-### No Fast Clone Support
+### Where the plugin's `clone_image()` is invoked
 
-**Limitation**: VM cloning does not use instant ZFS clones
+The plugin exposes `clone_image()`, which performs an instant ZFS
+clone on TrueNAS via `pool.snapshot.clone` — no data copy, metadata
+only. PVE invokes it for **linked clones from a template**:
 
-**Explanation**:
-- Proxmox treats iSCSI storage as "generic block storage"
-- For block storage, Proxmox uses network-based `qemu-img convert`
-- Plugin's efficient `clone_image()` and `copy_image()` methods are never called
-- ZFS instant clone capability is unused during VM cloning
+1. `qm template VMID` runs the plugin's `create_base`, which
+   renames the source zvol to `base-VMID-disk-N` and takes an
+   immutable `@__base__` snapshot.
+2. `qm clone BASE_VMID NEW_VMID` (linked clone) calls the plugin's
+   `clone_image()`, which clones the `@__base__` snapshot on
+   TrueNAS.
 
-**Performance Impact**:
-- Clone operations transfer data over network at connection speed (e.g., 1GbE = ~100MB/s)
-- Large VMs (32GB+) can take significant time to clone
-- Network bandwidth is consumed during cloning operation
-- No space efficiency benefit from ZFS clones
-
-**Workarounds**:
-
-#### 1. Use Smaller Base Images
-```bash
-# Create minimal templates
-# Add data/applications after cloning completes
-# Smaller templates = faster clones
-```
-
-#### 2. Ensure Adequate Network Bandwidth
-```bash
-# Use 10GbE or faster network between Proxmox and TrueNAS
-# Dedicated storage network
-# Jumbo frames (MTU 9000)
-```
-
-#### 3. Leverage Thin Provisioning
-```ini
-# Sparse volumes reduce data to copy
-tn_sparse 1
-```
-
-#### 4. Use ZFS Snapshots Instead
-```bash
-# ZFS snapshots ARE instant and space-efficient
-qm snapshot 100 template-state
-
-# Snapshots can be used for quick rollback
-# But not for creating independent VM clones
-```
-
-**Note**: This is a Proxmox architectural limitation, not a plugin bug. Proxmox categorizes storage plugins that return block device paths as "external" storage and bypasses plugin clone methods.
+Full clones (`qm clone --full`) and cross-storage disk moves
+(`qm move_disk`) are routed by PVE through its own data-copy
+mechanisms, not through our `clone_image()`. For cross-storage
+*moves*, prefer `pvesm export | pvesm import` or
+`qm migrate … --targetstorage`, which route through the plugin's
+`volume_export`/`volume_import` methods (as of 2.1.23~beta8+).
 
 **ZFS clones are not unavailable, they are unused here**: the plugin does
 create a ZFS clone for a linked clone of a template (`create_base` plus
@@ -246,86 +152,89 @@ Safety margin: 20GB (for ZFS metadata, snapshots, etc.)
 
 ## Content Type Limitations
 
-### Block Content Only
+### Supported content types
 
-**Limitation**: only `images` (VM disks) and `rootdir` (LXC root disks)
-are supported
+The plugin ships block storage over iSCSI or NVMe/TCP. Two PVE
+content types are supported:
 
-**Not Supported**:
-- ISO images (`iso`)
-- Container templates (`vztmpl`)
-- Backups (`backup`)
-- Snippets (`snippets`)
+- **`images`** — VM virtual disks (default; always available).
+- **`rootdir`** — LXC container root volumes (opt-in; add `rootdir`
+  to the storage's `content` field in `storage.cfg`). The plugin
+  allocates a zvol per container, formats it ext4, mounts it on the
+  node under `/mnt/<storage>/pct-<vmid>-rootdir/` during
+  `activate_volume`, and tears the mount down in `deactivate_volume`.
+  Tested end-to-end by the Proxmox storage-plugin-validation suite:
+  container create, start, backup to PBS, restore round-trip.
 
-This plugin hands PVE a block device per volume. `iso`, `vztmpl`,
-`backup` and `snippets` are file content: PVE expects a directory it can
-write files into, which a zvol is not. Export a dataset from the same
-TrueNAS over NFS or SMB and add it as a separate `nfs`/`cifs` storage for
-those - the same array, a different storage entry.
+### Not supported (and probably shouldn't be, in this plugin)
 
-**Explanation**:
-- The plugin provides block storage (iSCSI or NVMe/TCP): one device per volume
-- A VM disk and an LXC root disk are block devices, so both are supported
-- ISOs, container templates, backups and snippets are files, and PVE
-  writes them into a directory it can mount
+- **`iso`** (ISO images), **`vztmpl`** (LXC templates), **`snippets`**
+  (cloud-init hook scripts and user-data).
+- **`backup`** (vzdump archives).
+- **`import`** (OVF/VMA staging).
 
-**Workaround**:
-```bash
-# Use separate storage for the file-based content types:
-# - NFS/SMB share from the SAME TrueNAS for ISOs, templates, snippets
-# - PBS (Proxmox Backup Server) for backups
+**Why not here**: all of these are file-level content, not block.
+PVE has first-class storage types (NFS, dir, CephFS, PBS) that are
+better fits — point one of those at a TrueNAS NFS share, PBS
+datastore, or local directory. Running these through this plugin
+would mean growing a parallel NFS-mount code path next to the
+iSCSI/NVMe one.
 
-# Example /etc/pve/storage.cfg:
-truenasplugin: truenas-vms
-    # ... config ...
+**Workaround — split by content type in `storage.cfg`:**
+
+```ini
+truenasplugin: truenas-storage
+    # ... VM disks and LXC root volumes ...
     content images,rootdir
 
-nfs: truenas-files
+nfs: truenas-iso
     server 192.168.1.100
-    export /mnt/tank/pve-files
-    content iso,vztmpl,backup,snippets
+    export /mnt/tank/pve-iso
+    content iso,vztmpl,snippets
+
+pbs: pbs
+    server 192.168.0.145
+    datastore main
+    content backup
+    # ... fingerprint/username/password elsewhere ...
 ```
 
 ## Snapshot Limitations
 
-### No Backup Integration
+### vzdump captures live state, not snapshot history
 
-**Limitation**: ZFS snapshots are not included in Proxmox backups
+`vzdump` (and PBS backup) always captures the **current** VM disk
+state. The ZFS snapshot history on TrueNAS is separate — it stays on
+TrueNAS, not in the backup archive. This is standard PVE behavior,
+same as any other block-based storage plugin.
 
-**Explanation**:
-- Proxmox `vzdump` backup tool doesn't integrate with storage plugin snapshots
-- ZFS snapshots remain on TrueNAS, not exported
-- Backups capture current disk state only, not snapshot history
+**What this means in practice:**
 
-**Impact**:
-- Snapshots are not portable
-- Restoring VM from backup doesn't restore snapshots
-- Snapshots must be managed separately
+- `vzdump → PBS` and `vzdump → local directory` both work end-to-end
+  for VMs with disks on this plugin, in both `--mode stop` and
+  `--mode snapshot`. For running VMs in snapshot mode, the plugin's
+  `volume_snapshot` is called to create an ephemeral ZFS snapshot and
+  `_expose_snapshot_device` publishes a clone-of-snapshot as a device
+  the backup can read, then both are torn down after. Verified on
+  the storage-plugin-validation suite 2026-10 against both iSCSI and
+  NVMe/TCP, into PBS.
+- Restoring a backup produces a VM with the **disk contents as of
+  backup time**. It does NOT recreate the chain of ZFS snapshots that
+  existed on TrueNAS at backup time.
 
-**Workaround**:
-```bash
-# For backups including snapshot history:
-# 1. Use TrueNAS replication to replicate ZFS datasets
-# 2. Or use Proxmox Backup Server for VM backups
-# 3. Manage ZFS snapshots via TrueNAS (automated snapshot tasks)
+**If you want snapshot history preserved offsite:**
 
-# TrueNAS snapshot schedule:
-# Storage > Snapshots > Add
-# - Dataset: tank/proxmox
-# - Schedule: Hourly/Daily/Weekly
-# - Retention: As needed
-```
+- Set up TrueNAS-side snapshot schedules on `tank/proxmox` (or
+  whatever dataset the plugin manages). TrueNAS keeps the full
+  snapshot chain under its retention rules.
+- Add a TrueNAS replication task to replicate `tank/proxmox` to
+  another TrueNAS. ZFS send/recv preserves the full snapshot chain.
+- Keep PBS as your Proxmox-side VM backup (fast dedup, cross-storage
+  restore). It will keep its own history of backup snapshots.
 
-### Snapshots Don't Enable Fast Clones
-
-**Limitation**: VM snapshots don't enable ZFS clone-based VM cloning
-
-**Explanation**:
-- VM snapshots create ZFS snapshots on TrueNAS (instant, efficient)
-- But VM cloning still uses network-based copy (see "No Fast Clone Support" above)
-- Proxmox doesn't use ZFS clones for VM cloning, even from snapshots
-
-**Impact**: Same as fast clone limitation
+The two mechanisms are complementary, not substitutes. Use PBS for
+"restore the VM", TN replication for "preserve the ZFS snapshot
+chain for forensics or long-term rollback".
 
 ## Live Migration Limitations
 
@@ -525,6 +434,50 @@ tn_portals [2001:db8::101]:3260,[2001:db8::102]:3260
 ls -la /etc/pve/storage.cfg
 # -rw-r----- 1 root www-data
 ```
+
+### No SCSI persistent reservations for HA fencing
+
+**Limitation**: The plugin does not acquire or release SCSI
+persistent reservations on `activate_volume` / `deactivate_volume`.
+
+**Explanation**: In a Proxmox HA cluster, when a node is fenced
+out, the fenced node's iSCSI target-extent mapping stays as-is on
+TrueNAS. HA will restart the VM on another node, which re-activates
+the same LUN. If the fenced node ever comes back and re-enters the
+cluster before TrueNAS has invalidated the stale initiator session,
+both nodes briefly have the LUN visible — split-brain write risk,
+bounded only by what the TrueNAS target enforces at the SCST layer
+(which, without reservations configured, is nothing).
+
+**Impact**: Serious HA deployments on top of this plugin do not get
+plugin-level split-brain protection. The TN target itself does not
+currently drive persistent reservations on behalf of the plugin.
+
+**Mitigation**:
+- Rely on PVE's own fencing (watchdog + corosync membership
+  consensus) to ensure the fenced node is truly down before the
+  surviving node takes over.
+- Keep storage-network and corosync-network reliable; most "false
+  fence" scenarios come from flaky corosync, not storage.
+- A plugin that drives SCSI PR explicitly is on the roadmap but not
+  shipped as of 2.1.23~beta8.
+
+### `rename_volume` not implemented
+
+**Limitation**: The plugin does not implement PVE's
+`rename_volume()` method.
+
+**Impact**: A few housekeeping paths in PVE core die with
+`not implemented in storage plugin 'PVE::Storage::Custom::TrueNASPlugin'`:
+
+- Changing a VM's VMID (`qm set --newid`-style flows).
+- Some edge cases of PVE's volume-renaming utilities.
+
+**Workaround**: These are uncommon operations. For VMID change,
+clone → verify → destroy old is the stable workflow until
+`rename_volume` lands. The implementation path exists on the
+TrueNAS side (`zfs rename` + iSCSI extent `name` update); the
+plugin just doesn't expose it yet.
 
 ## Performance Limitations
 

@@ -6,6 +6,12 @@
 # Interactive installation, update, and configuration wizard
 #
 
+# Re-exec under bash when invoked via `sh install.sh`: dash ignores the
+# shebang and dies on the bashisms below (e.g. [[ =~ ]]) with a syntax
+# error. POSIX-safe on purpose — nothing bash-specific may run first.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
 set -euo pipefail
 
 # ============================================================================
@@ -26,7 +32,10 @@ readonly LOG_FILE="${TRUENAS_TEST_LOG_FILE:-/var/log/truenas-installer.log}"
 readonly APT_REPO_URL="https://truenas.github.io/truenas-proxmox-plugin/apt/"
 readonly APT_KEY_URL="https://truenas.github.io/truenas-proxmox-plugin/apt/pubkey.gpg"
 readonly APT_KEYRING_PATH="/etc/apt/keyrings/truenas-proxmox-plugin.gpg"
-readonly APT_SOURCES_PATH="/etc/apt/sources.list.d/truenas-proxmox-plugin.sources"
+readonly APT_SOURCES_PATH="${TRUENAS_TEST_APT_SOURCES:-/etc/apt/sources.list.d/truenas-proxmox-plugin.sources}"
+# The fork's own APT source (install-idk.sh writes this one, not the upstream
+# file above); get_install_source must see it or an IDK node reads as "dpkg".
+readonly APT_SOURCES_PATH_IDK="${TRUENAS_TEST_APT_SOURCES_IDK:-/etc/apt/sources.list.d/truenas-proxmox-plugin-idk.sources}"
 readonly APT_PACKAGE_NAME="truenas-proxmox-plugin"
 
 # Exit codes
@@ -421,8 +430,12 @@ check_dependencies() {
 
 # Detect if running on a Proxmox cluster node
 is_cluster_node() {
-    # Check if /etc/pve directory exists and has cluster configuration
-    if [[ -d "/etc/pve/nodes" ]] && [[ $(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) -gt 1 ]]; then
+    # Cluster membership comes from the authoritative count (get_cluster_node_count),
+    # which reads /etc/pve/.members rather than counting /etc/pve/nodes/ subdirs —
+    # the latter can include stale directories left behind by removed/renamed nodes.
+    local count
+    count=$(get_cluster_node_count)
+    if [[ "${count:-0}" -gt 1 ]]; then
         return 0
     fi
     return 1
@@ -430,7 +443,15 @@ is_cluster_node() {
 
 # Get cluster node count
 get_cluster_node_count() {
-    if [[ -d "/etc/pve/nodes" ]]; then
+    # Count the authoritative membership list (/etc/pve/.members) — the same
+    # source get_cluster_nodes() reads. Do NOT count /etc/pve/nodes/ subdirs:
+    # they can include stale directories from removed/renamed nodes (e.g. an old
+    # "pve-920x-3"), which inflates the reported cluster size.
+    local count
+    count=$(get_cluster_nodes 2>/dev/null | grep -c .)
+    if [[ -n "$count" ]] && [[ "$count" -ge 1 ]]; then
+        echo "$count"
+    elif [[ -d "/etc/pve/nodes" ]]; then
         find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
     else
         echo "0"
@@ -639,12 +660,87 @@ validate_cluster_ssh() {
     return 0
 }
 
+# Collect multipath/iscsid parity facts for a TrueNAS target on one node (#21).
+# Runs a self-contained POSIX sh script locally or over ssh, so it does not
+# depend on the remote node having the same installer version. Read-only.
+# Args: $1 = kind (iscsi|nvme), $2 = target (IQN or NQN), $3 = node IP ("" = local)
+# kind/target are passed to the script via environment (not positional args):
+# `sh -s` positional-arg semantics differ between dash and bash-as-sh.
+# Prints: "records sessions luns"
+#   iscsi: records = portal node records, sessions = active sessions,
+#          luns = by-path devices for the target
+#   nvme:  records = 1 if the subsystem is connected, sessions = 0 (unused),
+#          luns = live namespaces across the subsystem's controllers
+collect_parity_facts() {
+    local kind="$1"
+    local target="$2"
+    local node_ip="${3:-}"
+    local script
+    read -r -d '' script <<'PARITY_SCRIPT' || true
+if [ "$kind" = "nvme" ]; then
+    # Exact NQN match: the header line is 'nvme-subsysN - NQN=<nqn>'; compare
+    # the value after the first 'NQN=' for equality (a substring match would
+    # also accept sibling subsystems whose NQN is a superstring of the
+    # target). Controllers are taken from port lines only (' +- nvmeN
+    # tcp/pcie …') so an NQN that happens to contain 'nvme<digit>' cannot
+    # inject a local PCIe controller into the count.
+    subsys=0
+    ctrls=$(nvme list-subsys 2>/dev/null | awk -v nqn="$target" '
+        {
+            p = index($0, "NQN=")
+            if (p > 0) { inb = (substr($0, p + 4) == nqn) }
+        }
+        inb && $2 ~ /^nvme[0-9]+$/ { print $2 }
+    ' | sort -u)
+    if [ -n "$ctrls" ]; then subsys=1; fi
+    luns=0
+    for c in $ctrls; do
+        # Namespace devices only: /dev/${c}n* also matches partition nodes
+        # (nvmeXnYpZ), which would inflate the count and produce a permanent
+        # spurious WARN on a partitioned LUN.
+        n=$(ls /dev/${c}n* 2>/dev/null | grep -vcE 'n[0-9]+p[0-9]+$' || true)
+        luns=$((luns + n))
+    done
+    echo "$subsys 0 $luns"
+else
+    recs=$(iscsiadm -m node 2>/dev/null | awk -v t="$target" '$2 == t' | wc -l)
+    sess=$(iscsiadm -m session 2>/dev/null | awk -v t="$target" '$1 == "tcp:" { for (i = 2; i <= NF; i++) if ($i == t) { n++; break } } END { print n + 0 }')
+    luns=$(ls /dev/disk/by-path 2>/dev/null | grep -cF "iscsi-${target}-lun-" || true)
+    echo "$recs $sess ${luns:-0}"
+fi
+PARITY_SCRIPT
+    if [[ -z "$node_ip" ]]; then
+        kind="$kind" target="$target" sh -c "$script"
+    else
+        printf '%s\n' "$script" | ssh -o ConnectTimeout=5 -o BatchMode=yes "root@${node_ip}" "kind='$kind' target='$target' sh -s"
+    fi
+}
+
 # ============================================================================
 # INSTALLATION STATE DETECTION
 # ============================================================================
 
 # Get currently installed plugin version
+# When the plugin is dpkg-managed, the package version is the
+# authoritative source (issue #87, tracked in #93): the embedded
+# $VERSION string in the .pm was frozen at 2.1.5 for a long stretch of
+# releases (see #64), so a stale raw-file copy reported the wrong
+# version permanently. Returns the semver core (e.g. "2.1.23") with the
+# Debian revision (+deb1) and pre-release suffix (-beta5 / ~beta5)
+# stripped — compare_versions() and GitHub tag lookups cannot handle
+# those.
 get_installed_version() {
+    local dpkg_version
+    dpkg_version=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || dpkg_version=""
+    if [[ -n "$dpkg_version" ]]; then
+        local core
+        core=$(printf '%s' "$dpkg_version" | grep -Po '^[0-9]+(\.[0-9]+)*' || true)
+        if [[ -n "$core" ]]; then
+            echo "$core"
+            return 0
+        fi
+    fi
+
     if [[ ! -f "$PLUGIN_FILE" ]]; then
         echo ""
         return 1
@@ -672,7 +768,23 @@ get_installed_prerelease_status() {
         return 0
     fi
 
-    # Fetch release data from GitHub for this version
+    # dpkg-managed: derive pre-release status from the package version
+    # string itself (e.g. 2.1.23~beta5, 2.1.21-alpha1) — no network
+    # round-trip needed, and it works even when the release API does not
+    # expose the exact tag.
+    local dpkg_version
+    dpkg_version=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || dpkg_version=""
+    if [[ -n "$dpkg_version" ]]; then
+        local pre_re='[-~](alpha|beta|rc)[0-9]'
+        if [[ "$dpkg_version" =~ ${pre_re} ]]; then
+            echo "true"
+        else
+            echo "false"
+        fi
+        return 0
+    fi
+
+    # Fetch release data from GitHub for this version (raw-file install)
     local release_data
     release_data=$(github_api_call "/releases/tags/v${version}" 2>/dev/null) || {
         # If API call fails, assume not a pre-release
@@ -701,6 +813,43 @@ get_install_state() {
     else
         echo "not_installed"
     fi
+}
+
+# Get install source classification (issue #93 sweep, P0).
+# Returns one of:
+#   apt  = dpkg package registered AND the plugin APT source is configured
+#   dpkg = dpkg package registered via bare `dpkg -i` (no plugin APT source)
+#   raw  = no dpkg package (raw-file install)
+# apt and bare `dpkg -i` are indistinguishable in dpkg state; the configured
+# APT source file (APT_SOURCES_PATH) is the tell.
+get_install_source() {
+    if dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
+        if [[ -f "$APT_SOURCES_PATH" || -f "$APT_SOURCES_PATH_IDK" ]]; then
+            echo "apt"
+        else
+            echo "dpkg"
+        fi
+    else
+        echo "raw"
+    fi
+}
+
+# Echo the APT candidate version for the plugin package (empty string when the
+# package is not installed or no candidate is published). Single source of truth
+# for reading the APT candidate, shared by check_for_updates and the update action
+# so the two never diverge.
+get_apt_candidate_version() {
+    local v
+    v=$(apt-cache policy "$APT_PACKAGE_NAME" 2>/dev/null \
+        | awk -F': ' '/^  Candidate:/{print $2}' | xargs)
+    # apt-cache prints the literal sentinel '(none)' when no candidate exists
+    # (unreachable repo / unknown package). Normalize it to empty so callers
+    # can rely on -z alone instead of remembering the sentinel spelling.
+    if [[ -z "$v" || "$v" == "(none)" || "$v" == "none" ]]; then
+        echo ""
+        return 0
+    fi
+    printf '%s\n' "$v"
 }
 
 # ============================================================================
@@ -963,6 +1112,32 @@ apt_bootstrap_install() {
         error "Failed to download APT key from $APT_KEY_URL"
         return 1
     fi
+    # Validate before installing: a 200-with-empty-body (or truncated) key
+    # download passes download_file, and installing it leaves a 0-byte
+    # keyring that fails every apt signature check afterwards.
+    #
+    # Accept either an ASCII-armored key (starts with "-----BEGIN PGP
+    # PUBLIC KEY BLOCK-----") or a binary OpenPGP public key (first byte
+    # 0x98 or 0x99: the old-format Public-Key packet tag). The /apt/
+    # keyring convention under Debian trixie's Signed-By is binary, so
+    # servers routinely publish the binary form — rejecting it is wrong.
+    local first_byte
+    first_byte=$(head -c 1 "$key_tmp" | od -An -tu1 | tr -d ' ')
+    local is_valid_key=0
+    if [[ ! -s "$key_tmp" ]]; then
+        is_valid_key=0
+    elif grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$key_tmp"; then
+        is_valid_key=1
+    elif [[ "$first_byte" == "152" || "$first_byte" == "153" ]]; then
+        # 0x98 (152) or 0x99 (153) = OpenPGP old-format public-key packet.
+        is_valid_key=1
+    fi
+    if [[ "$is_valid_key" != "1" ]]; then
+        rm -f "$key_tmp"
+        echo -e "${c1}FAILED${c0}"
+        error "Downloaded APT key is empty or not a valid PGP key (neither ASCII-armored nor binary OpenPGP) -- not installing it"
+        return 1
+    fi
     install -m 0644 "$key_tmp" "$APT_KEYRING_PATH"
     rm -f "$key_tmp"
     echo -e "${c2}OK${c0}"
@@ -991,11 +1166,32 @@ EOF
     echo -e "${c2}OK${c0}"
 
     if dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
-        printf "%-30s " "Upgrading package:"
-        if ! apt-get install --only-upgrade -y "$APT_PACKAGE_NAME"; then
-            echo -e "${c1}FAILED${c0}"
-            error "Failed to upgrade $APT_PACKAGE_NAME"
-            return 1
+        # Preserve the current version (plugin file + .deb) before we change
+        # it, so a later rollback can restore it dpkg-consistently. The .deb
+        # must be captured BEFORE the upgrade, since apt-get replaces the
+        # cached .deb with the new version's. No-op when nothing to back up.
+        backup_plugin || warning "Could not back up current version before APT upgrade"
+        if [[ ! -f "$PLUGIN_FILE" ]]; then
+            # Package is registered but the plugin file is missing — this
+            # is the state left behind by the installer's uninstall menu,
+            # which removes the raw file without `apt remove`. A plain
+            # upgrade is a no-op here (apt reports "already the newest
+            # version"), so the file would never be restored and the
+            # verify step below would fail. Reinstall instead (issue
+            # #105, tracked in #93).
+            printf "%-30s " "Reinstalling package (plugin file missing):"
+            if ! apt-get install --reinstall -y "$APT_PACKAGE_NAME"; then
+                echo -e "${c1}FAILED${c0}"
+                error "Failed to reinstall $APT_PACKAGE_NAME"
+                return 1
+            fi
+        else
+            printf "%-30s " "Upgrading package:"
+            if ! apt-get install --only-upgrade -y "$APT_PACKAGE_NAME"; then
+                echo -e "${c1}FAILED${c0}"
+                error "Failed to upgrade $APT_PACKAGE_NAME"
+                return 1
+            fi
         fi
     else
         printf "%-30s " "Installing package:"
@@ -1081,9 +1277,24 @@ download_stdout() {
     esac
 }
 
+# True when the installed package is this fork's build (version carries
+# +idkN). The release/raw-file update paths below talk to upstream's GitHub
+# and would overwrite the fork's TrueNASPlugin.pm with upstream's, silently
+# dropping the secrets-in-priv work; the fork updates through install-idk.sh.
+is_idk_fork_install() {
+    local v
+    v=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || return 1
+    [[ "$v" =~ \+idk[0-9]+ ]]
+}
+
 # Fetch GitHub API data
 github_api_call() {
     local endpoint="$1"
+    if is_idk_fork_install; then
+        log "WARN" "Refusing GitHub release lookup: fork build installed (use install-idk.sh)"
+        error "This node runs the IDK fork build; releases of upstream are not offered. Update with install-idk.sh."
+        return 1
+    fi
     local url="https://api.github.com/repos/${GITHUB_REPO}${endpoint}"
 
     log "INFO" "GitHub API call: $url"
@@ -1143,7 +1354,16 @@ normalize_tag_version() {
 
     tag="${raw_tag#v}"
 
-    if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-deb[0-9]+)?$ ]]; then
+    # Accept any pre-release suffix (`-alphaN`, `-betaN`, `-rcN`,
+    # `-debN`, `-anything`) rather than only `-debN`. Historically this
+    # regex was hardcoded to `-deb[0-9]+`, which rejected all
+    # alpha/beta releases outright with "Release tag format is invalid;
+    # expected vX.Y.Z or vX.Y.Z-debN" and forced admins to fall back to
+    # `dpkg -i` on a manually-downloaded .deb (issue #86 comment by
+    # RobD68; tracked in #93). The suffix's content is not
+    # semantically parsed here, only recognised as valid; the picker
+    # still displays the raw tag name for the user to choose.
+    if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[A-Za-z0-9._~+-]+)?$ ]]; then
         echo "${BASH_REMATCH[1]}"
         return 0
     fi
@@ -1239,6 +1459,34 @@ compare_versions() {
 # Returns: "version:prerelease" (e.g., "1.1.3:true") if update available, empty otherwise
 check_for_updates() {
     local current_version="$1"
+
+    # Source-aware detection (issue #93 sweep, P0): for an APT-managed install
+    # the source of truth is the APT candidate, not the GitHub latest release.
+    # Comparing against GitHub and then raw-pulling would desync dpkg state.
+    # Report an update only when the APT candidate is newer than what is
+    # installed (using dpkg's own version ordering).
+    local install_source
+    install_source=$(get_install_source)
+    if [[ "$install_source" == "apt" ]]; then
+        local installed_full="" candidate=""
+        installed_full=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
+        candidate=$(get_apt_candidate_version) || true
+        if [[ -z "$candidate" || "$candidate" == "none" || "$candidate" == "(none)" ]]; then
+            log "INFO" "apt-managed: no APT candidate available; not reporting an update"
+            return 1
+        fi
+        if [[ -n "$installed_full" ]] && dpkg --compare-versions "$installed_full" "lt" "$candidate"; then
+            local apt_core=""
+            local apt_pre=false
+            apt_core=$(printf '%s' "$candidate" | grep -Po '^[0-9]+(\.[0-9]+)*' || true)
+            if [[ "$candidate" =~ [-~](alpha|beta|rc)[0-9] ]]; then apt_pre=true; fi
+            log "INFO" "apt-managed: update available via APT (installed $installed_full -> candidate $candidate)"
+            echo "${apt_core:-$candidate}:${apt_pre}"
+            return 0
+        fi
+        log "INFO" "apt-managed: no APT update available (installed ${installed_full:-unknown}, candidate $candidate)"
+        return 1
+    fi
     local latest_release
     latest_release=$(get_latest_release) || return 1
 
@@ -1323,6 +1571,42 @@ backup_plugin() {
 
     success "Backup created: $backup_file"
     log "INFO" "Backup created: $backup_file"
+
+    # Also capture the installed .deb (best-effort) so rollback can reinstall
+    # it with `dpkg -i` and keep dpkg state consistent. Never blocks the caller.
+    backup_installed_deb
+    return 0
+}
+
+# Capture the currently-installed package's .deb into BACKUP_DIR so a later
+# rollback can reinstall it with `dpkg -i` (keeps dpkg state consistent with
+# the on-disk plugin, unlike a raw .pm copy). Best-effort: the .deb is only in
+# /var/cache/apt/archives until `apt-get clean`, and beta/alpha versions were
+# never in the APT repo -- if it can't be found we log and move on (the .pm
+# backup remains the fallback). Never blocks the caller.
+backup_installed_deb() {
+    local version
+    version=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
+    if [[ -z "$version" ]]; then
+        return 0
+    fi
+    local src
+    src=$(ls -1 "/var/cache/apt/archives/${APT_PACKAGE_NAME}_${version}"*.deb 2>/dev/null | head -n1)
+    if [[ -z "$src" || ! -f "$src" ]]; then
+        log "WARNING" "backup_installed_deb: no cached .deb for ${APT_PACKAGE_NAME}_${version}; .pm backup is the rollback fallback"
+        return 0
+    fi
+    local dest
+    dest="${BACKUP_DIR}/$(basename "$src")"
+    if [[ -f "$dest" ]]; then
+        return 0
+    fi
+    mkdir -p "$BACKUP_DIR"
+    if ! cp "$src" "$dest" 2>/dev/null; then
+        log "WARNING" "backup_installed_deb: failed to copy $(basename "$src") to $BACKUP_DIR"
+        return 0
+    fi
+    log "INFO" "backup_installed_deb: captured $(basename "$dest") for dpkg-consistent rollback"
     return 0
 }
 
@@ -1333,6 +1617,15 @@ list_backups() {
     fi
 
     find "$BACKUP_DIR" -name "TrueNASPlugin.pm.backup.*" -type f | sort -r
+}
+
+# List available package (.deb) backups
+list_deb_backups() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        return 1
+    fi
+
+    find "$BACKUP_DIR" -name "${APT_PACKAGE_NAME}_*.deb" -type f | sort -r
 }
 
 # Human-readable file size
@@ -1519,11 +1812,79 @@ install_plugin_file() {
     return 0
 }
 
+# True if a deferred pveproxy restart timer is already pending on this host.
+# The transient unit is shared by every code path that defers pveproxy
+# (postinst, restart_pve_services, the remote one-liners): a second
+# `systemd-run --unit=truenas-pveproxy-restart` while the first timer is
+# pending FAILS, and the old fallback then restarted pveproxy immediately --
+# re-introducing the web-UI terminal drop this deferral exists to prevent.
+pveproxy_restart_pending() {
+    systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null
+}
+
+# Schedule a deferred (~10s) pveproxy restart unless one is already pending.
+# Returns 0 when the restart is covered (timer already pending, newly
+# scheduled, or immediate fallback succeeded); 1 only if scheduling AND the
+# immediate fallback both failed.
+schedule_pveproxy_deferred_restart() {
+    if pveproxy_restart_pending; then
+        success "pveproxy restart already deferred (~10s, timer pending)"
+        return 0
+    fi
+    # A previously failed transient unit keeps its name in the failed state,
+    # and systemd-run then refuses to re-create the unit (rc=1) -- the
+    # deferral would silently fall back to an immediate restart (the #60
+    # drop). Reset any stale failed state; no-op when the units are clean.
+    systemctl reset-failed truenas-pveproxy-restart.timer \
+        truenas-pveproxy-restart.service 2>/dev/null || true
+    if command -v systemd-run >/dev/null 2>&1; then
+        if systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
+            systemctl try-restart pveproxy >/dev/null 2>&1; then
+            success "pveproxy restart deferred ~10s"
+            return 0
+        fi
+        warning "systemd-run scheduling failed; restarting pveproxy immediately"
+    fi
+    if systemctl restart pveproxy 2>/dev/null; then
+        success "Restarted pveproxy"
+        return 0
+    fi
+    error "Failed to restart pveproxy"
+    return 1
+}
+
+# Deferred pveproxy restart, armed by restart_pve_services and consumed when
+# the installer exits (review P2-9): arming the ~10s timer right after an
+# install would drop the operator's web-UI terminal while they are still at
+# the installer's main menu. Scheduling from the EXIT trap lands the restart
+# after the installer has gone, and the pending-timer guard still prevents
+# double-scheduling against the package postinst's own timer (issue #60).
+PVEPROXY_DEFER_SCHEDULE=false
+
+pveproxy_exit_schedule() {
+    [[ "${PVEPROXY_DEFER_SCHEDULE:-false}" == "true" ]] || return 0
+    PVEPROXY_DEFER_SCHEDULE=false
+    # Best effort at exit: schedule_pveproxy_deferred_restart handles the
+    # pending-timer guard, systemd-run scheduling, and the immediate
+    # fallback. Output is suppressed; the operator has left the installer.
+    schedule_pveproxy_deferred_restart >/dev/null 2>&1 || true
+}
+
 # Restart PVE services
+#
+# Every daemon that loads /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+# must restart to pick up new code. pveproxy is handled separately and DEFERRED
+# ~10s: it serves the Proxmox web UI, including the xterm.js terminal that
+# streams `apt upgrade` output when an operator updates from the UI (issue #60).
+# Restarting it synchronously drops that terminal mid-transaction; deferring it
+# past the (short) apt transaction keeps the operator's session alive while
+# pveproxy still picks up the new plugin without manual action.
 restart_pve_services() {
     info "Restarting Proxmox services..."
 
-    local services=("pvedaemon" "pveproxy")
+    # Plugin-loading daemons, restarted immediately. These are core PVE units
+    # that exist on every node, so a hard restart + is-active check is safe.
+    local services=("pvedaemon" "pvestatd" "pvescheduler")
     local failed=false
 
     for service in "${services[@]}"; do
@@ -1535,12 +1896,23 @@ restart_pve_services() {
         fi
     done
 
+    # Defer pveproxy until the installer exits so the ~10s restart does not
+    # land while the operator is still at the installer's main menu (review
+    # P2-9). A pending timer from the package postinst is detected at exit
+    # and NOT re-scheduled: the second systemd-run would fail and the
+    # fallback would restart pveproxy immediately -- re-introducing the web-UI
+    # terminal drop this deferral exists to prevent (issue #60).
+    PVEPROXY_DEFER_SCHEDULE=true
+    trap 'pveproxy_exit_schedule; cleanup_all; cleanup_on_error' EXIT
+    info "pveproxy restart will be scheduled when the installer exits"
+
     if [[ "$failed" == "true" ]]; then
         warning "Some services failed to restart. Please check manually."
         return 1
     fi
 
-    # Wait a moment and verify services are running
+    # Verify the immediate set is running. pveproxy is intentionally not checked
+    # here: it may still be pending its deferred restart.
     sleep 2
     for service in "${services[@]}"; do
         if systemctl is-active --quiet "$service"; then
@@ -1635,8 +2007,26 @@ install_plugin_on_remote_node() {
     fi
     log "INFO" "Remote installation to $node_ip: Plugin installed successfully"
 
-    # Restart services on remote node
-    if ! ssh "root@${node_ip}" "systemctl restart pvedaemon pveproxy" 2>/dev/null; then
+    # Restart the plugin-loading daemons immediately; defer pveproxy ~10s so an
+    # active web-UI upgrade terminal survives the transaction (issue #60), with
+    # an immediate-restart fallback if systemd-run is unavailable. A pending
+    # timer from a concurrent flow is detected and NOT re-scheduled (the
+    # second systemd-run would fail), and a failed daemon restart is reported
+    # (the old `; if` form swallowed its exit status).
+    if ! ssh "root@${node_ip}" "
+        if ! systemctl restart pvedaemon pvestatd pvescheduler 2>/dev/null; then
+            echo 'daemon restart failed'
+            exit 1
+        fi
+        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
+            if command -v systemd-run >/dev/null 2>&1; then
+                systemd-run --on-active=10s --unit=truenas-pveproxy-restart systemctl try-restart pveproxy >/dev/null 2>&1 || \
+                    systemctl restart pveproxy 2>/dev/null || { echo 'pveproxy restart failed'; exit 1; }
+            else
+                systemctl restart pveproxy 2>/dev/null || { echo 'pveproxy restart failed'; exit 1; }
+            fi
+        fi
+    " 2>/dev/null; then
         log "WARNING" "Remote installation to $node_ip: Service restart failed"
         echo "Service restart failed - manual restart required"
         return 2  # Special return code: installed but needs manual service restart
@@ -1644,6 +2034,74 @@ install_plugin_on_remote_node() {
     log "INFO" "Remote installation to $node_ip: Services restarted successfully"
 
     return 0
+}
+
+# Update the plugin on a remote node through its own APT repo (issue #93
+# sweep, P0). Mirrors install_plugin_on_remote_node's return codes: 0 on
+# success, 1 on failure, 2 on success with a pending service restart. Refuses
+# to raw-pull so the node's dpkg state stays consistent.
+install_plugin_on_remote_node_via_apt() {
+    local node_ip="$1"
+    if [[ -z "$node_ip" ]]; then
+        echo "Invalid parameters"
+        return 1
+    fi
+    log "INFO" "Starting remote APT update on $node_ip"
+    local remote_out=""
+    local rc=0
+    remote_out=$(ssh -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" '
+        set -e
+        pkg="truenas-proxmox-plugin"
+        src="/etc/apt/sources.list.d/truenas-proxmox-plugin.sources"
+        pmf="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            echo "node is not dpkg-managed; refusing raw cluster pull"
+            exit 1
+        fi
+        if [[ ! -f "$src" ]]; then
+            echo "no plugin APT source configured on node"
+            exit 1
+        fi
+        apt-get update -qq >/dev/null 2>&1 || true
+        if [[ ! -f "$pmf" ]]; then
+            apt-get install --reinstall -y "$pkg" >/dev/null 2>&1
+        else
+            apt-get install --only-upgrade -y "$pkg" >/dev/null 2>&1
+        fi
+        # Restart the plugin-loading daemons immediately; defer pveproxy ~10s (it
+        # serves the web-UI terminal, issue #60), falling back to an immediate
+        # restart when systemd-run is absent. A timer pending from the apt
+        # postinst in the same transaction is detected and NOT re-scheduled,
+        # and a failed daemon restart is reported (the old `|| true` swallowed it).
+        daemon_ok=true
+        pveproxy_ok=true
+        systemctl restart pvedaemon pvestatd pvescheduler >/dev/null 2>&1 || daemon_ok=false
+        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
+            if command -v systemd-run >/dev/null 2>&1; then
+                systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
+                    systemctl try-restart pveproxy >/dev/null 2>&1 || \
+                    systemctl restart pveproxy >/dev/null 2>&1 || pveproxy_ok=false
+            else
+                systemctl restart pveproxy >/dev/null 2>&1 || pveproxy_ok=false
+            fi
+        fi
+        if [ "$daemon_ok" = "false" ] || [ "$pveproxy_ok" = "false" ]; then
+            echo "updated; service restart required"
+            exit 2
+        fi
+        echo "updated via apt"
+    ' 2>&1) || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        log "INFO" "Remote APT update on $node_ip: success"
+        return 0
+    fi
+    if [[ $rc -eq 2 ]]; then
+        log "WARNING" "Remote APT update on $node_ip: installed, service restart required"
+        return 2
+    fi
+    log "ERROR" "Remote APT update on $node_ip failed: ${remote_out:-rc=$rc}"
+    echo "${remote_out:-APT update failed (rc=$rc)}"
+    return 1
 }
 
 # Display cluster installation summary
@@ -1679,6 +2137,8 @@ perform_cluster_wide_installation() {
     local version="${1:-latest}"
     local include_local="${2:-true}"
 
+    clear_screen
+    print_banner
     print_header "Installing TrueNAS Plugin (Cluster-Wide)"
 
     # Check for non-interactive mode
@@ -1744,6 +2204,80 @@ perform_cluster_wide_installation() {
         return 1
     fi
 
+    # Source-aware routing (issue #93 sweep, P0): an APT-managed cluster node
+    # updates every node through the plugin's APT repo (local + remote), never
+    # a raw-file pull, so dpkg state stays consistent cluster-wide. The raw
+    # GitHub path below is left intact for dpkg-only / raw installs and for
+    # specific-version installs.
+    if [[ "$version" == "latest" ]] && [[ "$(get_install_source)" == "apt" ]]; then
+        info "This node is APT-managed; updating all nodes through the plugin APT repo"
+
+        local -a successful_nodes=()
+        local -a failed_nodes=()
+        local -a failure_reasons=()
+
+        # Local node via APT
+        if [[ "$include_local" == "true" ]]; then
+            echo
+            info "Updating local node ($current_node) via APT..."
+            if apt_bootstrap_install; then
+                if restart_pve_services; then
+                    successful_nodes+=("$current_node")
+                else
+                    warning "Local node updated but services may need manual restart"
+                    successful_nodes+=("$current_node (services need restart)")
+                fi
+            else
+                error "Local node APT update failed"
+                failed_nodes+=("$current_node")
+                failure_reasons+=("APT update failed")
+            fi
+        fi
+
+        # Remote nodes via their own APT repo
+        echo
+        info "Updating remote cluster nodes via APT..."
+        echo
+        local apt_total=${#remote_nodes[@]}
+        local apt_current=0
+        local apt_msg=""
+        local apt_rc=0
+        for node_info in "${remote_nodes[@]}"; do
+            apt_current=$((apt_current + 1))
+            local apt_node_name="${node_info%%:*}"
+            local apt_node_ip="${node_info##*:}"
+            printf "[%d/%d] %s (%s): " "$apt_current" "$apt_total" "$apt_node_name" "$apt_node_ip"
+            start_spinner
+            apt_rc=0
+            apt_msg=$(install_plugin_on_remote_node_via_apt "$apt_node_ip" 2>&1) || apt_rc=$?
+            stop_spinner
+            if [[ $apt_rc -eq 0 ]]; then
+                printf "\r[%d/%d] %s (%s): ${c3}✓ Success${c0}\n" "$apt_current" "$apt_total" "$apt_node_name" "$apt_node_ip"
+                successful_nodes+=("$apt_node_name")
+            elif [[ $apt_rc -eq 2 ]]; then
+                printf "\r[%d/%d] %s (%s): ${c4}⚠ Success (restart needed)${c0}\n" "$apt_current" "$apt_total" "$apt_node_name" "$apt_node_ip"
+                successful_nodes+=("$apt_node_name (services need restart)")
+            else
+                printf "\r[%d/%d] %s (%s): ${c5}✗ Failed${c0}\n" "$apt_current" "$apt_total" "$apt_node_name" "$apt_node_ip"
+                failed_nodes+=("$apt_node_name")
+                failure_reasons+=("${apt_msg:-APT update failed}")
+            fi
+        done
+
+        show_cluster_install_summary
+        echo
+        if [[ ${#successful_nodes[@]} -gt 0 ]]; then
+            success "Cluster-wide APT update completed"
+            if [[ "$include_local" == "true" ]]; then
+                show_next_steps
+            fi
+            return 0
+        else
+            error "All cluster nodes failed to update via APT"
+            return 1
+        fi
+    fi
+
     # Download plugin from GitHub
     info "Fetching release from GitHub..."
     local release_data
@@ -1758,7 +2292,7 @@ perform_cluster_wide_installation() {
 
     local install_version
     install_version=$(get_release_version "$release_data") || {
-        error "Release tag format is invalid; expected vX.Y.Z or vX.Y.Z-debN"
+        error "Release tag format is invalid; expected vX.Y.Z (optionally with a -prerelease suffix)"
         return 1
     }
     info "Installing version: $install_version"
@@ -1942,7 +2476,48 @@ perform_cluster_wide_installation() {
 perform_installation() {
     local version="${1:-latest}"
 
+    clear_screen
+    print_banner
     print_header "Installing TrueNAS Plugin"
+
+    # Source-aware routing (issue #93 sweep, P0): an APT-managed install
+    # updates through the plugin's APT repo so dpkg state and the .pm file
+    # stay in lockstep. A raw-file GitHub pull here would leave dpkg reporting
+    # the old version while the file becomes a newer build — a mixed state the
+    # next `apt-get upgrade` may clobber.
+    local install_source
+    install_source=$(get_install_source)
+    if [[ "$install_source" == "apt" ]] && [[ "$version" == "latest" ]]; then
+        info "Plugin is APT-managed; updating via the plugin APT repo (not a raw-file pull)"
+        # Only bootstrap+restart when the APT candidate is actually newer than the
+        # installed version. Otherwise a no-op "update" would still run apt, restart
+        # pvedaemon/pveproxy, and claim an update happened.
+        local installed_full apt_candidate
+        installed_full=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
+        apt_candidate=$(get_apt_candidate_version) || true
+        if [[ -z "$installed_full" || -z "$apt_candidate" || "$apt_candidate" == "none" || "$apt_candidate" == "(none)" ]] \
+            || ! dpkg --compare-versions "$installed_full" "lt" "$apt_candidate"; then
+            echo
+            info "TrueNAS Plugin is already up to date (v${installed_full:-unknown}; APT candidate: ${apt_candidate:-none})"
+            return 0
+        fi
+        if ! apt_bootstrap_install; then
+            error "APT update failed"
+            return 1
+        fi
+        if ! restart_pve_services; then
+            warning "Plugin updated but services may need manual restart"
+        fi
+        local updated_version
+        updated_version=$(get_installed_version) || updated_version="unknown"
+        echo
+        success "TrueNAS Plugin v${updated_version} updated via APT!"
+        if is_cluster_node; then
+            show_cluster_warning
+        fi
+        show_next_steps
+        return 0
+    fi
 
     # Get release information
     local release_data
@@ -1959,7 +2534,7 @@ perform_installation() {
 
     local install_version
     install_version=$(get_release_version "$release_data") || {
-        error "Release tag format is invalid; expected vX.Y.Z or vX.Y.Z-debN"
+        error "Release tag format is invalid; expected vX.Y.Z (optionally with a -prerelease suffix)"
         return 1
     }
     info "Installing version: $install_version"
@@ -2975,6 +3550,39 @@ test_api_call() {
     return $exit_code
 }
 
+# Pick a bridge for the plugin-function-test VMs. Historically this
+# script hardcoded `vmbr0` in every `qm create --net0 bridge=`
+# invocation, which fails with `bridge 'vmbr0' does not exist` on
+# hosts that use a different bridge naming scheme (issue #67). Hosts
+# with multiple bridges also often have vmbr0 for public traffic and
+# vmbr1+ for cluster/storage — the test only needs *any* bridge to
+# attach the test VM's NIC to, not vmbr0 specifically.
+#
+# Resolution order:
+#   1. TRUENAS_PLUGIN_TEST_BRIDGE env var, if set (operator override).
+#   2. `vmbr0` if it actually exists (preserve legacy behavior).
+#   3. The first `vmbr*` link found via `ip -o link show type bridge`.
+#   4. Fall back to `vmbr0` and let the error surface as it did before.
+test_pick_bridge() {
+    if [ -n "${TRUENAS_PLUGIN_TEST_BRIDGE:-}" ]; then
+        echo "$TRUENAS_PLUGIN_TEST_BRIDGE"
+        return
+    fi
+    if ip -o link show vmbr0 >/dev/null 2>&1; then
+        echo vmbr0
+        return
+    fi
+    local first
+    first=$(ip -o link show type bridge 2>/dev/null \
+        | awk -F': ' '{print $2}' | awk '{print $1}' \
+        | grep -E '^vmbr[0-9]+$' | head -1)
+    if [ -n "$first" ]; then
+        echo "$first"
+        return
+    fi
+    echo vmbr0
+}
+
 # Function to find available VM IDs dynamically
 test_find_available_vm_ids() {
     local base_id=${1:-990}
@@ -3077,13 +3685,14 @@ test_volume_creation() {
     printf "%-30s " "Create test VM:"
     start_spinner
 
+    local test_bridge=$(test_pick_bridge)
     local output
     output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
         --vmid "$TEST_VM_BASE" \
         --name "test-base-vm" \
         --memory 512 \
         --cores 1 \
-        --net0 "virtio,bridge=vmbr0" \
+        --net0 "virtio,bridge=$test_bridge" \
         --scsihw "virtio-scsi-pci" 2>&1)
 
     if [[ $? -ne 0 ]]; then
@@ -3471,13 +4080,14 @@ test_vm_migration() {
         migrate_vm_id=$((migrate_vm_id + 1))
     done
 
+    local test_bridge=$(test_pick_bridge)
     local output
     output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
         --vmid "$migrate_vm_id" \
         --name "test-migrate-vm" \
         --memory 256 \
         --cores 1 \
-        --net0 "virtio,bridge=vmbr0" 2>&1)
+        --net0 "virtio,bridge=$test_bridge" 2>&1)
 
     if [[ $? -ne 0 ]]; then
         stop_spinner
@@ -3540,13 +4150,14 @@ test_cross_node_clone() {
         clone_source_vm=$((clone_source_vm + 1))
     done
 
+    local test_bridge=$(test_pick_bridge)
     local output
     output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
         --vmid "$clone_source_vm" \
         --name "test-clone-source" \
         --memory 256 \
         --cores 1 \
-        --net0 "virtio,bridge=vmbr0" \
+        --net0 "virtio,bridge=$test_bridge" \
         --scsihw "virtio-scsi-pci" 2>&1)
 
     if [[ $? -ne 0 ]]; then
@@ -4830,11 +5441,16 @@ run_health_check() {
         printf "%-30s " "TrueNAS API:"
         start_spinner
         local api_result
-        if timeout 5 bash -c ">/dev/tcp/$api_host/$api_port" 2>/dev/null; then
-            api_result="${COLOR_GREEN}✓${COLOR_RESET} Reachable on $api_host:$api_port"
+        # bash's /dev/tcp does not understand bracketed IPv6 ("[::1]"); strip brackets for the probe
+        local api_host_bare="${api_host#\[}"
+        api_host_bare="${api_host_bare%\]}"
+        local api_host_display="$api_host"
+        [[ "$api_host_display" == *:* && "$api_host_display" != \[* ]] && api_host_display="[$api_host_display]"
+        if timeout 5 bash -c ">/dev/tcp/$api_host_bare/$api_port" 2>/dev/null; then
+            api_result="${COLOR_GREEN}✓${COLOR_RESET} Reachable on $api_host_display:$api_port"
             ((checks_passed++))
         else
-            api_result="${COLOR_RED}✗${COLOR_RESET} Cannot reach $api_host:$api_port"
+            api_result="${COLOR_RED}✗${COLOR_RESET} Cannot reach $api_host_display:$api_port"
             ((errors++))
         fi
         stop_spinner
@@ -4845,13 +5461,26 @@ run_health_check() {
     fi
 
     # Check 5b: API authentication
+    #
+    # Use auth.me (no role required) instead of system.info (needs
+    # READONLY_ADMIN) or core.ping (which does not require auth at all
+    # and would give a false green on a bogus/revoked API key). The
+    # least-privilege role set documented in wiki/API-Permissions.md
+    # deliberately does NOT include READONLY_ADMIN, so a system.info
+    # probe rejects valid least-privilege keys with a misleading
+    # "auth failed" message; core.ping accepts bogus keys because it
+    # is no_auth_required. auth.me splits the difference: it requires
+    # a real authenticated session but no role, so it works for every
+    # valid API key (least-privilege or full-admin) and cleanly refuses
+    # bogus/revoked ones. (issues #113, #93; matches the plugin's own
+    # _preflight_check_alloc auth probe.)
     local api_key_early
     api_key_early=$(get_storage_config_value "$storage_name" "tn_api_key")
     if [[ -n "$api_host" ]] && [[ -n "$api_key_early" ]]; then
         printf "%-30s " "API authentication:"
         start_spinner
         local auth_result
-        if tn_api_call "$api_host" "$api_key_early" "system.info" '[]' >/dev/null 2>&1; then
+        if tn_api_call "$api_host" "$api_key_early" "auth.me" '[]' >/dev/null 2>&1; then
             auth_result="${COLOR_GREEN}✓${COLOR_RESET} Authenticated"
             ((checks_passed++))
         else
@@ -5317,6 +5946,153 @@ run_health_check() {
         check_result "Weight volume presence" "SKIP" "Not applicable for NVMe/TCP"
     fi
 
+    # Check 14: Cluster parity — multipath/iscsid functional parity across
+    # cluster nodes (#21). Read-only; per-node detail lines plus one
+    # aggregate row. Never aborts the health check.
+    local -a parity_nodes=()
+    mapfile -t parity_nodes < <(get_cluster_nodes 2>/dev/null) || true
+    if [[ ${#parity_nodes[@]} -le 1 ]]; then
+        check_result "Cluster parity" "SKIP" "Not applicable (single node)"
+    else
+        local parity_kind parity_target
+        if [[ "$transport_mode" == "nvme-tcp" ]]; then
+            parity_kind="nvme"
+            parity_target="${subsystem_nqn:-}"
+        else
+            parity_kind="iscsi"
+            parity_target="${target_iqn:-}"
+        fi
+        if [[ -z "$parity_target" ]]; then
+            check_result "Cluster parity" "SKIP" "No target configured"
+        else
+            # Gather: one local or ssh round-trip per node
+            local -a p_names=() p_ips=() p_facts=() p_rcs=()
+            local cur_node pname pip facts p_rc
+            cur_node=$(get_current_node_name)
+            printf "%-30s " "Cluster parity:"
+            start_spinner
+            for pip_full in "${parity_nodes[@]}"; do
+                pname="${pip_full%%:*}"
+                pip="${pip_full##*:}"
+                if [[ "$pname" == "$cur_node" ]]; then
+                    if facts=$(collect_parity_facts "$parity_kind" "$parity_target" "" 2>/dev/null); then
+                        p_rc=0
+                    else
+                        p_rc=$?
+                    fi
+                else
+                    if facts=$(collect_parity_facts "$parity_kind" "$parity_target" "$pip" 2>/dev/null); then
+                        p_rc=0
+                    else
+                        p_rc=$?
+                    fi
+                fi
+                p_names+=("$pname")
+                p_ips+=("$pip")
+                p_facts+=("$facts")
+                p_rcs+=("$p_rc")
+            done
+            stop_spinner
+
+            # Evaluate: cluster maxima + per-node verdicts
+            local max_recs=0 max_sess=0 max_luns=0
+            local -a p_recs=() p_sess=() p_luns=() p_status=()
+            local i fr fs fl
+            for i in "${!p_facts[@]}"; do
+                if [[ "${p_facts[$i]}" =~ ^([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+                    fr="${BASH_REMATCH[1]}"
+                    fs="${BASH_REMATCH[2]}"
+                    fl="${BASH_REMATCH[3]}"
+                else
+                    fr=""
+                    fs=""
+                    fl=""
+                fi
+                p_recs[i]="$fr"
+                p_sess[i]="$fs"
+                p_luns[i]="$fl"
+                if [[ -n "$fr" && "$fr" -gt "$max_recs" ]]; then max_recs="$fr"; fi
+                if [[ -n "$fs" && "$fs" -gt "$max_sess" ]]; then max_sess="$fs"; fi
+                if [[ -n "$fl" && "$fl" -gt "$max_luns" ]]; then max_luns="$fl"; fi
+            done
+            local parity_errors=0 parity_warnings=0
+            for i in "${!p_facts[@]}"; do
+                if [[ -z "${p_recs[$i]}" ]]; then
+                    # Distinguish a collector that failed (SSH down, node
+                    # unreachable, collector crashed) from one that ran but
+                    # produced unparseable output.
+                    if [[ "${p_rcs[$i]}" != "0" ]]; then
+                        p_status[i]="WARN no data (collector failed -- node unreachable or SSH error)"
+                    else
+                        p_status[i]="WARN no data (collector returned malformed output)"
+                    fi
+                    ((parity_warnings++))
+                elif [[ "$parity_kind" == "nvme" ]]; then
+                    if [[ "${p_recs[$i]}" -eq 0 ]]; then
+                        p_status[i]="CRIT subsystem not connected"
+                        ((parity_errors++))
+                    elif [[ "${p_luns[$i]}" -eq 0 && "$max_luns" -gt 0 ]]; then
+                        p_status[i]="CRIT 0 live namespaces (cluster sees $max_luns)"
+                        ((parity_errors++))
+                    elif [[ "${p_luns[$i]}" -lt "$max_luns" ]]; then
+                        p_status[i]="WARN only ${p_luns[$i]}/$max_luns live namespace(s)"
+                        ((parity_warnings++))
+                    else
+                        p_status[i]="OK connected, ${p_luns[$i]} live namespace(s)"
+                    fi
+                else
+                    if [[ "${p_recs[$i]}" -eq 0 ]]; then
+                        p_status[i]="CRIT no node records for target"
+                        ((parity_errors++))
+                    elif [[ "${p_recs[$i]}" -lt "$max_recs" ]]; then
+                        p_status[i]="WARN only ${p_recs[$i]}/$max_recs portal record(s)"
+                        ((parity_warnings++))
+                    elif [[ "${p_sess[$i]}" -eq 0 && "$max_sess" -gt 0 ]]; then
+                        p_status[i]="WARN no active sessions (cluster sees $max_sess)"
+                        ((parity_warnings++))
+                    elif [[ "${p_sess[$i]}" -gt 0 && "${p_luns[$i]}" -eq 0 && "$max_luns" -gt 0 ]]; then
+                        p_status[i]="CRIT session(s) active but 0 LUNs visible (cluster sees $max_luns)"
+                        ((parity_errors++))
+                    elif [[ "${p_sess[$i]}" -gt 0 && "${p_luns[$i]}" -lt "$max_luns" ]]; then
+                        p_status[i]="WARN only ${p_luns[$i]}/$max_luns LUN(s) visible"
+                        ((parity_warnings++))
+                    elif [[ "${p_sess[$i]}" -gt 0 ]]; then
+                        p_status[i]="OK ${p_recs[$i]} record(s), ${p_sess[$i]} session(s), ${p_luns[$i]} LUN(s)"
+                    else
+                        p_status[i]="OK ${p_recs[$i]} record(s), no active sessions (login on demand)"
+                    fi
+                fi
+            done
+
+            # Aggregate row, then per-node detail lines
+            local parity_icon parity_msg
+            if [[ $parity_errors -gt 0 ]]; then
+                parity_icon="${COLOR_RED}✗"
+                parity_msg="$parity_errors critical, $parity_warnings warning(s) across ${#p_facts[@]} nodes"
+                ((errors++))
+            elif [[ $parity_warnings -gt 0 ]]; then
+                parity_icon="${COLOR_YELLOW}⚠"
+                parity_msg="$parity_warnings of ${#p_facts[@]} node(s) inconsistent"
+                ((warnings++))
+            else
+                parity_icon="${COLOR_GREEN}✓"
+                parity_msg="All ${#p_facts[@]} nodes consistent"
+                ((checks_passed++))
+            fi
+            ((checks_total++))
+            echo -e "\r$(printf "%-30s " "Cluster parity:")${parity_icon}${COLOR_RESET} ${parity_msg} (${parity_kind})"
+            for i in "${!p_facts[@]}"; do
+                local lvl="${p_status[$i]%% *}"
+                local detail="${p_status[$i]#* }"
+                case "$lvl" in
+                    OK)   printf "  %-28s ${COLOR_GREEN}✓${COLOR_RESET} %s\n" "${p_names[$i]} (${p_ips[$i]})" "$detail" ;;
+                    WARN) printf "  %-28s ${COLOR_YELLOW}⚠${COLOR_RESET} %s\n" "${p_names[$i]} (${p_ips[$i]})" "$detail" ;;
+                    *)    printf "  %-28s ${COLOR_RED}✗${COLOR_RESET} %s\n" "${p_names[$i]} (${p_ips[$i]})" "$detail" ;;
+                esac
+            done
+        fi
+    fi
+
     # Summary
     echo
     info "Health Summary:"
@@ -5651,7 +6427,7 @@ get_all_storage_config_values() {
     return 0
 }
 
-# Validate IP address format
+# Validate IP address format (IPv4 dotted-quad, or IPv6 bare/bracketed literal)
 validate_ip() {
     local ip="$1"
     if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
@@ -5664,6 +6440,13 @@ validate_ip() {
         done
         return 0
     fi
+    # IPv6: strip optional brackets, then validate via Perl's inet_pton (avoids
+    # a hand-rolled regex for zone IDs/compression/embedded-IPv4 edge cases)
+    local ip6="${ip#\[}"
+    ip6="${ip6%\]}"
+    if [[ -n "$ip6" ]] && perl -MSocket -e 'exit(defined(Socket::inet_pton(Socket::AF_INET6(), $ARGV[0])) ? 0 : 1)' "$ip6" 2>/dev/null; then
+        return 0
+    fi
     return 1
 }
 
@@ -5672,6 +6455,13 @@ validate_host() {
     local host="$1"
     # All-numeric dotted strings must be valid IPv4; otherwise reject.
     if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        validate_ip "$host" && return 0
+        return 1
+    fi
+    # A colon means an IPv6 literal (bare or bracketed) - never a valid
+    # hostname label, so validate as an IP rather than falling through
+    # to the hostname regex below (which would reject the colon/brackets).
+    if [[ "$host" == *:* ]]; then
         validate_ip "$host" && return 0
         return 1
     fi
@@ -5894,6 +6684,12 @@ check_nvme_multipath() {
 
 # Test TrueNAS API connectivity
 # Uses WebSocket-only API via TrueNASPlugin
+#
+# Auth is verified via auth.me (no role required), so a least-privilege
+# API key configured per wiki/API-Permissions.md passes here even
+# without READONLY_ADMIN. The TrueNAS version display is a best-effort
+# secondary probe via system.info; the connectivity check does not
+# require it to succeed. (issue #113)
 test_truenas_api() {
     local ip="$1"
     local apikey="$2"
@@ -5903,22 +6699,41 @@ test_truenas_api() {
     printf "  Testing connection to TrueNAS at %s%s..." "$ip" "$port_suffix"
     start_spinner
 
-    local response
-    response=$(tn_api_call "$ip" "$apikey" "system.info" "[]" 2>/dev/null)
-    local exit_code=$?
+    # Authoritative auth check: auth.me. Requires a real authenticated
+    # session (unlike core.ping which is no_auth_required and would give
+    # a false green on a bogus/revoked key), but needs no role (unlike
+    # system.info which requires READONLY_ADMIN and rejects the
+    # least-privilege keys documented in wiki/API-Permissions.md). This
+    # matches the plugin's own _preflight_check_alloc auth probe.
+    # (issues #113, #93)
+    local auth_response
+    auth_response=$(tn_api_call "$ip" "$apikey" "auth.me" "[]" 2>/dev/null)
+    local auth_exit=$?
 
-    stop_spinner
-    printf "\r\033[K"  # Clear spinner line
-
-    if [[ $exit_code -eq 0 ]] && [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
-        local version
-        version=$(echo "$response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
-        success "Connected to TrueNAS successfully (version: $version)"
-        return 0
-    else
+    if [[ $auth_exit -ne 0 ]] || [[ -z "$auth_response" ]]; then
+        stop_spinner
+        printf "\r\033[K"  # Clear spinner line
         error "Failed to connect to TrueNAS API"
         return 1
     fi
+
+    # Best-effort version display via system.info. Requires READONLY_ADMIN;
+    # a least-privilege user gets no version string here (harmless).
+    local response
+    local version=""
+    response=$(tn_api_call "$ip" "$apikey" "system.info" "[]" 2>/dev/null) || true
+    if [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
+        version=$(echo "$response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
+    fi
+
+    stop_spinner
+    printf "\r\033[K"  # Clear spinner line
+    if [[ -n "$version" ]]; then
+        success "Connected to TrueNAS successfully (version: $version)"
+    else
+        success "Connected to TrueNAS successfully"
+    fi
+    return 0
 }
 
 # Verify dataset exists
@@ -5970,9 +6785,9 @@ discover_truenas_portals() {
     fi
 
     # Extract IP addresses from interfaces, excluding the primary IP
-    # Parse JSON to find all "address" fields with IPv4 addresses
+    # Parse JSON to find all "address" fields with IPv4 or IPv6 addresses
     local portals
-    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9.]+' | grep -v "^127\." | grep -v -- "^${primary_ip}$" | sort -u)
+    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9a-fA-F.:]+' | grep -v "^127\." | grep -v -- "^::1$" | grep -vi -- "^fe80:" | grep -v -- "^${primary_ip}$" | sort -u)
 
     if [[ -z "$portals" ]]; then
         return 1
@@ -6309,6 +7124,11 @@ display_interface_table() {
     local api_host="$3"
     local apikey="$4"
 
+    # TrueNAS reports interface addresses bracket-free; strip brackets from a
+    # bracketed IPv6 api_host so the mgmt-interface match below compares like-for-like.
+    local api_host_bare="${api_host#\[}"
+    api_host_bare="${api_host_bare%\]}"
+
     # Initialize global arrays
     IFACE_NAMES=()
     IFACE_IPS=()
@@ -6349,7 +7169,7 @@ display_interface_table() {
         return ""
     }
 
-    # Helper function to find all IPv4 addresses in a block
+    # Helper function to find all IPv4/IPv6 addresses in a block
     function find_ipv4_addresses(block, ips,    count, pos, remainder, addr, i, c, in_addr) {
         count = 0
         # Look for "address": "X.X.X.X" patterns
@@ -6369,8 +7189,8 @@ display_interface_table() {
                 if (c == "\"") break
                 addr = addr c
             }
-            # Check if it looks like IPv4 (contains only digits and dots)
-            if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+            # Check if it looks like IPv4 (digits and dots) or IPv6 (hex and colons)
+            if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || (addr ~ /:/ && addr ~ /^[0-9a-fA-F:]+$/)) {
                 count++
                 ips[count] = addr
             }
@@ -6434,13 +7254,13 @@ display_interface_table() {
                     # Extract active_media_subtype from state object
                     current_speed = extract_value(iface_block, "active_media_subtype")
 
-                    # Extract all IPv4 addresses from aliases array
+                    # Extract all IPv4/IPv6 addresses from aliases array
                     delete ip_list
                     ip_count = find_ipv4_addresses(iface_block, ip_list)
                     for (k = 1; k <= ip_count; k++) {
                         ip = ip_list[k]
-                        # Skip localhost
-                        if (ip !~ /^127\./) {
+                        # Skip loopback/link-local (v4 127.x, v6 ::1 and fe80::/10 - unusable for portals)
+                        if (ip !~ /^127\./ && ip != "::1" && ip !~ /^[fF][eE]80:/) {
                             print current_name "|" ip "|" current_link "|" current_speed
                         }
                     }
@@ -6471,7 +7291,7 @@ display_interface_table() {
 
         # Check if this is the management interface
         local is_mgmt=""
-        if [[ "$ipv4" == "$api_host" ]]; then
+        if [[ "$ipv4" == "$api_host_bare" ]]; then
             is_mgmt="mgmt"
         fi
 
@@ -6485,14 +7305,14 @@ display_interface_table() {
     # Fallback: if awk parsing failed, try simple grep extraction
     if [[ ${#IFACE_IPS[@]} -eq 0 ]]; then
         local all_ips
-        all_ips=$(echo "$interfaces_json" | grep -Po '"address":\s*"\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=")' | grep -v "^127\." | sort -u)
+        all_ips=$(echo "$interfaces_json" | grep -Po '"address":\s*"\K[0-9a-fA-F.:]+(?=")' | grep -v "^127\." | grep -v -- "^::1$" | grep -vi -- "^fe80:" | sort -u)
         local idx=1
         for ipv4 in $all_ips; do
             IFACE_NAMES+=("if${idx}")
             IFACE_IPS+=("$ipv4")
             IFACE_SPEEDS+=("-")
             IFACE_STATES+=("UP")
-            if [[ "$ipv4" == "$api_host" ]]; then
+            if [[ "$ipv4" == "$api_host_bare" ]]; then
                 IFACE_MGMT+=("mgmt")
             else
                 IFACE_MGMT+=("")
@@ -6502,7 +7322,7 @@ display_interface_table() {
     fi
 
     if [[ ${#IFACE_IPS[@]} -eq 0 ]]; then
-        error "No network interfaces with IPv4 addresses found on TrueNAS"
+        error "No network interfaces with IPv4 or IPv6 addresses found on TrueNAS"
         return 1
     fi
 
@@ -6536,7 +7356,7 @@ display_interface_table() {
     # Display header
     echo
     printf '%b%b%s%b\n' "${c6}" "${c8}" "TrueNAS Network Interfaces" "${c0}"
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
 
     local portal_col
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
@@ -6544,8 +7364,8 @@ display_interface_table() {
     else
         portal_col="Portal"
     fi
-    printf "  %-3s %-14s %-17s %-8s %-6s %s\n" "#" "Interface" "IP Address" "Speed" "Link" "$portal_col"
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf "  %-3s %-14s %-30s %-8s %-6s %s\n" "#" "Interface" "IP Address" "Speed" "Link" "$portal_col"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
 
     # Display each interface
     for ((i=0; i<${#IFACE_IPS[@]}; i++)); do
@@ -6580,11 +7400,11 @@ display_interface_table() {
             done
         fi
 
-        printf "  %-3s %-14s %-17s %-8s %b%-6s%b %b\n" \
+        printf "  %-3s %-14s %-30s %-8s %b%-6s%b %b\n" \
             "$num" "$name" "$ip" "$speed" "$state_color" "$state" "${c0}" "$portal_status"
     done
 
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
     echo
 
     return 0
@@ -6694,7 +7514,7 @@ select_interfaces() {
     info "Selected interfaces:"
     for idx in "${SELECTED_IFACE_INDICES[@]}"; do
         local arr_idx=$((idx-1))
-        printf "  • %-14s %-17s %s\n" "${IFACE_NAMES[$arr_idx]}" "${IFACE_IPS[$arr_idx]}" "${IFACE_SPEEDS[$arr_idx]}"
+        printf "  • %-14s %-30s %s\n" "${IFACE_NAMES[$arr_idx]}" "${IFACE_IPS[$arr_idx]}" "${IFACE_SPEEDS[$arr_idx]}"
     done
 
     return 0
@@ -6836,7 +7656,11 @@ tn_api_call_write() {
             exit 1;
         }
 
-        # Make the API call with ephemeral connection
+        # Make the API call with ephemeral connection.
+        # TrueNASPlugin.pm exposes _api_call and _api_call_mutate;
+        # _api_call_write was a name that never landed on the .pm side,
+        # so this wrapper needs to call _api_call_mutate to reach the
+        # write path.
         my $result = eval {
             PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, $method, $params);
         };
@@ -6977,12 +7801,42 @@ tn_create_dataset() {
     local full_path="${parent_pool}/${dataset_name}"
     log "INFO" "Creating dataset: $full_path"
 
-    # Create dataset with FILESYSTEM type (for zvol children)
+    # Create dataset with FILESYSTEM type (for zvol children).
+    #
+    # TrueNAS 25.10.x's legacy API shim leaves any omitted optional
+    # field as an unresolved _NotRequired sentinel, which crashes
+    # pool.dataset.create -- either during validation or during
+    # audit-log JSON serialization AFTER a successful server-side
+    # create. The post-create serialization crash is the dangerous
+    # one: the client sees an error, retries, and gets "dataset
+    # already exists", leaving the first (successful) dataset as
+    # an orphan. To avoid this, send every optional field the
+    # FILESYSTEM path expects. Values match the plugin-runtime fix
+    # (PR #82, TrueNASPlugin.pm _tn_dataset_create and alloc_image).
+    #
+    # Note: this wrapper only creates FILESYSTEM datasets (the
+    # parent for zvol children). Zvol (VOLUME) creates go through
+    # the plugin's alloc_image path, which was already fixed in
+    # PR #82. So only the FILESYSTEM field-set is inlined here.
     local params
     # Use Python to construct JSON with proper escaping
     params=$(python3 -c "
 import json, sys
-data = [{'name': sys.argv[1], 'type': 'FILESYSTEM'}]
+data = [{
+    'name': sys.argv[1],
+    'type': 'FILESYSTEM',
+    'acltype': 'INHERIT',
+    'aclmode': 'INHERIT',
+    'atime':   'INHERIT',
+    'recordsize': 'INHERIT',
+    'snapdev':    'INHERIT',
+    'casesensitivity': 'SENSITIVE',
+    'quota':          0,
+    'refquota':       0,
+    'reservation':    0,
+    'refreservation': 0,
+    'special_small_block_size': 0,
+}]
 print(json.dumps(data))
 " "$full_path" 2>&1)
 
@@ -7113,6 +7967,11 @@ tn_create_portal() {
     local api_key="$2"
     local listen_ip="$3"
     local listen_port="${4:-3260}"
+
+    # TrueNAS's iscsi.portal.create 'ip' field wants a bare address; strip
+    # brackets in case an IPv6 literal arrived in [addr] display form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
 
     log "INFO" "Creating iSCSI portal: $listen_ip:$listen_port"
 
@@ -7599,6 +8458,11 @@ tn_find_nvme_port() {
     local listen_ip="$3"
     local listen_port="${4:-4420}"
 
+    # TrueNAS stores addr_traddr as a bare address; strip brackets so the
+    # comparison below matches an IPv6 literal that arrived in [addr] form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
+
     log "INFO" "Searching for existing NVMe port: $listen_ip:$listen_port"
 
     # Query all ports
@@ -7648,6 +8512,11 @@ tn_create_nvme_port() {
     local subsystem_id="$3"
     local listen_ip="$4"
     local listen_port="${5:-4420}"
+
+    # TrueNAS's nvmet.port addr_traddr field wants a bare address; strip
+    # brackets in case an IPv6 literal arrived in [addr] display form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
 
     log "INFO" "Creating/finding NVMe port for subsystem $subsystem_id: $listen_ip:$listen_port"
 
@@ -8775,10 +9644,33 @@ execute_provisioning() {
         if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
             echo -e "$(printf "%-30s " "NVMe subsystem:")${c2}✓${c0} Using existing"
             PROVISIONED_SUBSYSTEM_NQN="$PROV_NQN"
-            # Get subsystem ID for port association
+            # Get subsystem ID for port association. Historically the two
+            # 2>/dev/null suppressions on this pair of commands, combined
+            # with `data.get('id', '')` returning an empty string on any
+            # parse or lookup failure, let PROV_SUBSYSTEM_ID come back
+            # empty without raising an error. The "NVMe port" block below
+            # is gated on `[[ -n "$PROV_SUBSYSTEM_ID" ]]`, so it would
+            # silently skip; PROVISIONED_PORTAL_IP and PROVISIONED_PORTAL_PORT
+            # then stay unset and generate_storage_config wrote
+            # `tn_discovery_portal :` (bare colon) to storage.cfg,
+            # silently producing a broken config (issue #86 sub-item 1,
+            # tracked in #93). Surface the failure loudly instead: the
+            # errors gate below prevents the port block from running and
+            # generate_storage_config's `[[ -n "$portal" ]]` guard keeps
+            # the empty portal out of the file.
             local subsys_info
-            subsys_info=$(tn_check_subsystem "$host" "$api_key" "$PROV_NQN" 2>/dev/null)
+            subsys_info=$(tn_check_subsystem "$host" "$api_key" "$PROV_NQN" 2>&1)
+            local subsys_lookup_rc=$?
             PROV_SUBSYSTEM_ID=$(echo "$subsys_info" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('id', ''))" 2>/dev/null)
+            if [[ $subsys_lookup_rc -ne 0 ]] || [[ -z "$PROV_SUBSYSTEM_ID" ]]; then
+                echo -e "$(printf "%-30s " "NVMe subsystem:")${c1}✗${c0} Could not resolve subsystem ID for '$PROV_NQN'"
+                echo "  $subsys_info" | head -3 | sed 's/^/    /'
+                echo "  Port association will be skipped, and 'tn_discovery_portal'"
+                echo "  cannot be filled in. Verify the subsystem exists on TrueNAS,"
+                echo "  the API key has 'nvmet.subsys.query' access, and the network"
+                echo "  path to the middleware is up. Then re-run the wizard."
+                ((errors++))
+            fi
         else
             printf "%-30s " "NVMe subsystem:"
             start_spinner
@@ -9572,7 +10464,17 @@ EOF
     echo "	shared 1"
 
     if [[ -n "$portal" ]]; then
-        echo "	tn_discovery_portal ${portal}"
+        # Defense in depth (issue #86 sub-item 1, tracked in #93): never write a
+        # malformed portal (e.g. a bare ":" produced from an all-empty IP/port
+        # pair, which the plain non-empty guard would happily accept). stdout is
+        # the config, so warn on stderr and omit rather than fail the capture.
+        local portal_ip="${portal%%:*}"
+        local portal_port="${portal##*:}"
+        if [[ -n "$portal_ip" && -n "$portal_port" ]]; then
+            echo "	tn_discovery_portal ${portal}"
+        else
+            echo "WARNING: omitting malformed tn_discovery_portal '${portal}' (empty IP or port)" >&2
+        fi
     fi
 
     if [[ -n "$blocksize" ]]; then
@@ -10506,6 +11408,200 @@ wizard_add_storage() {
     return 0
 }
 
+# ============================================================================
+# LVM GLOBAL FILTER (GitHub issue #4)
+# ============================================================================
+# The host's LVM stack scans TrueNAS-served NVMe/TCP namespaces. A guest VM
+# whose disk lives on a TN namespace usually runs its own LVM; the host sees
+# the guest's PV signatures and treats them as host-level PVs, producing
+# duplicate-VG warning storms on every LVM call (pvesm, pvesh, qm, pvestatd
+# polls). With many cloned namespaces this can push `pvesh get
+# /nodes/<node>/storage` past the 596s API timeout, breaking Veeam and
+# similar backup integrations, and fills /etc/lvm/archive with stale metadata.
+#
+# Fix: add a reject regex to LVM's global_filter matching the
+# /dev/disk/by-id/nvme-TrueNAS_* symlinks that udev builds from the NVMe
+# controller MODEL string. Local NVMe drives never match, so local LVM is
+# unaffected. /dev/zd* and /dev/rbd* are already rejected by the existing
+# filter, so we add only the TrueNAS-specific pattern.
+#
+# WHICH FILE: /etc/lvm/lvmlocal.conf is read AFTER /etc/lvm/lvm.conf and
+# OVERRIDES it. On PVE hosts the effective global_filter usually lives in a
+# "truenasplugin managed" devices { } block in lvmlocal.conf (which also
+# restricts `scan` to /dev/disk/by-id). Editing lvm.conf alone would be
+# silently overridden by that block, so we detect the EFFECTIVE filter via
+# `lvm dumpconfig` and apply to the effective file (lvmlocal.conf when it
+# carries a global_filter line, else lvm.conf). This matches where the filter
+# already lives on hosts that have it, and stays idempotent.
+#
+# The regex + marker below are byte-identical to tools/truenas-plugin-lvm-filter
+# so that script's --status / --uninstall keep working on an installer-applied
+# filter. lvm.conf is a pve-manager conffile and lvmlocal.conf is operator-
+# owned; we never edit either silently -- this always asks first and writes a
+# timestamped backup.
+#
+# Offered for both transports (iSCSI and NVMe/TCP) per issue #4; the filter
+# only matches NVMe/TCP namespaces, so for a pure-iSCSI setup it is harmless
+# (no matching devices) and future-proofs a host that later adds NVMe.
+
+readonly LVM_CONF_FILE="/etc/lvm/lvm.conf"
+readonly LVM_LOCAL_CONF_FILE="/etc/lvm/lvmlocal.conf"
+readonly LVM_FILTER_REGEX='"r|/dev/disk/by-id/nvme-TrueNAS_.*|"'
+readonly LVM_FILTER_MARKER='truenas-proxmox-plugin issue #4'
+
+# True if a REJECT pattern for nvme-TrueNAS_ namespaces is ALREADY ACTIVE in
+# the effective LVM config (lvm.conf, lvmlocal.conf, or any override),
+# regardless of which file it lives in or whether it is anchored (^...).
+_lvm_filter_effective() {
+    command -v lvm >/dev/null 2>&1 || return 1
+    local cfg
+    cfg=$(lvm dumpconfig 2>/dev/null) || return 1
+    grep -qE 'r\|[^"]*nvme-TrueNAS_' <<<"$cfg"
+}
+
+# Echo the file whose global_filter line is in effect and return 0; return 1
+# with no output if neither file has an active global_filter line. lvmlocal.conf
+# wins over lvm.conf, so it is preferred when it carries a global_filter.
+_lvm_filter_target_file() {
+    local f
+    for f in "$LVM_LOCAL_CONF_FILE" "$LVM_CONF_FILE"; do
+        if [[ -f "$f" ]] && grep -qE "^[[:space:]]*global_filter[[:space:]]*=" "$f"; then
+            echo "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Note about /etc/lvm/archive bloat (stale LVM metadata archives) if present.
+_lvm_archive_note() {
+    local archive_dir="/etc/lvm/archive"
+    [[ -d "$archive_dir" ]] || return 0
+    local count
+    count=$(find "$archive_dir" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+    if [[ "${count:-0}" -gt 50 ]]; then
+        echo
+        warning "$count stale metadata files in $archive_dir"
+        echo "  LVM archives old metadata there on every change; a large pile slows scans."
+        echo "  Safe to clear once no LVM rollback is pending:"
+        echo "    rm -f $archive_dir/*"
+    fi
+    return 0
+}
+
+# Apply the filter: pick the effective file, timestamped backup, insert
+# regex+marker into its existing global_filter array, verify LVM still parses,
+# refresh LVM caches, restart lvm2-monitor, and note any /etc/lvm/archive
+# bloat. Returns non-zero on failure (caller handles messaging).
+_lvm_filter_apply() {
+    local target
+    if ! target=$(_lvm_filter_target_file); then
+        echo "  No active global_filter line in lvm.conf or lvmlocal.conf -- refusing to create one."
+        echo "  Add one inside a devices { ... } section, then re-run."
+        return 1
+    fi
+
+    local backup="${target}.bak.$(date +%Y%m%d%H%M%S).truenas-plugin"
+    if ! cp -a "$target" "$backup"; then
+        echo "  Backup failed -- aborting without modifying $target."
+        return 1
+    fi
+    echo "  Editing: $target"
+    echo "  Backup:  $backup"
+
+    # Insert the regex before the closing "]" of the global_filter array,
+    # tagged with the marker comment. Identical edit to the helper.
+    if ! perl -i -spe '
+        if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(\s*)$/) {
+            my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
+            $body =~ s/\s+$//;
+            $body .= "," unless $body =~ /,\s*$/ || $body =~ /^\s*$/;
+            $_ = "${lead}${body} ${r} ${close} # ${m}\n";
+        }
+    ' -- -r="$LVM_FILTER_REGEX" -m="$LVM_FILTER_MARKER" "$target"; then
+        echo "  Failed to edit $target -- restore with: cp $backup $target"
+        return 1
+    fi
+
+    # The perl edit is a silent no-op (exit 0) when the global_filter array
+    # spans multiple lines or the closing ] carries a trailing comment -- the
+    # parse check below cannot catch that because nothing changed. Verify the
+    # marker actually landed before claiming success (marker is absent here:
+    # the idempotency check ran first).
+    if ! grep -qF "$LVM_FILTER_MARKER" "$target"; then
+        echo "  Edit not applied -- global_filter is multi-line or has a trailing comment after ]."
+        echo "  File unchanged (backup kept: $backup). Collapse the array to one line and re-run."
+        return 1
+    fi
+
+    # Verify LVM still parses the (merged) config: lvm loads lvm.conf +
+    # lvmlocal.conf for any command; a parse error exits non-zero.
+    if command -v lvm >/dev/null 2>&1 && ! lvm dumpconfig >/dev/null 2>&1; then
+        echo "  LVM config no longer parses -- restoring backup."
+        cp -a "$backup" "$target" 2>/dev/null || true
+        return 1
+    fi
+
+    success "LVM global filter installed"
+
+    # Refresh LVM's device caches and restart the monitor daemon. All
+    # best-effort under set -e (a cache hiccup must never fail the flow).
+    rm -f /etc/lvm/cache/.cache 2>/dev/null || true
+    command -v pvscan >/dev/null 2>&1 && pvscan --cache >/dev/null 2>&1 || true
+    command -v vgscan >/dev/null 2>&1 && vgscan --cache >/dev/null 2>&1 || true
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files lvm2-monitor.service >/dev/null 2>&1; then
+        if systemctl restart lvm2-monitor >/dev/null 2>&1; then
+            success "Restarted lvm2-monitor"
+        else
+            warning "Could not restart lvm2-monitor -- run: systemctl restart lvm2-monitor"
+        fi
+    fi
+
+    _lvm_archive_note
+    return 0
+}
+
+# Offer, and on consent apply, the LVM global filter for TrueNAS NVMe/TCP.
+# Idempotent and non-fatal: no LVM, an already-effective filter, a declined
+# prompt, or an edit error all just print a note and return 0, so this never
+# breaks the surrounding storage flow. $1 = transport mode (for the message).
+offer_lvm_filter() {
+    local transport_mode="${1:-}"
+
+    if [[ ! -f "$LVM_CONF_FILE" && ! -f "$LVM_LOCAL_CONF_FILE" ]]; then
+        info "LVM not detected on this host -- skipping LVM filter step"
+        return 0
+    fi
+    if _lvm_filter_effective; then
+        info "LVM global_filter already rejects TrueNAS NVMe namespaces (effective config) -- nothing to do"
+        return 0
+    fi
+    if [[ "${NON_INTERACTIVE:-}" == "true" ]]; then
+        info "LVM filter for TrueNAS NVMe not active. Apply later with: truenas-plugin-lvm-filter --install"
+        return 0
+    fi
+
+    echo
+    warning "Host LVM is scanning TrueNAS NVMe/TCP namespaces (transport: ${transport_mode:-unknown})"
+    echo "  A guest VM that runs LVM inside will cause duplicate-VG warning storms on"
+    echo "  this host and can push storage-list API calls past the 596s timeout."
+    echo
+    echo "  Fix: add this reject regex to LVM's global_filter:"
+    echo "      $LVM_FILTER_REGEX"
+    echo "  (local /dev/zd* and /dev/rbd* are already rejected by the existing filter)"
+    echo
+    read -rp "Apply the LVM global filter now? [Y/n]: " lvm_confirm
+    if [[ ! "$lvm_confirm" =~ ^[Nn] ]]; then
+        _lvm_filter_apply || {
+            warning "LVM filter was not applied (see above). You can run it later with:"
+            echo "  truenas-plugin-lvm-filter --install"
+        }
+    else
+        info "Skipped. Apply later with: truenas-plugin-lvm-filter --install"
+    fi
+    return 0
+}
+
 # Configuration wizard
 menu_configure_storage() {
     clear_screen
@@ -10776,13 +11872,20 @@ menu_configure_storage() {
             local use_multipath="$PROV_USE_MULTIPATH"
             local portals="$PROV_ADDITIONAL_PORTALS"
 
+            # Build the discovery portal only when BOTH IP and port resolved.
+            # An all-empty pair would otherwise yield a bare ":" (issue #86
+            # sub-item 1, tracked in #93) that the non-empty guard would write
+            # to storage.cfg even after the subsystem-ID lookup fails and the
+            # user chooses "Continue anyway".
+            if [[ -n "$PROVISIONED_PORTAL_IP" && -n "$PROVISIONED_PORTAL_PORT" ]]; then
+                portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
+            fi
+
             if [[ "$transport_mode" == "nvme-tcp" ]]; then
                 subsystem_nqn="$PROVISIONED_SUBSYSTEM_NQN"
-                portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
                 hostnqn="$PROV_HOSTNQN"
             else
                 target="$PROVISIONED_TARGET_IQN"
-                portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
             fi
 
             # Node restriction (cluster only)
@@ -10901,6 +12004,8 @@ menu_configure_storage() {
             fi
 
             success "Storage '$storage_name' configured successfully!"
+
+            offer_lvm_filter "$transport_mode"
 
             read -rp "Press any key to return to main menu..." -n1 _
             echo
@@ -11073,25 +12178,47 @@ menu_configure_storage() {
     while true; do
         read -rp "Portal IP (optional, press Enter to use TrueNAS IP): " portal
         if [[ -z "$portal" ]]; then
-            portal="${truenas_ip}:${default_port}"
+            # Bracket a bare IPv6 truenas_ip before appending :port (plain ":" would be ambiguous)
+            local truenas_ip_disp="$truenas_ip"
+            [[ "$truenas_ip_disp" == *:* && "$truenas_ip_disp" != \[* ]] && truenas_ip_disp="[$truenas_ip_disp]"
+            portal="${truenas_ip_disp}:${default_port}"
             break
         else
-            # Extract IP part (may or may not have port)
-            local portal_ip="${portal%%:*}"
+            # Extract IP part and optional port. IPv6 addresses contain colons
+            # themselves, so a port suffix is only unambiguous in two forms:
+            # "[ipv6]:port" (bracketed) or "ipv4-or-host:port" (single colon).
+            # A bare IPv6 literal (multiple colons, no brackets) can't carry a
+            # port suffix at all - treat the whole string as the address.
+            local portal_ip portal_port
+            if [[ "$portal" =~ ^\[([0-9a-fA-F:]+)\](:([0-9]+))?$ ]]; then
+                portal_ip="[${BASH_REMATCH[1]}]"
+                portal_port="${BASH_REMATCH[3]}"
+            elif [[ "$portal" == *:*:* ]]; then
+                portal_ip="$portal"
+                portal_port=""
+            else
+                portal_ip="${portal%%:*}"
+                if [[ "$portal" == *:* ]]; then
+                    portal_port="${portal##*:}"
+                else
+                    portal_port=""
+                fi
+            fi
+
             if ! validate_ip "$portal_ip"; then
                 error "Invalid IP address format"
                 continue
             fi
-            if [[ ! "$portal" =~ : ]]; then
+            if [[ -z "$portal_port" ]]; then
                 # Add default port if not specified
-                portal="${portal}:${default_port}"
+                portal="${portal_ip}:${default_port}"
             else
                 # Validate port number
-                local portal_port="${portal##*:}"
                 if ! [[ "$portal_port" =~ ^[0-9]+$ ]] || [[ "$portal_port" -lt 1 ]] || [[ "$portal_port" -gt 65535 ]]; then
                     error "Invalid port number (must be 1-65535)"
                     continue
                 fi
+                portal="${portal_ip}:${portal_port}"
             fi
             break
         fi
@@ -11391,12 +12518,55 @@ menu_configure_storage() {
         return 1
     fi
 
+    offer_lvm_filter "$transport_mode"
+
     read -rp "Press Enter to continue..."
 }
 
 # ============================================================================
 # ROLLBACK FUNCTIONALITY
 # ============================================================================
+
+# Restore from a packaged .deb backup via `dpkg -i`. Unlike a raw .pm copy,
+# this keeps dpkg state consistent with the on-disk plugin: afterwards `dpkg -l`
+# reports the rolled-back version. The package's postinst runs (broker-socket
+# wait + the deferred service restarts), so no separate restart is needed here.
+restore_from_deb() {
+    local deb_file="$1"
+
+    if [[ ! -f "$deb_file" ]]; then
+        error "Package backup not found: $deb_file"
+        return 1
+    fi
+
+    if ! command -v dpkg >/dev/null 2>&1; then
+        error "dpkg is required to restore from a .deb backup"
+        return 1
+    fi
+
+    # Integrity check -- a corrupt archive would otherwise fail inside dpkg -i
+    # with a confusing message.
+    if ! dpkg-deb --info "$deb_file" >/dev/null 2>&1; then
+        error "Package backup failed integrity check: $deb_file"
+        return 1
+    fi
+
+    local ver
+    ver=$(dpkg-deb -f "$deb_file" Version 2>/dev/null || echo "unknown")
+    info "Restoring plugin from package backup via dpkg -i: $(basename "$deb_file") ($ver)"
+
+    # Preserve the current version before replacing it (enables re-rollback).
+    backup_plugin || warning "Could not backup current version"
+
+    if ! dpkg -i "$deb_file"; then
+        error "dpkg -i failed for $(basename "$deb_file")"
+        return 1
+    fi
+
+    success "Plugin rolled back to $ver via dpkg (dpkg state consistent)"
+    log "INFO" "Plugin restored from package: $deb_file ($ver)"
+    return 0
+}
 
 # Restore from backup
 restore_plugin_from_backup() {
@@ -11434,7 +12604,77 @@ restore_plugin_from_backup() {
     # Restart services
     restart_pve_services || warning "Services may need manual restart"
 
+    # A raw .pm copy does not update dpkg state: on a dpkg-managed node
+    # `dpkg -l` still reports the pre-rollback version -- exactly the #87
+    # drift. Make it visible instead of silent, and point at the resync.
+    if [[ "$(get_install_source)" == "apt" ]]; then
+        warning "Raw .pm restore does not update dpkg state."
+        warning "dpkg -l will report the pre-rollback version until you resync:"
+        warning "  apt-get install --reinstall $APT_PACKAGE_NAME"
+    fi
+
     return 0
+}
+
+# Roll back all REMOTE cluster nodes to the same artifact. $1 = local artifact
+# path, $2 = kind ("deb" | "pm"). For each remote node: transfer the artifact to
+# its BACKUP_DIR, then dpkg -i (deb) or raw .pm copy + service restart (pm).
+# A failure on one node does not abort the others; per-node results are reported.
+rollback_cluster_to_artifact() {
+    local artifact="$1" kind="$2"
+    local -a remotes
+    mapfile -t remotes < <(get_remote_cluster_nodes 2>/dev/null || true)
+
+    if [[ ${#remotes[@]} -eq 0 ]]; then
+        warning "No remote cluster nodes to roll back"
+        return 1
+    fi
+
+    local base
+    base=$(basename "$artifact")
+    local ok_count=0 fail_count=0
+
+    for entry in "${remotes[@]}"; do
+        local node_name="${entry%%:*}"
+        local node_ip="${entry##*:}"
+        info "Rolling back $node_name ($node_ip) to $(basename "$artifact")..."
+
+        if ! scp -o ConnectTimeout=10 -o BatchMode=yes "$artifact" "root@${node_ip}:${BACKUP_DIR}/${base}" >/dev/null 2>&1; then
+            error "$node_name: failed to transfer artifact"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        if [[ "$kind" == "deb" ]]; then
+            # dpkg -i runs the postinst (broker wait + service restarts).
+            if ssh -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" "dpkg -i '${BACKUP_DIR}/${base}'" >/dev/null 2>&1; then
+                success "$node_name: rolled back via dpkg"
+                ok_count=$((ok_count + 1))
+            else
+                error "$node_name: dpkg -i failed"
+                fail_count=$((fail_count + 1))
+            fi
+        else
+            # Raw .pm copy + immediate restart of the plugin-loading daemons.
+            # dpkg state on that node goes stale (same caveat as a local raw restore).
+            if ssh -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" \
+                "cp '${BACKUP_DIR}/${base}' '$PLUGIN_FILE' && chown root:root '$PLUGIN_FILE' && chmod 644 '$PLUGIN_FILE' && systemctl restart pvedaemon pvestatd pvescheduler pveproxy" >/dev/null 2>&1; then
+                warning "$node_name: rolled back via raw .pm copy (dpkg state stale on that node)"
+                ok_count=$((ok_count + 1))
+            else
+                error "$node_name: raw .pm restore failed"
+                fail_count=$((fail_count + 1))
+            fi
+        fi
+    done
+
+    echo
+    if [[ $fail_count -eq 0 ]]; then
+        success "Cluster rollback: $ok_count node(s) updated, 0 failed"
+    else
+        warning "Cluster rollback: $ok_count succeeded, $fail_count failed"
+    fi
+    [[ $fail_count -eq 0 ]]
 }
 
 # Menu: Rollback
@@ -11442,10 +12682,11 @@ menu_rollback() {
     print_header "Rollback to Previous Version"
 
     info "Searching for available backups..."
-    local backups
-    backups=$(list_backups 2>/dev/null || true)
+    local pm_backups deb_backups
+    pm_backups=$(list_backups 2>/dev/null || true)
+    deb_backups=$(list_deb_backups 2>/dev/null || true)
 
-    if [[ -z "$backups" ]]; then
+    if [[ -z "$pm_backups" && -z "$deb_backups" ]]; then
         warning "No backups found"
         info "Backups are stored in: $BACKUP_DIR"
         read -rp "Press Enter to continue..."
@@ -11453,37 +12694,45 @@ menu_rollback() {
     fi
 
     echo
-    echo "Available backups:"
+    echo "Available rollback targets:"
     echo "─────────────────────────────────────────────────────────"
 
-    local -a backup_array
+    local -a target_array=()
+    local -a target_kind=()
     local index=1
-    while IFS= read -r backup; do
-        # Extract version and timestamp from filename
-        local filename
-        filename=$(basename "$backup")
-        # Format: TrueNASPlugin.pm.backup.VERSION.TIMESTAMP
-        # Remove prefix to get VERSION.TIMESTAMP
-        local version_timestamp
-        version_timestamp=$(echo "$filename" | sed 's/TrueNASPlugin\.pm\.backup\.//')
-        # Split on last underscore (timestamp starts with YYYYMMDD_)
-        local version
-        version=$(echo "$version_timestamp" | sed 's/\.[0-9]*_[0-9]*$//')
-        local timestamp
-        timestamp=$(echo "$version_timestamp" | sed 's/.*\.\([0-9]*_[0-9]*\)$/\1/')
 
-        # Format timestamp for display
-        local display_time
-        if [[ "$timestamp" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
-            display_time="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
-        else
-            display_time="$timestamp"
-        fi
+    if [[ -n "$deb_backups" ]]; then
+        echo "  Package backups  (dpkg-consistent restore via dpkg -i):"
+        while IFS= read -r deb; do
+            local dver
+            dver=$(dpkg-deb -f "$deb" Version 2>/dev/null || echo "unknown")
+            echo "    $index) $dver   [dpkg]   $(basename "$deb")"
+            target_array+=("$deb")
+            target_kind+=("deb")
+            ((index++))
+        done <<< "$deb_backups"
+    fi
 
-        echo "  $index) Version $version - $display_time"
-        backup_array+=("$backup")
-        ((index++))
-    done <<< "$backups"
+    if [[ -n "$pm_backups" ]]; then
+        echo "  Plugin file backups  (raw .pm copy; dpkg state goes stale):"
+        while IFS= read -r backup; do
+            local filename version_timestamp version timestamp display_time
+            filename=$(basename "$backup")
+            # Format: TrueNASPlugin.pm.backup.VERSION.TIMESTAMP
+            version_timestamp=$(echo "$filename" | sed 's/TrueNASPlugin\.pm\.backup\.//')
+            version=$(echo "$version_timestamp" | sed 's/\.[0-9]*_[0-9]*$//')
+            timestamp=$(echo "$version_timestamp" | sed 's/.*\.\([0-9]*_[0-9]*\)$/\1/')
+            if [[ "$timestamp" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+                display_time="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+            else
+                display_time="$timestamp"
+            fi
+            echo "    $index) $version - $display_time   [raw]"
+            target_array+=("$backup")
+            target_kind+=("pm")
+            ((index++))
+        done <<< "$pm_backups"
+    fi
 
     echo "  0) Cancel"
     echo "─────────────────────────────────────────────────────────"
@@ -11497,10 +12746,15 @@ menu_rollback() {
         return 0
     fi
 
-    local selected_backup="${backup_array[$((choice - 1))]}"
+    local selected="${target_array[$((choice - 1))]}"
+    local kind="${target_kind[$((choice - 1))]}"
 
     echo
-    warning "This will replace the current plugin with the selected backup"
+    if [[ "$kind" == "deb" ]]; then
+        warning "This will reinstall the selected .deb via dpkg (dpkg-consistent)"
+    else
+        warning "This will replace the current plugin with the selected .pm backup"
+    fi
     read -rp "Continue with rollback? [y/N]: " confirm
 
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
@@ -11509,12 +12763,29 @@ menu_rollback() {
         return 0
     fi
 
-    if restore_plugin_from_backup "$selected_backup"; then
+    local rollback_ok=false
+    if [[ "$kind" == "deb" ]]; then
+        if restore_from_deb "$selected"; then
+            rollback_ok=true
+        fi
+    else
+        if restore_plugin_from_backup "$selected"; then
+            rollback_ok=true
+        fi
+    fi
+
+    if [[ "$rollback_ok" == "true" ]]; then
         success "Rollback completed successfully"
 
-        # Show cluster warning if applicable
+        # Cluster-wide opt-in: offer to roll back the rest of the cluster to the
+        # same artifact. Declining leaves the other nodes untouched.
         if is_cluster_node; then
             show_cluster_warning
+            echo
+            read -rp "Roll back all cluster nodes to this version too? [y/N]: " cluster_choice
+            if [[ "$cluster_choice" =~ ^[Yy] ]]; then
+                rollback_cluster_to_artifact "$selected" "$kind"
+            fi
         fi
     else
         error "Rollback failed"
@@ -11926,6 +13197,18 @@ uninstall_plugin() {
         info "Plugin file not found (already removed)"
     fi
 
+    # If the plugin is dpkg-managed, remove the package too. Leaving it
+    # registered makes the next "Install via APT" a no-op (apt reports
+    # "already the newest version") and its verify step then fails with
+    # "Plugin file not found" (issue #105, tracked in #93).
+    if dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
+        if apt-get remove -y "$APT_PACKAGE_NAME"; then
+            success "APT package $APT_PACKAGE_NAME removed"
+        else
+            warning "Failed to remove APT package $APT_PACKAGE_NAME — 'Install via APT' may report the plugin as already installed"
+        fi
+    fi
+
     # Handle storage configuration
     if [[ "$remove_config" == "true" ]]; then
         local storages
@@ -11973,6 +13256,10 @@ uninstall_plugin() {
 
 # Menu: Uninstall
 menu_uninstall() {
+    clear_screen
+    print_banner
+    echo
+
     print_header "Uninstall TrueNAS Plugin"
 
     warning "This will remove the TrueNAS plugin from Proxmox"

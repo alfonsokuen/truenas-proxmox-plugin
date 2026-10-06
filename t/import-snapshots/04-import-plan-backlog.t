@@ -16,7 +16,7 @@
 #      recreated under the same name between the listing and the operator's
 #      "yes" was imported in place of the one that was confirmed.
 #
-# Run with:  prove -v t/nvme/23-import-plan-backlog.t
+# Run with:  prove -v t/import-snapshots/04-import-plan-backlog.t
 
 use strict;
 use warnings;

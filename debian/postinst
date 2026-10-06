@@ -41,20 +41,73 @@ enable_broker() {
 }
 
 restart_proxmox_services() {
+    # The plugin-loading daemons (pvedaemon / pvestatd / pvescheduler / the HA
+    # daemons) do not touch the operator's web-UI session. pveproxy IS the web
+    # UI gateway and serves the xterm.js terminal that streams `apt upgrade`
+    # output when an operator updates from the UI (issue #60): restarting it
+    # synchronously drops that terminal mid-transaction. So we restart the
+    # plugin-loading daemons now and DEFER pveproxy ~10s via a systemd one-shot
+    # timer -- by the time it fires the apt transaction (and its terminal) has
+    # closed, so pveproxy still picks up the new plugin without dropping the
+    # session.
+    #
+    # TRUENAS_PLUGIN_NO_RESTART=1 is an escape hatch for operators who reach
+    # the UI through a jump host or a PAM-mediated password vault and can't
+    # afford even the deferred pveproxy restart: it skips the PVE-side restarts
+    # entirely and prints the command to run later. The truenas-plugin-broker
+    # restart in enable_broker() still runs unconditionally -- our own service,
+    # does not touch the web UI session.
+    if [ "${TRUENAS_PLUGIN_NO_RESTART:-0}" = "1" ]; then
+        echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not restarting Proxmox services."
+        echo "  When convenient, run manually to pick up the new plugin:"
+        echo "    systemctl restart pvedaemon pvestatd pvescheduler pve-ha-crm pve-ha-lrm pveproxy"
+        return 0
+    fi
     if have_systemd; then
         # reload-or-try-restart is what pve-manager itself does: PVE::Daemon
         # re-execs on reload and keeps serving, while a plain try-restart
-        # kills the workers of any task in flight (backup, migration).
-        for unit in pvedaemon.service pvestatd.service pveproxy.service; do
+        # kills the workers of any task in flight (backup, migration). The HA
+        # daemons are in the list because they load the plugin too and keep a
+        # stale copy otherwise (upstream issue #100); a unit that is not
+        # active (HA on a standalone node) is simply skipped, which is what
+        # "try" means.
+        for unit in pvedaemon.service pvestatd.service pvescheduler.service \
+                    pve-ha-crm.service pve-ha-lrm.service; do
             if command -v deb-systemd-invoke >/dev/null 2>&1; then
                 deb-systemd-invoke reload-or-try-restart "$unit" || true
             else
                 systemctl reload-or-try-restart "$unit" || true
             fi
         done
+        # pveproxy is deferred ~10s so an active web-UI upgrade terminal
+        # survives the transaction (upstream issue #60); fall back to an
+        # immediate reload if systemd-run is unavailable. A pending timer from
+        # a concurrent installer run is detected and NOT re-scheduled: a second
+        # `systemd-run` with the same unit name fails while the first timer is
+        # pending, and the fallback would act on pveproxy immediately --
+        # dropping the terminal this deferral exists to protect.
+        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
+            # A previously failed transient unit keeps its name in the failed
+            # state and makes systemd-run refuse to re-create it; reset stale
+            # failed state so the deferral does not fall back to an immediate
+            # action mid-transaction. No-op when the units are clean.
+            systemctl reset-failed truenas-pveproxy-restart.timer \
+                truenas-pveproxy-restart.service 2>/dev/null || true
+            if command -v systemd-run >/dev/null 2>&1; then
+                systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
+                    systemctl reload-or-try-restart pveproxy >/dev/null 2>&1 || \
+                    systemctl reload-or-try-restart pveproxy || true
+            else
+                systemctl reload-or-try-restart pveproxy || true
+            fi
+        fi
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true
+        invoke-rc.d pvestatd restart || true
+        invoke-rc.d pvescheduler restart || true
         invoke-rc.d pveproxy restart || true
+        invoke-rc.d pve-ha-crm restart || true
+        invoke-rc.d pve-ha-lrm restart || true
     fi
 }
 
@@ -164,6 +217,14 @@ case "$1" in
         fi
 
         enable_broker
+        # The packaged udev rule (NVMe/TCP command size cap, only for
+        # namespaces whose subsystem NQN names truenas) is read at the next
+        # block event; reload so it is in place without a reboot. Already-
+        # connected namespaces are NOT re-triggered here: that is a live I/O
+        # setting change, left to the operator (docs/nvmeof-host-tuning.md).
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules >/dev/null 2>&1 || true
+        fi
         restart_proxmox_services
         ;;
     abort-upgrade|abort-remove|abort-deconfigure|triggered)

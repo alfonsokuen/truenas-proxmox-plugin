@@ -17,7 +17,7 @@
 # So the planner is fail-closed, and this file pins both directions - the
 # candidates it must accept and the ones it must refuse.
 #
-# Run with:  prove -v t/nvme/19-snapshot-import-plan.t
+# Run with:  prove -v t/import-snapshots/01-snapshot-import-plan.t
 
 use strict;
 use warnings;
