@@ -38,10 +38,21 @@
 # measurement used 128, which also works but is not what this fork sets.
 #
 # INSTALL
-#     cp 99-nvme-tcp-max-sectors.rules /etc/udev/rules.d/
+#     The .deb installs this file as /usr/lib/udev/rules.d/99-nvme-tcp-max-sectors.rules;
+#     nothing to copy. Do NOT also copy it to /etc/udev/rules.d/ under the same
+#     name: udev lets that copy replace the packaged one, so upgrades would stop
+#     updating the rule. (Without the package, install it by hand to
+#     /usr/lib/udev/rules.d/ instead.)
 #     udevadm control --reload-rules
 #     udevadm trigger --subsystem-match=block --action=change
 #     cat /sys/block/<dev>/queue/max_sectors_kb        # must say 1024
+#
+# COEXISTENCE. Production nodes may already carry
+# /etc/udev/rules.d/99-nvmeof-maxio.rules (a different file name, which sets the
+# same 1024 on the head with a RUN step). Both rules may stay: they write the
+# same value, so neither undoes the other. Keep every one of them at the plugin's
+# default (NVME_DEFAULT_MAX_IO_KB = tn_nvme_max_io_kb); a different number in any
+# of them would make the plugin report a drift each time it revalidates.
 #
 # The trigger applies it to already-connected namespaces, so no reboot and no
 # disconnect is needed. Confirm the value actually changed -- a rule that does

@@ -58,8 +58,22 @@ truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium
 
   * ANTES DE ESCRIBIR claves nuevas en storage.cfg (tn_use_cluster_lock,
     tn_device_ready_retries, y un tn_api_host con corchetes IPv6 o formato
-    portal-dns) esperar a que los 3 nodos esten en idk22: idk21 no las
-    conoce y descartaria la seccion entera del storage.
+    portal-dns) esperar a que los 3 nodos esten en idk22. Medido en
+    laboratorio: idk21 NO descarta la seccion entera; solo descarta esa clave
+    desconocida con un warning, y un `pvesm set` ejecutado desde un nodo idk21
+    la BORRA del stanza para todo el cluster (una clave escrita desde idk22 se
+    pierde en silencio).
+
+  * Cambios de comportamiento respecto a idk21:
+    - free_image devuelve el borrado del dataset como worker (la tarea imgdel
+      de PVE) y este corre FUERA del lock; un borrado que falla vive en esa
+      tarea, no en la llamada que lo pidio.
+    - _device_for_lun espera hasta 600 reintentos (~60 s, dentro de pveproxy)
+      en vez de 200 (tn_device_ready_retries, default 600).
+    - El lock CFS sigue tomandose siempre; tn_use_cluster_lock=0 es opt-in al
+      bypass de upstream.
+    - Un teardown de clon vzdump que falla ya no se traga: lanza error y los
+      llamadores lo registran con el dataset huerfano exacto.
 
   * KNOWN ISSUE (preexistente desde idk21, NO corregido aqui): `qm rescan`
     global registra el disco de un clon enlazado como `unusedN` ademas de su
@@ -68,7 +82,9 @@ truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium
 
   * Pendiente conocido: `pvesm free` imprime "Removed volume" aunque el
     borrado diferido (el worker que devuelve free_image) falle despues; es el
-    orden de PVE (imprime antes de forkear el worker), no del plugin.
+    orden de PVE, no del plugin. Tampoco se corrigen aqui: el reaper de
+    namespaces frente a un create_base en otro nodo (hipotesis), la clave API
+    por argv en install.sh (preexistente) y 4Kn/IPv6.
 
   * tn_broker_timeout conserva el default de 30 s del fork (upstream subio a
     60 s); sigue siendo configurable.

@@ -125,8 +125,10 @@ apt install "./truenas-proxmox-plugin_${V}_all.deb"
 
 > **Rolling upgrade to idk22:** do not write the new `storage.cfg` keys
 > (`tn_use_cluster_lock`, `tn_device_ready_retries`, or a `tn_api_host` in
-> bracketed-IPv6 / portal-dns form) until all three nodes run idk22. idk21 does
-> not know them and would drop the whole storage section.
+> bracketed-IPv6 / portal-dns form) until all three nodes run idk22. Measured
+> in the lab: idk21 does NOT drop the section; it discards that one unknown key
+> with a warning, and a `pvesm set` run from an idk21 node DELETES it from the
+> stanza for the whole cluster. See `docs/idk22-rollout-runbook.md`.
 
 If the same version is already installed, `apt install` is a no-op: use
 `apt reinstall ./<file>.deb` or `dpkg -i`. The options below are upstream's.
