@@ -921,8 +921,8 @@ COMMANDS:
     migrate-secrets <storeid> [--dry-run]
                         Move tn_api_key/tn_chap_password/tn_nvme_dhchap_secret/
                         tn_nvme_dhchap_ctrl_secret for an existing truenasplugin
-                        storage out of storage.cfg (readable via `pvesh get
-                        /storage/<id>` with the Datastore.Allocate permission,
+                        storage out of storage.cfg (readable via \`pvesh get
+                        /storage/<id>\` with the Datastore.Allocate permission,
                         and by the www-data group) into /etc/pve/priv/storage
                         (root-only). Storages created or edited after this
                         installer already store secrets there; this is only
@@ -933,17 +933,21 @@ COMMANDS:
                         that check once you have confirmed it by hand. See
                         wiki/Tools.md#migrate-secrets.
 
-    prune-orphan-cloudinit [--storage ID] [--yes]
+    prune-orphan-cloudinit [--storage ID] [--yes --confirm-sole-cluster]
                         List the cloud-init volumes of truenasplugin storages
                         whose guest no longer exists on any node (and that no
                         configuration, snapshots included, references).
-                        `qm destroy --purge` leaves them behind: PVE only
+                        \`qm destroy --purge\` leaves them behind: PVE only
                         frees a cloud-init drive whose volid ENDS in
                         "cloudinit", and ours ends in -ns<uuid>/-lun<N>.
                         Dry run unless --yes, which frees each one with
-                        `pvesm free` (through the plugin's free_image guards).
-                        Exits with an error, listing nothing, if /etc/pve
-                        cannot be read. See wiki/Known-Limitations.md.
+                        \`pvesm free\` (through the plugin's free_image guards)
+                        and also needs --confirm-sole-cluster: this tool only
+                        sees THIS cluster, so no other Proxmox VE, PegaProx or
+                        lab may use the same dataset. Aborts, listing nothing,
+                        on any doubt (unreadable /etc/pve, a node without its
+                        guest directories, operations in progress, two
+                        storages on one dataset). See wiki/Known-Limitations.md.
 
 OPTIONS:
     --version           Display installer version
@@ -966,7 +970,7 @@ EXAMPLES:
     truenas-proxmox-manage migrate-secrets tn-prod --dry-run
     truenas-proxmox-manage migrate-secrets tn-prod
 
-    # Find cloud-init volumes left behind by `qm destroy --purge` (dry run)
+    # Find cloud-init volumes left behind by \`qm destroy --purge\` (dry run)
     truenas-proxmox-manage prune-orphan-cloudinit
 
     # Non-interactive APT bootstrap install
