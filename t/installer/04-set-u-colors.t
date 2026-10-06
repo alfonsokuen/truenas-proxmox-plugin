@@ -41,4 +41,14 @@ $out = run_clean("TERM=xterm");
 like($out, qr/COLOR=\w+/, 'a plain TERM still works');
 unlike($out, qr/unbound variable/, '  ...without unbound variables');
 
+# --- the prune-orphan-cloudinit subcommand is dispatched to the plugin -------
+{
+    open(my $fh, '<', $SCRIPT) or die;
+    my $src = do { local $/; <$fh> };
+    close $fh;
+    like($src, qr/^\s+prune-orphan-cloudinit\)\s*\n(?:.*\n){1,8}?\s+exec perl .*\n\s+-e 'exit PVE::Storage::Custom::TrueNASPlugin::prune_orphan_cloudinit_cli\(\@ARGV\)'/m,
+        'install.sh dispatches prune-orphan-cloudinit to the plugin CLI');
+    like($src, qr/^\s+prune-orphan-cloudinit \[--storage ID\] \[--yes\]/m, '  ...and documents it in --help');
+}
+
 done_testing;

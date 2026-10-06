@@ -5136,6 +5136,190 @@ sub migrate_priv_secrets {
 }
 
 # `truenas-proxmox-manage migrate-secrets <storeid> [--dry-run] [--all-nodes-upgraded]`
+# ======== prune-orphan-cloudinit ========
+#
+# PVE's drive_is_cloudinit() matches /(?:vm-\d+-)?cloudinit(?:\.fmt)?$/ at the
+# END of the volid. This plugin's cloud-init volume is vol-vm-N-cloudinit-ns<uuid>
+# (NVMe) or ...-lun<K> (iSCSI), which does not match, so destroy_vm treats it as
+# a plain CD-ROM and never calls free_image: `qm destroy --purge` leaves the zvol
+# behind. The volume cannot be renamed (the bare name does not parse on idk21
+# during a rolling upgrade, and `qm rescan` would register the existing ones as
+# unusedN, one delete away from destroying a real disk), so this command finds
+# the ones whose guest no longer exists and, only with --yes, frees them through
+# `pvesm free` - which goes through free_image and its guards. Nothing here ever
+# deletes through the API by itself.
+our $_PRUNE_PVE_ROOT = '/etc/pve';
+our $_PRUNE_LIST;       # coderef($storeid) -> [volids]   (tests)
+our $_PRUNE_FREE;       # coderef($volid)   -> exit status (tests)
+
+sub _prune_read_file {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or die "cannot read $path: $!\n";
+    local $/;
+    my $c = <$fh>;
+    die "cannot read $path: $!
+" if !defined $c;
+    close $fh;
+    return $c;
+}
+
+# Every guest conf of every node: { exists => {vmid=>1}, text => [all conf text] }.
+# Any failure to read dies: a conf we could not read might be the one that
+# references the volume, so "cannot look" must never read as "not referenced".
+sub _prune_guest_index {
+    my ($root) = @_;
+    my $nodes = "$root/nodes";
+    opendir(my $nd, $nodes) or die "cannot read $nodes: $!\n";
+    my @nodes = grep { !/^\./ && -d "$nodes/$_" } readdir($nd);
+    closedir($nd);
+    die "no nodes found under $nodes; refusing to guess that no guest exists\n" if !@nodes;
+    my (%exists, @text);
+    for my $node (@nodes) {
+        for my $kind (qw(qemu-server lxc)) {
+            my $dir = "$nodes/$node/$kind";
+            my $dh;
+            if (!opendir($dh, $dir)) {
+                next if $!{ENOENT};
+                die "cannot read $dir: $!\n";
+            }
+            my @confs = grep { /^\d+\.conf$/ } readdir($dh);
+            closedir($dh);
+            for my $c (@confs) {
+                my ($vmid) = $c =~ /^(\d+)\.conf$/;
+                $exists{$vmid} = 1;
+                push @text, _prune_read_file("$dir/$c");
+            }
+        }
+    }
+    return { exists => \%exists, text => \@text };
+}
+
+sub _prune_truenas_storages {
+    my ($root) = @_;
+    my $cfg = _prune_read_file("$root/storage.cfg");
+    return [ $cfg =~ /^truenasplugin:\s*(\S+)\s*$/mg ];
+}
+
+sub _prune_references {
+    my ($index, $volid) = @_;
+    return scalar grep { /(?<![A-Za-z0-9-])\Q$volid\E(?![A-Za-z0-9-])/ } @{ $index->{text} };
+}
+
+# Returns { orphans => [ {volid, vmid} ], kept => [ {volid, vmid, reason} ],
+# freed => [ {volid, vmid, rc|note} ] }. Dies on anything it cannot establish.
+# With yes => 1 also frees each orphan, re-reading every guest configuration
+# right before each free (a guest may appear meanwhile).
+sub prune_orphan_cloudinit {
+    my ($class, %o) = @_;
+    my $root = $o{pve_root} // $_PRUNE_PVE_ROOT;
+    my $list = $o{list_volumes} // $_PRUNE_LIST // sub {
+        my ($store) = @_;
+        my @ids;
+        run_command(['pvesm', 'list', $store, '--content', 'images'], outfunc => sub {
+            my ($line) = @_;
+            push @ids, $1 if $line =~ /^(\S+:\S+)\s/;
+        });
+        return [ @ids ];
+    };
+    my $free = $o{free_volume} // $_PRUNE_FREE // sub {
+        my ($volid) = @_;
+        my $st = system('pvesm', 'free', $volid);
+        return $st == -1 ? 255 : ($st >> 8);
+    };
+
+    my $stores = _prune_truenas_storages($root);
+    my @targets = @$stores;
+    if (defined $o{storage}) {
+        die "storage '$o{storage}' is not a truenasplugin storage\n" if !grep { $_ eq $o{storage} } @$stores;
+        @targets = ($o{storage});
+    }
+
+    my $index = _prune_guest_index($root);
+    my (@orphans, @kept);
+    for my $store (@targets) {
+        my $ids = $list->($store);
+        die "listing storage '$store' returned no list\n" if ref($ids) ne 'ARRAY';
+        for my $volid (@$ids) {
+            my ($v1, $v2) = $volid =~ /^\Q$store\E:(?:vol-vm-(\d+)-cloudinit-(?:lun\d+|ns[0-9a-f-]+)|vm-(\d+)-cloudinit)$/;
+            my $vmid = $v1 // $v2;
+            next if !defined $vmid;
+            if ($index->{exists}{$vmid}) {
+                push @kept, { volid => $volid, vmid => $vmid, reason => "guest $vmid exists" };
+            } elsif (_prune_references($index, $volid)) {
+                push @kept, { volid => $volid, vmid => $vmid, reason => "referenced by a guest configuration (snapshots included)" };
+            } else {
+                push @orphans, { volid => $volid, vmid => $vmid };
+            }
+        }
+    }
+    @orphans = sort { $a->{volid} cmp $b->{volid} } @orphans;
+
+    my %result = (orphans => \@orphans, kept => \@kept, freed => []);
+    return \%result if !$o{yes};
+
+    for my $orphan (@orphans) {
+        my $fresh = eval { _prune_guest_index($root) };
+        if (!$fresh) {
+            push @{ $result{freed} }, { %$orphan, rc => undef, note => "cannot re-read the guest configurations: $@" };
+            last;
+        }
+        if ($fresh->{exists}{ $orphan->{vmid} } || _prune_references($fresh, $orphan->{volid})) {
+            push @{ $result{freed} }, { %$orphan, rc => undef, note => 'a guest appeared or references it now' };
+            next;
+        }
+        push @{ $result{freed} }, { %$orphan, rc => $free->($orphan->{volid}) };
+    }
+    return \%result;
+}
+
+sub prune_orphan_cloudinit_cli(@argv) {
+    my ($storage, $yes);
+    my $usage = "Usage: truenas-proxmox-manage prune-orphan-cloudinit [--storage ID] [--yes]\n";
+    while (@argv) {
+        my $arg = shift @argv;
+        if ($arg eq '--yes' || $arg eq '-y') {
+            $yes = 1;
+        } elsif ($arg eq '--storage') {
+            $storage = shift @argv;
+            if (!defined $storage) { print STDERR $usage; return 1 }
+        } elsif ($arg eq '--help' || $arg eq '-h') {
+            print $usage;
+            print "\nLists cloud-init volumes of truenasplugin storages whose guest no longer exists\n"
+                . "(no qemu-server or lxc conf on any node, and no conf, snapshots included,\n"
+                . "referencing the volume). Dry run unless --yes, which frees each one with\n"
+                . "`pvesm free` (through the plugin's free_image guards). See wiki/Known-Limitations.md.\n";
+            return 0;
+        } else {
+            print STDERR "unexpected argument '$arg'\n$usage";
+            return 1;
+        }
+    }
+    my $r = eval { __PACKAGE__->prune_orphan_cloudinit(storage => $storage, yes => $yes) };
+    if (my $err = $@) {
+        print STDERR "prune-orphan-cloudinit: $err";
+        print STDERR "No volume was listed as orphaned or freed.\n";
+        return 1;
+    }
+    print "kept    $_->{volid}  ($_->{reason})\n" for @{ $r->{kept} };
+    if (!@{ $r->{orphans} }) {
+        print "0 orphaned cloud-init volumes.\n";
+        return 0;
+    }
+    if (!$yes) {
+        print "orphan  $_->{volid}  (guest $_->{vmid} does not exist on any node)\n" for @{ $r->{orphans} };
+        print scalar(@{ $r->{orphans} }) . " orphaned cloud-init volume(s). Dry run: nothing was freed; "
+            . "re-run with --yes to free them (`pvesm free`).\n";
+        return 0;
+    }
+    my $bad = 0;
+    for my $f (@{ $r->{freed} }) {
+        if (!defined $f->{rc}) { print "skipped $f->{volid}  ($f->{note})\n"; $bad++; next }
+        print "freed   $f->{volid}  rc=$f->{rc}\n";
+        $bad++ if $f->{rc} != 0;
+    }
+    return $bad ? 1 : 0;
+}
+
 sub migrate_secrets_cli(@argv) {
     my ($storeid, $dry_run, $all_nodes_upgraded);
     my $usage = "Usage: truenas-proxmox-manage migrate-secrets <storeid> "

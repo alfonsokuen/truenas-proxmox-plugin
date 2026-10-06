@@ -933,6 +933,18 @@ COMMANDS:
                         that check once you have confirmed it by hand. See
                         wiki/Tools.md#migrate-secrets.
 
+    prune-orphan-cloudinit [--storage ID] [--yes]
+                        List the cloud-init volumes of truenasplugin storages
+                        whose guest no longer exists on any node (and that no
+                        configuration, snapshots included, references).
+                        `qm destroy --purge` leaves them behind: PVE only
+                        frees a cloud-init drive whose volid ENDS in
+                        "cloudinit", and ours ends in -ns<uuid>/-lun<N>.
+                        Dry run unless --yes, which frees each one with
+                        `pvesm free` (through the plugin's free_image guards).
+                        Exits with an error, listing nothing, if /etc/pve
+                        cannot be read. See wiki/Known-Limitations.md.
+
 OPTIONS:
     --version           Display installer version
     --non-interactive   Run in non-interactive mode with defaults
@@ -953,6 +965,9 @@ EXAMPLES:
     # Move an existing storage's secrets out of storage.cfg
     truenas-proxmox-manage migrate-secrets tn-prod --dry-run
     truenas-proxmox-manage migrate-secrets tn-prod
+
+    # Find cloud-init volumes left behind by `qm destroy --purge` (dry run)
+    truenas-proxmox-manage prune-orphan-cloudinit
 
     # Non-interactive APT bootstrap install
     $0 --non-interactive --apt-install --apt-suite trixie
@@ -997,6 +1012,14 @@ parse_arguments() {
                 shift
                 exec perl -MPVE::Storage::Custom::TrueNASPlugin \
                     -e 'exit PVE::Storage::Custom::TrueNASPlugin::migrate_secrets_cli(@ARGV)' \
+                    -- "$@"
+                ;;
+            prune-orphan-cloudinit)
+                # Same rationale as import-snapshots above: dispatched before
+                # the installer proper starts; the logic lives in the plugin.
+                shift
+                exec perl -MPVE::Storage::Custom::TrueNASPlugin \
+                    -e 'exit PVE::Storage::Custom::TrueNASPlugin::prune_orphan_cloudinit_cli(@ARGV)' \
                     -- "$@"
                 ;;
             --version)
