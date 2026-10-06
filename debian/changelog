@@ -61,6 +61,15 @@ truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium
     portal-dns) esperar a que los 3 nodos esten en idk22: idk21 no las
     conoce y descartaria la seccion entera del storage.
 
+  * KNOWN ISSUE (preexistente desde idk21, NO corregido aqui): `qm rescan`
+    global registra el disco de un clon enlazado como `unusedN` ademas de su
+    `scsi0`, porque _list_images_iscsi lista el volid sin la base. Borrar ese
+    `unusedN` liberaria el disco que el clon sigue usando. No lo borres.
+
+  * Pendiente conocido: `pvesm free` imprime "Removed volume" aunque el
+    borrado diferido (el worker que devuelve free_image) falle despues; es el
+    orden de PVE (imprime antes de forkear el worker), no del plugin.
+
   * tn_broker_timeout conserva el default de 30 s del fork (upstream subio a
     60 s); sigue siendo configurable.
 

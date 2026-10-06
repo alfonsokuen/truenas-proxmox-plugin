@@ -113,4 +113,22 @@ sub run_free {
     my ($ok) = run_free();
     ok(!$ok && deletes() == 0, 'B2: a transport "Method does not exist" is not "already gone"');
 }
+# --- B3: iSCSI list_images fails closed on a non-list answer ---------------
+{
+    no strict 'refs'; no warnings 'redefine';
+    my %ans;
+    local *{"${PKG}::_api_call"} = sub { my ($s, $m) = @_; return $ans{$m} };
+    local *{"${PKG}::_resolve_target_id"} = sub { 4 };
+    my $l = sub { $PKG->can('_list_images_iscsi')->($PKG, 's', { tn_dataset => 'tank/pve', tn_api_host => 'h' }, undef, undef, {}) };
+    %ans = ('iscsi.extent.query' => [], 'iscsi.targetextent.query' => [], 'pool.dataset.query' => []);
+    my $r = eval { $l->() };
+    ok($r && ref($r) eq 'ARRAY' && !@$r, 'B3: a real empty list is a legitimately empty storage');
+    for my $case (['undef', undef], ['a hash', { x => 1 }]) {
+        %ans = ('iscsi.extent.query' => $case->[1], 'iscsi.targetextent.query' => [], 'pool.dataset.query' => []);
+        ok(!eval { $l->(); 1 } && $@ =~ /Cannot list s/, "B3: extent query answering $case->[0] -> list_images dies, not empty");
+    }
+    %ans = ('iscsi.extent.query' => [], 'iscsi.targetextent.query' => undef, 'pool.dataset.query' => []);
+    ok(!eval { $l->(); 1 }, 'B3: targetextent query answering nothing -> dies');
+}
+
 done_testing;

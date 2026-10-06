@@ -10750,8 +10750,19 @@ sub _list_images_iscsi {
     # listing; without bypassing the cache here it intermittently reappears.
     # Cost: two extra TN API calls per list_images invocation. list_images is
     # not in a hot loop -- it's called on demand from storage-content queries.
-    my $extents    = _api_call($scfg, 'iscsi.extent.query', []) // [];
-    my $maps       = _api_call($scfg, 'iscsi.targetextent.query', []) // [];
+    # An empty list is a claim ("nothing on this storage"); only a real array,
+    # possibly empty, may make it. undef or a non-list answer used to become []
+    # here and reconciliation read it as "every volume is an orphan". Same rule
+    # as _list_images_nvme.
+    my $extents    = _api_call($scfg, 'iscsi.extent.query', []);
+    my $maps       = _api_call($scfg, 'iscsi.targetextent.query', []);
+    for my $pair (['iscsi.extent.query', $extents], ['iscsi.targetextent.query', $maps]) {
+        my ($what, $got) = @$pair;
+        next if ref($got) eq 'ARRAY';
+        die "Cannot list $storeid: $what answered with "
+          . (defined $got ? (ref($got) || 'a scalar') : 'nothing')
+          . " instead of a list, so the contents of this storage are unknown\n";
+    }
     my $target_id  = $cache->{target_id} //= _resolve_target_id($scfg);
 
     # Index extents by id for quick lookups
