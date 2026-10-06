@@ -595,6 +595,10 @@ sub _is_retryable_error {
 # timeout, which is what every caller outside the retry loop wants.
 our $_api_deadline;
 
+# Set (dynamically scoped) by volume_import while it allocates the target, so
+# _alloc_image_iscsi does not force a 4096-byte sector size on imported data.
+our $_import_alloc = 0;
+
 # Seconds left in the current call's budget, or undef when unbounded. Never
 # returns 0 or less: a caller that asked for the remaining time and got 0
 # would treat it as "no timeout" and block forever.
@@ -9674,6 +9678,9 @@ sub _alloc_image_iscsi {
         blocksize => 4096,
         pblocksize => JSON::PP::true,
     };
+    # An imported disk carries data laid out for the source's sector size; do
+    # not re-present it as 4096 (see volume_import).
+    delete @$extent_payload{qw(blocksize pblocksize)} if $_import_alloc;
     my $extent_id;
 
     # Idempotency: if an extent already points at this exact zvol path,
@@ -12367,7 +12374,16 @@ sub volume_import {
     # The incoming $volname is a stem from pvesm/storage_migrate; the real
     # on-TN layout dictates the suffix. Callers get the final volid in
     # our return value.
-    my $allocname = $class->alloc_image($storeid, $scfg, $vmid, 'raw', undef, $size_kib);
+    # PVE's vdisk_alloc calls alloc_image inside cluster_lock_storage (storage
+    # lock, operation budget, deferred work drained after release); calling it
+    # bare skipped all three. $_import_alloc tells _alloc_image_iscsi not to
+    # force a 4096-byte sector size on a disk that arrives with data.
+    my $allocname = do {
+        local $_import_alloc = 1;
+        $class->cluster_lock_storage($storeid, $scfg->{shared}, undef, sub {
+            $class->alloc_image($storeid, $scfg, $vmid, 'raw', undef, $size_kib);
+        });
+    };
     die "volume_import: alloc_image returned no name\n" if !$allocname;
 
     my $new_volname = $allocname;
@@ -12387,8 +12403,23 @@ sub volume_import {
     if (my $err = $@) {
         _log($scfg, 0, 'err',
             "[TrueNAS] volume_import: streaming failed, rolling back alloc for $new_volname: $err");
-        eval { $class->free_image($storeid, $scfg, $new_volname, 0, 'raw') };
-        warn "[TrueNAS] volume_import: rollback free_image failed: $@\n" if $@;
+        # free_image returns the cleanup worker that holds the dataset delete
+        # (PVE forks it after vdisk_free); dropping it left the zvol behind.
+        my $worker = eval {
+            $class->cluster_lock_storage($storeid, $scfg->{shared}, undef, sub {
+                $class->free_image($storeid, $scfg, $new_volname, 0, 'raw');
+            });
+        };
+        my $rollback_err = $@;
+        if (!$rollback_err && ref($worker) eq 'CODE') {
+            eval { $worker->('volume_import-rollback') };
+            $rollback_err = $@;
+        }
+        if ($rollback_err) {
+            _log($scfg, 0, 'err', "[TrueNAS] volume_import: rollback of $new_volname FAILED, "
+                . "the volume may be left on the array: $rollback_err");
+            die "$err(additionally, the rollback failed and $new_volname may remain on the array: $rollback_err)\n";
+        }
         die $err;
     }
 
