@@ -23,18 +23,25 @@
 # MEASURED (lab, 3-node cluster, kernel 6.8 and 7.0.2-pve):
 #
 #     head 1280 / paths 1280  ->  actual request size 1024 KB
-#     head  128 / paths 1280  ->  actual request size  128 KB     <- this rule
+#     head  128 / paths 1280  ->  actual request size  128 KB
+#     head 1024 / paths 1280  ->  actual request size 1024 KB     <- this rule (idk22)
 #     head  128 / paths  128  ->  actual request size  128 KB
 #
 # Setting it on the head is enough: it splits the bio before forwarding to the
 # path. Also verified to survive a full disconnect/reconnect of the subsystem,
 # which is what matters -- namespaces come and go.
 #
+# VALUE. 1024 is the fork's in-plugin default (NVME_DEFAULT_MAX_IO_KB, tn_nvme_max_io_kb):
+# the plugin re-applies that number on every revalidation, so a rule with a
+# different one would make each pass report a drift it caused itself. Change both
+# together; t/nvme/31-udev-cap-single-source.t compares them. Upstream's own
+# measurement used 128, which also works but is not what this fork sets.
+#
 # INSTALL
 #     cp 99-nvme-tcp-max-sectors.rules /etc/udev/rules.d/
 #     udevadm control --reload-rules
 #     udevadm trigger --subsystem-match=block --action=change
-#     cat /sys/block/<dev>/queue/max_sectors_kb        # must say 128
+#     cat /sys/block/<dev>/queue/max_sectors_kb        # must say 1024
 #
 # The trigger applies it to already-connected namespaces, so no reboot and no
 # disconnect is needed. Confirm the value actually changed -- a rule that does
@@ -48,4 +55,4 @@
 # Adjust the NQN glob if the array's subsystem NQNs do not contain "truenas".
 
 ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", \
-  ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="128"
+  ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"

@@ -28,7 +28,8 @@ SSD, where `local-lvm` lives.
 | Configuration | Actual request size |
 |---|---|
 | head 1280, paths 1280 | 1024 KB |
-| **head 128, paths 1280** | **128 KB** |
+| head 128, paths 1280 | 128 KB |
+| **head 1024, paths 1280** | **1024 KB** (what the fork's rule and `tn_nvme_max_io_kb` both set) |
 | head 128, paths 128 | 128 KB |
 
 Setting it on the head is enough — it splits the bio before forwarding. Verified
