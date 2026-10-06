@@ -100,24 +100,60 @@ still on idk21 cannot parse it during a rolling upgrade, and `qm rescan` would
 register every existing cloud-init disk as `unusedN`, one `qm set --delete`
 away from destroying a real disk. The plugin keeps the volname as it is.
 
-**Mitigation.** List what is left behind, then free it through the plugin:
+**Prevention (tested in the lab on both transports).** Destroy the guest with
+
+```bash
+qm destroy N --purge --destroy-unreferenced-disks 1
+```
+
+In the idk22 lab (Proxmox VE 9.2.21, one VM with a disk and a cloud-init drive per
+transport) a plain `qm destroy N --purge` left `vol-vm-N-cloudinit-lun<K>` (iSCSI) and
+`vol-vm-N-cloudinit-ns<uuid>` (NVMe/TCP) on the storage, and the same destroy with
+`--destroy-unreferenced-disks 1` freed both. That option deletes EVERY volume of that
+vmid on every enabled storage that the configuration no longer references, so use it
+only when nothing of that vmid is to be kept. Not tested for containers (`pct destroy`).
+
+**Mitigation for what is already left behind.** List it, then free it through the plugin:
 
 ```bash
 # dry run (default): lists volumes whose guest exists on no node and that no
-# configuration - snapshots included - references; changes nothing
+# configuration references under ANY of the volume's names; changes nothing
 truenas-proxmox-manage prune-orphan-cloudinit [--storage ID]
-
-# frees each orphan with `pvesm free` (through free_image's guards), one by one
-truenas-proxmox-manage prune-orphan-cloudinit --yes
 ```
 
-It refuses to list anything if `/etc/pve` cannot be read, and re-checks every
-volume right before freeing it. Manual equivalent:
+Before `--yes`: this node must be quorate (`pvecm status | grep -i quorate` says
+`Yes`; the tool also refuses otherwise), no guest may be being created, restored,
+migrated or backed up, and the list must match the vmids you expect (in production
+120, 122, 126, 127, 128, 129, 131, 9000 are live guests, so they must NOT appear as
+orphans). A vmid you do not recognise may belong to ANOTHER cluster, PegaProx or
+lab that uses the same dataset: this tool only sees this cluster, hence the extra
+flag. Repeat the dry run if a VM was being created meanwhile (a guest created between
+the guest index and the listing shows up as a false orphan).
+
+```bash
+truenas-proxmox-manage prune-orphan-cloudinit --yes --confirm-sole-cluster
+```
+
+It frees each one with `pvesm free` (through `free_image`'s guards), re-reading every
+guest configuration right before each free. It aborts, listing nothing, on any doubt:
+unreadable `/etc/pve`, a node without its guest directories, no guest configuration
+at all, files next to the confs (operations in progress), an active
+vzdump/restore/clone/migrate task, a node that is not quorate, or two storage ids on
+the same dataset.
+
+Manual equivalent, only if the tool cannot be used. EVERY step must succeed, and
+"the command failed" is not "nothing found":
 
 ```bash
 pvesm list <storage> | grep cloudinit        # volid in the first column
-ls /etc/pve/nodes/*/qemu-server/N.conf /etc/pve/nodes/*/lxc/N.conf   # guest N must NOT exist
-grep -l '<volid>' /etc/pve/nodes/*/qemu-server/*.conf /etc/pve/nodes/*/lxc/*.conf   # and nothing may reference it
+# 1. the guest must exist on NO node (use the exit status, not the output):
+ls /etc/pve/nodes/*/qemu-server/N.conf /etc/pve/nodes/*/lxc/N.conf   # must fail for every path with "No such file"
+# 2. no configuration of ANY guest may reference the volume, snapshots, [PENDING]
+#    and unusedN included, under any spelling (vm-N-cloudinit, vol-vm-N-cloudinit-ns..., -lun...):
+grep -rlE 'vm-N-cloudinit' /etc/pve/nodes/*/qemu-server /etc/pve/nodes/*/lxc ; echo "grep rc=$?"   # rc must be 1 (no match); rc=2 means it could not look
+# 3. nothing may be creating, restoring, cloning, migrating or backing up a guest now
+#    (a create/restore/disk move makes the volume BEFORE the conf references it):
+cat /var/log/pve/tasks/active
 pvesm free <volid>
 ```
 
@@ -129,17 +165,30 @@ If TrueNAS takes longer than `tn_broker_timeout` (30 s by default) to answer
 `pool.dataset.create`, the broker returns `no response from upstream` and the
 allocation fails on the Proxmox side, but the zvol may still be created a moment
 later and stay behind with no guest. Seen in the lab with 9-15 s of latency under
-a heavy write load (not verified against idk21). Find such a zvol with
-`pvesm list <storage>` (a volume of a guest that does not own it) and remove it
-with `pvesm free`; raise `tn_broker_timeout` if the array is routinely that slow.
+a heavy write load (not verified against idk21). Raise `tn_broker_timeout` if the
+array is routinely that slow.
+
+To find and remove such a zvol, apply the same rigor as for cloud-init: it is an
+orphan only if (1) `pvesm list <storage>` shows a volume of a vmid whose guest does
+not exist, or of a guest that does not reference it (grep ALL
+`/etc/pve/nodes/*/{qemu-server,lxc}/*.conf` with `grep -rl`, snapshots, `[PENDING]`
+and `unusedN` included, and check the grep exit status: 1 = no match, 2 = it could not
+look); (2) that guest has no `lock:` line; and (3) no restore, `qm disk move`,
+migration or clone is running (they create the volume BEFORE the conf references it;
+see `/var/log/pve/tasks/active`). Then `pvesm free <volid>`.
 
 ### A leftover `@vzdump` snapshot or clone makes vzdump fail
 
 A `@vzdump` snapshot, and its clone, left behind by hand (or by an interrupted
 backup) make the next `vzdump` of that guest fail with `EEXIST` when it creates
 the snapshot; nothing cleans it up automatically (not verified against idk21).
-Destroy the clone first, then the snapshot, on TrueNAS (or with
-`zfs destroy`), then run the backup again.
+
+Before destroying them by hand on TrueNAS: make sure no `vzdump` is running on that
+guest (`cat /var/log/pve/tasks/active`, and no backup job in its window), that the
+snapshot is not referenced by any guest or by a backup in progress, and that the clone
+is not in use (`grep -rl <clone-or-volume-name> /etc/pve/nodes/*/{qemu-server,lxc}/*.conf`,
+rc=1 means no reference, rc=2 means it could not look). Destroy the clone first, then
+the snapshot (`zfs destroy`), then run the backup again.
 
 ### DH-HMAC-CHAP: generate the key with `nvme gen-dhchap-key`
 

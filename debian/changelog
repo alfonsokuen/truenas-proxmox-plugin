@@ -85,7 +85,20 @@ truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium
     cuyo guest no existe en ningun nodo y que ninguna conf referencia, snapshots
     incluidos; con --yes los libera con `pvesm free`, uno a uno, re-comprobando
     antes de cada uno; sin poder leer /etc/pve sale con error y no lista nada.
-    Receta manual y causa en wiki/Known-Limitations.md.
+    Receta manual y causa en wiki/Known-Limitations.md. Endurecido tras revision:
+    las referencias se comparan por identidad canonica (storage, vmid) en cualquier
+    alias (vm-N-cloudinit, -ns/-lun, extension) y en cualquier conf (snapshots,
+    [PENDING], unusedN, otros guests, contenedores); aborta ante cualquier duda
+    (directorio de guests ilegible o ausente, indice vacio, sin nodo local,
+    ficheros temporales/lock junto a los confs, tareas vzdump/restore/clone activas,
+    nodo no quorate, dos storages sobre el mismo dataset); `--yes` exige ademas
+    `--confirm-sole-cluster`. PREVENCION probada en laboratorio (iSCSI y NVMe):
+    `qm destroy N --purge --destroy-unreferenced-disks 1` si libera el cloud-init;
+    `--purge` a secas no.
+
+  * install.sh --help: los backticks del texto de ayuda estaban en un heredoc sin
+    comillas y EJECUTABAN `qm destroy --purge`, `pvesm free` y `pvesh get` al
+    imprimir la ayuda; escapados.
 
   * install.sh: detect_color_support ya no muere con `SSH_CLIENT: unbound
     variable` cuando faltan TERM/SSH_* (set -u).

@@ -92,17 +92,32 @@ pueden empezar a usar las claves nuevas del punto 0.3.
 ## 3b. Paso post-despliegue: cloud-init huerfanos (una vez, con los 3 nodos en idk22)
 
 `qm destroy --purge` no libera el disco cloud-init (PVE solo lo hace si el volid
-termina en `cloudinit`; ver `wiki/Known-Limitations.md`). Tras el despliegue,
-en cualquier nodo y **en dry run**:
+termina en `cloudinit`; ver `wiki/Known-Limitations.md`). **Prevencion** (probada en el
+laboratorio en iSCSI y NVMe): destruir con
+`qm destroy N --purge --destroy-unreferenced-disks 1` cuando nada de ese vmid deba
+conservarse. Para lo que ya quedo atras, tras el despliegue, en cualquier nodo y
+**en dry run**:
 
 ```bash
+pvecm status | grep -i quorate          # debe decir Yes (la herramienta tambien aborta si no)
 truenas-proxmox-manage prune-orphan-cloudinit
 ```
 
 Debe decir `0 orphaned cloud-init volumes` mientras todas las VMs con cloud-init
-(hoy 120, 122, 126, 127, 128, 129, 131, 9000) existan. Revisar la salida a mano;
-solo si lista un huerfano real, y tras confirmarlo, `... prune-orphan-cloudinit
---yes`. Repetirlo de vez en cuando (p. ej. tras borrar VMs con cloud-init).
+(hoy 120, 122, 126, 127, 128, 129, 131, 9000) existan. Comparar la lista con esos
+vmid: **un vmid que no reconoces puede ser de otro cluster** (PegaProx, laboratorio u
+otro PVE sobre el mismo dataset), que esta herramienta no ve. Repetir el dry run si
+se estaba creando una VM (un guest creado entre el indice y el listado sale como falso
+huerfano).
+
+`--yes` solo en una **ventana sin operaciones** (nada creandose, restaurandose,
+migrando ni respaldando; la herramienta aborta si lo detecta) y siempre con
+`--confirm-sole-cluster`, que es TU declaracion de que ningun otro cluster usa el
+dataset:
+
+```bash
+truenas-proxmox-manage prune-orphan-cloudinit --yes --confirm-sole-cluster
+```
 
 ## 4. Vuelta atras (por nodo)
 
