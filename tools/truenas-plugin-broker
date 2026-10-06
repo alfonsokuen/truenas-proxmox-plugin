@@ -556,6 +556,16 @@ sub scfg_key {
     return $host . ':' . sha1_hex($key);
 }
 
+# A liveness answer counts only if it is an envelope that carries a result and
+# no error. ws_rpc hands back the whole decoded envelope, so an
+# ENOTAUTHENTICATED reply is a truthy hash too.
+sub liveness_ok {
+    my ($resp) = @_;
+    return 0 if ref($resp) ne 'HASH';
+    return 0 if defined $resp->{error};
+    return defined $resp->{result} ? 1 : 0;
+}
+
 sub get_or_open_ws {
     my ($scfg, $deadline) = @_;
     $deadline //= time() + $UPSTREAM_TIMEOUT;
@@ -588,7 +598,7 @@ sub get_or_open_ws {
                 jsonrpc => "2.0", id => 999999, method => "auth.me", params => [],
             }, $ping_deadline);
         };
-        if ($ok) {
+        if (liveness_ok($ok)) {
             $entry->{last_used} = $now;
             $entry->{last_liveness_ok} = $now;
             return $entry->{conn};
