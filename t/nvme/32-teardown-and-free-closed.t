@@ -131,4 +131,20 @@ sub run_free {
     ok(!eval { $l->(); 1 }, 'B3: targetextent query answering nothing -> dies');
 }
 
+# --- G4: callers that swallow a teardown failure still say WHICH clone -------
+{
+    no strict 'refs'; no warnings 'redefine';
+    my @logs;
+    local *{"${PKG}::_log"} = sub { my ($sc, $lvl, $kind, $msg) = @_; push @logs, "$lvl/$kind $msg" };
+    local *{"${PKG}::_teardown_snapshot_device"} = sub { die "dataset is busy\n" };
+    local $SIG{__WARN__} = sub { };
+    my $vol = 'vol-vm-101-disk-0-ns11111111-2222-3333-4444-555555555555';
+    ok(eval { $PKG->deactivate_volume('s', $scfg, $vol, 'snap1', {}); 1 }, 'G4: deactivate_volume still does not die');
+    my ($line) = grep { m{^0/err} } @logs;
+    ok($line, '  ...and logs at ERROR level 0');
+    like($line // '', qr/vmid=101/, '  ...with the guest');
+    like($line // '', qr{tank/pve/vzdump-vm-101-disk-0-snap1}i, '  ...and the exact orphaned clone dataset');
+    like($line // '', qr/\Q$vol\E/, '  ...and the volume');
+}
+
 done_testing;

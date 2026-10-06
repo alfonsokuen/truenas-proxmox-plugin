@@ -3758,7 +3758,7 @@ sub volume_snapshot_delete {
         # clone exists.
         if (defined($snapname) && $snapname ne '') {
             eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
-            warn "[TrueNAS] volume_snapshot_delete: snapshot clone teardown failed: $@\n" if $@;
+            $class->_log_clone_teardown_failure($scfg, 'volume_snapshot_delete', $volname, $snapname, $@) if $@;
         }
 
         my $result = _api_call_mutate(
@@ -12073,6 +12073,7 @@ sub _expose_snapshot_device {
         # don't leak the clone (and any half-created extent/namespace).
         _log($scfg, 0, 'err', "[TrueNAS] _expose_snapshot_device: expose failed, rolling back clone: $err");
         eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
+        $class->_log_clone_teardown_failure($scfg, '_expose_snapshot_device rollback', $volname, $snapname, $@) if $@;
         die $err;
     }
 
@@ -12081,6 +12082,25 @@ sub _expose_snapshot_device {
 
 # Tear down everything _expose_snapshot_device created. Best-effort: every step
 # is wrapped so a single failure cannot prevent the rest of the cleanup.
+# A teardown that fails leaves the vzdump clone on the array (and, for LXC, the
+# CT locked). The callers cannot let it propagate, but it must not vanish into
+# a bare warn either: log at error level with the guest, the volume and the
+# EXACT clone dataset, so whoever cleans it up knows what to destroy.
+sub _log_clone_teardown_failure {
+    my ($class, $scfg, $where, $volname, $snapname, $err) = @_;
+    my ($vmid, $clone_full) = ('?', '?');
+    eval {
+        my (undef, $zname, $v) = $class->parse_volname($volname);
+        $vmid = $v // '?';
+        (undef, $clone_full) = _snapshot_clone_paths($scfg, $zname, $snapname);
+    };
+    chomp(my $why = $err // '');
+    _log($scfg, 0, 'err', "[TrueNAS] $where: snapshot clone teardown FAILED for vmid=$vmid "
+        . "volume=$volname snapshot=$snapname; orphaned clone dataset: $clone_full "
+        . "(destroy it on TrueNAS once nothing uses it): $why");
+    warn "[TrueNAS] $where: snapshot clone teardown failed (clone $clone_full): $why\n";
+}
+
 sub _teardown_snapshot_device {
     my ($class, $scfg, $volname, $snapname) = @_;
 
@@ -12340,7 +12360,7 @@ sub deactivate_volume {
     # activate_volume exposed for vzdump snapshot backups. Best-effort.
     if (defined($snapname) && $snapname ne '') {
         eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
-        warn "[TrueNAS] deactivate_volume snapshot teardown failed: $@\n" if $@;
+        $class->_log_clone_teardown_failure($scfg, 'deactivate_volume', $volname, $snapname, $@) if $@;
     }
     return 1;
 }
