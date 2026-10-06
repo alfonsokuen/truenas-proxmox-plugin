@@ -45,17 +45,17 @@ my $orphan = $PKG->can('_dataset_orphan_check_and_delete');
 ok($orphan, '_dataset_orphan_check_and_delete exists');
 
 # --- 1. fail closed on a failing clone query (red before the merge fix) ----
-@calls = (); %reply = ('pool.dataset.query' => [ { id => 'tank/pve/base-1-disk-0', children => [] } ]);
+@calls = (); %reply = ('pool.dataset.query' => [ { id => 'tank/pve/vzdump-vm-1-disk-0-s1-abcd1234', children => [] } ]);
 %die_on = ('pool.dataset.query:clones' => "[EFAULT] boom\n");
-is($orphan->($scfg, 'tank/pve/base-1-disk-0'), 0, 'clone query error: orphan recovery refuses');
+is($orphan->($scfg, 'tank/pve/vzdump-vm-1-disk-0-s1-abcd1234'), 0, 'clone query error: orphan recovery refuses');
 ok(!(grep { $_ eq 'pool.dataset.delete' } @calls), '  ...and pool.dataset.delete was never sent');
 
 # the other direction: a clean empty answer still deletes
 @calls = (); %die_on = (); $reply{'pool.dataset.query:clones'} = [];
-is($orphan->($scfg, 'tank/pve/base-1-disk-0'), 1, 'no clones: orphan is deleted');
+is($orphan->($scfg, 'tank/pve/vzdump-vm-1-disk-0-s1-abcd1234'), 1, 'no clones: orphan is deleted');
 ok((grep { $_ eq 'pool.dataset.delete' } @calls), '  ...pool.dataset.delete was sent');
 @calls = (); $reply{'pool.dataset.query:clones'} = [ { id => 'tank/pve/vm-9-disk-0' } ];
-is($orphan->($scfg, 'tank/pve/base-1-disk-0'), 0, 'live clone: refuses');
+is($orphan->($scfg, 'tank/pve/vzdump-vm-1-disk-0-s1-abcd1234'), 0, 'live clone: refuses');
 ok(!(grep { $_ eq 'pool.dataset.delete' } @calls), '  ...no delete');
 
 # --- 2. delete confirmation -------------------------------------------------
@@ -218,12 +218,12 @@ SKIP: {
     local *{"${PKG}::_api_call"} = sub {
         my ($s, $m, $p) = @_;
         if ($m eq 'pool.dataset.query' && $p->[0][0][0] eq 'origin.parsed') { return $clones }
-        return [ { id => 'tank/pve/base-1-disk-0', children => [] } ];
+        return [ { id => 'tank/pve/vzdump-vm-1-disk-0-s1-abcd1234', children => [] } ];
     };
     local *{"${PKG}::_api_call_mutate"} = sub { push @calls, $_[1]; 1 };
     for my $bad (undef, { id => 'x' }, 'str') {
         @calls = (); $clones = $bad;
-        my $r = $PKG->can('_dataset_orphan_check_and_delete')->($scfg, 'tank/pve/base-1-disk-0');
+        my $r = $PKG->can('_dataset_orphan_check_and_delete')->($scfg, 'tank/pve/vzdump-vm-1-disk-0-s1-abcd1234');
         is($r, 0, 'orphan recovery: clone query answering ' . (defined $bad ? ref($bad) || 'a string' : 'undef') . ' -> refuses');
         ok(!(grep { $_ eq 'pool.dataset.delete' } @calls), '  ...no delete');
     }
@@ -253,6 +253,24 @@ SKIP: {
         'check_config accepts 500 (inside the schema range)') or diag($@);
     ok(!eval { $PKG->check_config('s', { type => 'truenasplugin', tn_broker_timeout => $max + 100 }, 0, 1); 1 },
         '  ...and rejects what the schema would reject');
+}
+
+# --- G3: a base-* template is never deleted by the orphan recovery ----------
+{
+    no strict 'refs'; no warnings 'redefine';
+    my @calls;
+    local *{"${PKG}::_api_call"} = sub {
+        my ($s, $m, $p) = @_; push @calls, $m;
+        return [] if $m eq 'pool.dataset.query' && ref $p->[0][0] && $p->[0][0][0] eq 'origin.parsed';   # no clones
+        return [ { id => 'tank/pve/base-7-disk-0', children => [] } ];
+    };
+    local *{"${PKG}::_api_call_mutate"} = sub { push @calls, $_[1]; 1 };
+    my $r = $PKG->can('_dataset_orphan_check_and_delete')->($scfg, 'tank/pve/base-7-disk-0');
+    is($r, 0, 'G3: a base-N-disk-0 template with no children and no clones is REFUSED');
+    ok(!(grep { $_ eq 'pool.dataset.delete' } @calls), '  ...and never deleted');
+    @calls = ();
+    $r = $PKG->can('_dataset_orphan_check_and_delete')->($scfg, 'tank/pve/vm-7-disk-0');
+    is($r, 0, '  ...nor a live-looking vm-N-disk-0');
 }
 
 # --- 11. third review round: "nothing" is not permission --------------------

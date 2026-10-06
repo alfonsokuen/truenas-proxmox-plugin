@@ -419,6 +419,20 @@ sub _is_dataset_already_exists_error {
 # or if the query/delete itself failed.
 sub _dataset_orphan_check_and_delete {
     my ($scfg, $target_dataset) = @_;
+
+    # Only the ephemeral datasets the plugin itself creates (the vzdump snapshot
+    # clones) may be removed by this recovery. A `base-*` template with no
+    # linked clones satisfies "no children, no clones" just as an orphan does,
+    # and a recursive+force delete of it destroys a template; upstream's
+    # create_base EEXIST recovery did exactly that call. Refuse anything else.
+    my ($leaf) = ($target_dataset // '') =~ m{([^/]+)$};
+    if (!defined $leaf || !_is_snapshot_clone_zname($leaf)) {
+        _log($scfg, 0, 'err',
+            "[TrueNAS] _dataset_orphan_check_and_delete: refusing to delete '" . ($target_dataset // '')
+          . "': it is not an ephemeral dataset this plugin creates (vzdump-*), so it could be "
+          . "a template or a volume someone still needs; remove it by hand if it really is stale");
+        return 0;
+    }
     my $query = eval {
         _api_call($scfg, 'pool.dataset.query',
             [ [[ 'id', '=', $target_dataset ]] ]);
