@@ -162,18 +162,31 @@ for my $odd ('300.conf.tmp.1234', '300.conf.tmp', '300.lock', '300.conf.lock', '
     my $root = pve_root();
     my $dir = tempdir(CLEANUP => 1);
     my $act = "$dir/active";
-    open(my $f, '>', $act) or die;
-    print $f "UPID:pve1:00001A2B:0003C4D5:67890ABC:vzdump:120:root\@pam: 1\n";
-    close $f;
-    my $r = eval { run($root, tasks_active => $act) };
-    ok(!$r && $@ =~ /operations in progress.*vzdump/, 'H3c: an active vzdump task aborts');
-    open($f, '>', $act) or die;
-    print $f "UPID:pve1:00001A2B:0003C4D5:67890ABC:qmrestore:300:root\@pam: 1\n";
-    close $f;
-    ok(!eval { run($root, tasks_active => $act) }, '  ...and an active qmrestore');
-    open($f, '>', $act) or die; print $f "UPID:pve1:00001A2B:0003C4D5:67890ABC:vncproxy:120:root\@pam: 1\n"; close $f;
-    ok(eval { run($root, tasks_active => $act) }, '  ...but an unrelated task (vncproxy) does not');
-    open($f, '>', $act) or die; close $f;
+    # a task whose process is REALLY alive: this test process, with its real start time
+    my $stat = do { open(my $s, '<', "/proc/$$/stat") or die; local $/; <$s> };
+    my ($rest) = $stat =~ /^\d+ \(.*\) (.*)$/s;
+    my $pstart = sprintf('%08X', (split ' ', $rest)[19]);
+    my $alive = sprintf('UPID:pve1:%08X:%s', $$, $pstart);
+    my $dead  = 'UPID:pve1:3B9AC9FF:0003C4D5';          # no such pid
+    my $recycled = sprintf('UPID:pve1:%08X:00000001', $$);   # pid exists, but it is not the process that started the task
+    my $line = sub { my ($u, $type) = @_; return "$u:67890ABC:$type:120:root\@pam: 1\n" };
+    my $w = sub { open(my $f, '>', $act) or die; print $f @_; close $f };
+
+    $w->($line->($alive, 'vzdump'));
+    my $r = eval { run($root, tasks_active => $act, local_node => 'pve1') };
+    ok(!$r && $@ =~ /operations in progress.*vzdump/, 'H3c: an active (live) vzdump task aborts');
+    $w->($line->($alive, 'qmrestore'));
+    ok(!eval { run($root, tasks_active => $act, local_node => 'pve1') }, '  ...and a live qmrestore');
+    $w->($line->($alive, 'vncproxy'));
+    ok(eval { run($root, tasks_active => $act, local_node => 'pve1') }, '  ...but an unrelated task (vncproxy) does not');
+    $w->($line->($dead, 'vzdump'));
+    ok(eval { run($root, tasks_active => $act, local_node => 'pve1') },
+        '  ...and a STALE entry (process gone) does not block forever: production nodes carry such leftovers') or diag($@);
+    $w->($line->($recycled, 'vzdump'));
+    ok(eval { run($root, tasks_active => $act, local_node => 'pve1') }, '  ...nor an entry whose pid was recycled by another process');
+    $w->($line->('UPID:pve2:3B9AC9FF:0003C4D5', 'vzdump'));
+    ok(!eval { run($root, tasks_active => $act, local_node => 'pve1') }, '  ...but a task of ANOTHER node cannot be checked, so it blocks');
+    open(my $f, '>', $act) or die; close $f;
     ok(eval { run($root, tasks_active => $act) }, '  ...and an empty list is fine');
     ok(!eval { run($root, tasks_active => "$dir/does-not-exist") }, '  ...an unreadable task list aborts');
 }

@@ -5229,16 +5229,42 @@ sub _prune_check_quorate {
     return 1;
 }
 
-# Tasks that create/restore/clone/back up volumes. Unreadable list: abort.
+# Is the process behind a task UPID still the one that started it? Same test as
+# PVE::ProcFSTools::check_process_running: the pid exists AND its start time
+# (field 22 of /proc/<pid>/stat) equals the UPID's pstart, so a recycled pid does
+# not count. /var/log/pve/tasks/active keeps entries of tasks that died without
+# being cleaned up (a killed backup, an OOM); treating those as running would
+# block this tool forever. A task of ANOTHER node cannot be checked from here:
+# it counts as running.
+sub _prune_task_alive {
+    my ($upid, $local) = @_;
+    my @f = split /:/, $upid;
+    my ($node, $pid_hex, $pstart_hex) = @f[1, 2, 3];
+    return 1 if !defined $pstart_hex || $pid_hex !~ /^[0-9A-Fa-f]+$/ || $pstart_hex !~ /^[0-9A-Fa-f]+$/;
+    if (defined $local && defined $node && $node ne $local) {
+        return 1;
+    }
+    my $stat = eval { _prune_read_file('/proc/' . hex($pid_hex) . '/stat') };
+    return 0 if !defined $stat;                 # no such process: the task is dead
+    my ($rest) = $stat =~ /^\d+ \(.*\) (.*)$/s;
+    return 1 if !defined $rest;                 # cannot parse: assume alive
+    my @s = split ' ', $rest;
+    return 1 if @s < 20;
+    return $s[19] == hex($pstart_hex) ? 1 : 0;
+}
+
+# Tasks that create/restore/clone/back up volumes. Unreadable list: abort. Only
+# tasks whose process is still alive count (see _prune_task_alive).
 sub _prune_check_no_busy_tasks {
-    my ($path) = @_;
+    my ($path, $local) = @_;
     my $c = _prune_read_file($path);
     for my $line (split /\n/, $c) {
         my ($upid) = $line =~ /^(UPID:\S+)/ or next;
         my @f = split /:/, $upid;
         my $type = $f[5] // '';
-        die "there are operations in progress (active $type task: $upid); wait for them to finish and retry\n"
-            if $type =~ $PRUNE_BUSY_TASKS;
+        next if $type !~ $PRUNE_BUSY_TASKS;
+        next if !_prune_task_alive($upid, $local);
+        die "there are operations in progress (active $type task: $upid); wait for them to finish and retry\n";
     }
     return 1;
 }
@@ -5326,7 +5352,7 @@ sub prune_orphan_cloudinit {
         @targets = ($o{storage});
     }
 
-    _prune_check_no_busy_tasks($tasks) if defined $tasks;
+    _prune_check_no_busy_tasks($tasks, $o{local_node} // $_PRUNE_LOCAL_NODE) if defined $tasks;
     my $index = _prune_guest_index($root, local_node => $o{local_node});
     my $refs = _prune_ref_keys($index);
     my (@orphans, @kept);
@@ -5354,7 +5380,7 @@ sub prune_orphan_cloudinit {
     for (my $i = 0; $i < @orphans; $i++) {
         my $orphan = $orphans[$i];
         my $fresh = eval {
-            _prune_check_no_busy_tasks($tasks) if defined $tasks;
+            _prune_check_no_busy_tasks($tasks, $o{local_node} // $_PRUNE_LOCAL_NODE) if defined $tasks;
             $quorum->($root) if $quorum;
             _prune_guest_index($root, local_node => $o{local_node});
         };
