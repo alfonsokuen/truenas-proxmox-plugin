@@ -243,4 +243,16 @@ SKIP: {
 }
 is($PKG->can('DATASET_DELETE_TIMEOUT_S')->(), 30, 'DATASET_DELETE_TIMEOUT_S keeps the fork value (30)');
 
+# --- 10. tn_broker_timeout: schema and check_config agree -------------------
+SKIP: {
+    skip 'cannot register the plugin with PVE::SectionConfig', 3 unless eval {
+        require PVE::Storage::Plugin; $PKG->register(); PVE::Storage::Plugin->init(); 1 };
+    my $max = $props->{tn_broker_timeout}{maximum};
+    is($max, 600, 'tn_broker_timeout schema maximum is 600');
+    ok(eval { $PKG->check_config('s', { type => 'truenasplugin', tn_broker_timeout => 500 }, 0, 1); 1 },
+        'check_config accepts 500 (inside the schema range)') or diag($@);
+    ok(!eval { $PKG->check_config('s', { type => 'truenasplugin', tn_broker_timeout => $max + 100 }, 0, 1); 1 },
+        '  ...and rejects what the schema would reject');
+}
+
 done_testing;

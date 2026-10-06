@@ -1345,8 +1345,8 @@ sub check_config {
             if $opts->{tn_api_retry_delay} < 0.1 || $opts->{tn_api_retry_delay} > 60;
     }
     if (defined $opts->{tn_broker_timeout}) {
-        die "tn_broker_timeout must be between 5 and 300 seconds (got $opts->{tn_broker_timeout})\n"
-            if $opts->{tn_broker_timeout} < 5 || $opts->{tn_broker_timeout} > 300;
+        die "tn_broker_timeout must be between 5 and 600 seconds (got $opts->{tn_broker_timeout})\n"
+            if $opts->{tn_broker_timeout} < 5 || $opts->{tn_broker_timeout} > 600;
     }
 
     # Validate dataset name follows ZFS naming conventions
@@ -5681,11 +5681,11 @@ sub _preflight_check_alloc {
     # Cache successful result: touch a stamp file in /run so sibling
     # pvedaemon workers on this node see the pass, and set in-process
     # hash for the fast path in subsequent calls from this worker.
-    _log($scfg, 0, 'info', "[TrueNAS] TIMING preflight-end errors=" . scalar(@errors));
+    _log($scfg, 2, 'debug', "[TrueNAS] TIMING preflight-end errors=" . scalar(@errors));
     if (!@errors) {
         $_preflight_last_ok{$api_host_key} = time();
         my $stamp_file = _preflight_stamp_path($api_host_key);
-        _log($scfg, 0, 'info', "[TrueNAS] TIMING preflight-stamp path=$stamp_file");
+        _log($scfg, 2, 'debug', "[TrueNAS] TIMING preflight-stamp path=$stamp_file");
         eval {
             my $dir = $stamp_file; $dir =~ s{/[^/]+$}{};
             if (! -d $dir) {
@@ -5699,7 +5699,7 @@ sub _preflight_check_alloc {
         if (my $err = $@) {
             _log($scfg, 0, 'warning', "[TrueNAS] TIMING preflight-stamp WRITE FAILED: $err");
         } else {
-            _log($scfg, 0, 'info', "[TrueNAS] TIMING preflight-stamp WROTE OK");
+            _log($scfg, 2, 'debug', "[TrueNAS] TIMING preflight-stamp WROTE OK");
         }
     }
 
@@ -9525,7 +9525,7 @@ sub alloc_image {
     my $lap = sub {
         my ($label) = @_;
         my $now = Time::HiRes::time();
-        _log($scfg, 0, 'info', sprintf(
+        _log($scfg, 2, 'debug', sprintf(
             "[TrueNAS] TIMING alloc vmid=%s %s: +%.3fs (total %.3fs)",
             $vmid, $label, $now - $t_last, $now - $t0));
         $t_last = $now;
@@ -9685,7 +9685,7 @@ sub _alloc_image_iscsi {
     my $lap = sub {
         my ($label) = @_;
         my $now = Time::HiRes::time();
-        _log($scfg, 0, 'info', sprintf(
+        _log($scfg, 2, 'debug', sprintf(
             "[TrueNAS] TIMING alloc_iscsi zname=%s %s: +%.3fs (total %.3fs)",
             $zname, $label, $now - $t_last, $now - $t0));
         $t_last = $now;
@@ -10018,7 +10018,7 @@ sub _alloc_image_nvme {
         my $t0 = Time::HiRes::time();
         my $lap_defer = sub {
             my ($phase) = @_;
-            _log($deferred_scfg, 0, 'info', sprintf(
+            _log($deferred_scfg, 2, 'debug', sprintf(
                 "[TrueNAS] LOCKHOLD alloc_nvme_deferred uuid=%s phase=%s elapsed=%.3fs",
                 $deferred_uuid, $phase, Time::HiRes::time() - $t0));
         };
@@ -12044,7 +12044,7 @@ sub activate_volume {
         my $t0_av = Time::HiRes::time();
         my $lap_av = sub {
             my ($phase) = @_;
-            _log($scfg, 0, 'info', sprintf(
+            _log($scfg, 2, 'debug', sprintf(
                 "[TrueNAS] LOCKHOLD activate_volume vmid=%s uuid=%s phase=%s elapsed=%.3fs",
                 $vmid // '?', $metadata, $phase, Time::HiRes::time() - $t0_av));
         };
@@ -12802,7 +12802,7 @@ sub _clone_image_nvme {
         my $t0 = Time::HiRes::time();
         my $lap_defer_clone = sub {
             my ($phase) = @_;
-            _log($deferred_scfg, 0, 'info', sprintf(
+            _log($deferred_scfg, 2, 'debug', sprintf(
                 "[TrueNAS] LOCKHOLD clone_nvme_deferred uuid=%s phase=%s elapsed=%.3fs",
                 $deferred_uuid, $phase, Time::HiRes::time() - $t0));
         };

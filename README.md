@@ -123,6 +123,11 @@ sha256sum -c SHA256SUMS
 apt install "./truenas-proxmox-plugin_${V}_all.deb"
 ```
 
+> **Rolling upgrade to idk22:** do not write the new `storage.cfg` keys
+> (`tn_use_cluster_lock`, `tn_device_ready_retries`, or a `tn_api_host` in
+> bracketed-IPv6 / portal-dns form) until all three nodes run idk22. idk21 does
+> not know them and would drop the whole storage section.
+
 If the same version is already installed, `apt install` is a no-op: use
 `apt reinstall ./<file>.deb` or `dpkg -i`. The options below are upstream's.
 

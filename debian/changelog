@@ -56,6 +56,11 @@ truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium
     /WebSocket.*closed/ de upstream (falso positivo con trazas de
     middlewared).
 
+  * ANTES DE ESCRIBIR claves nuevas en storage.cfg (tn_use_cluster_lock,
+    tn_device_ready_retries, y un tn_api_host con corchetes IPv6 o formato
+    portal-dns) esperar a que los 3 nodos esten en idk22: idk21 no las
+    conoce y descartaria la seccion entera del storage.
+
   * tn_broker_timeout conserva el default de 30 s del fork (upstream subio a
     60 s); sigue siendo configurable.
 
@@ -1406,6 +1411,7 @@ truenas-proxmox-plugin (2.1.24~alpha1) unstable; urgency=medium
     neither TrueNAS nor a configured storage.
 
  -- Alfonso Kuen <alfonsok@gmail.com>  Sun, 16 Aug 2026 20:30:00 +0000
+
 truenas-proxmox-plugin (2.1.23~beta8) unstable; urgency=medium
 
   * fix(#88): path() fast-fail + deterministic by-path fallback.
