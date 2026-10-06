@@ -8345,26 +8345,13 @@ sub _nvme_device_for_uuid {
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
         } elsif (($i == 75 || $i == 125) && !$reconnect_attempted && $allow_reconnect
                  && _nvme_is_connected($scfg)) {
-            # alpha23/24: two-tier reconnect for the "target UUID exists on TN
-            # but this host's kernel hasn't seen it" case under multi-node
-            # concurrent creates.
-            #
-            # First tier (i==75, ~7.5s): SAFE — skip if any subsystem device
-            # is in use by another process on this host, to avoid disrupting
-            # running VMs writing to other namespaces on the shared subsystem.
-            # In steady-state cluster testing this gate almost always blocks
-            # (there is always some VM using something), so it rarely fires.
-            #
-            # Second tier (i==125, ~12.5s): LAST RESORT — force reconnect
-            # regardless of the fuser check. Rationale: at this point the
-            # activate_volume for the target VM is going to fail if we do
-            # nothing (~2.5s left of the budget, all previous interventions
-            # exhausted). A brief NVMe controller drop causes queued I/O on
-            # other VMs — kernel NVMe controller-loss handling normally
-            # resumes cleanly on reconnect within a couple of seconds. The
-            # trade is "one confirmed activate_volume failure now" vs "a few
-            # hundred ms of I/O pause on other VMs, then everything works".
-            # The failure is worse than the pause.
+            # alpha23/24 reconnect for the "target UUID exists on TN but this
+            # host's kernel hasn't seen it" case under multi-node concurrent
+            # creates. Upstream forced the reconnect at i==125 even with
+            # devices in use; this fork never does: `nvme disconnect` drops
+            # EVERY controller of the subsystem, so a live VM on another
+            # namespace would get EIO. With devices in use we only warn, and
+            # activate_volume fails with a readable error instead.
             my $tn_has_uuid = 0;
             eval {
                 my $q = _api_call($scfg, 'nvmet.namespace.query',
@@ -8372,22 +8359,20 @@ sub _nvme_device_for_uuid {
                 $tn_has_uuid = 1 if $q && @$q;
             };
             if ($tn_has_uuid) {
-                my $is_last_resort = ($i == 125);
                 my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
                 my $in_use = _nvme_check_devices_in_use($scfg, @dev_paths);
-                if ($in_use && !$is_last_resort) {
+                if ($in_use) {
                     _log($scfg, 1, 'warning',
                         "[TrueNAS] nvme_device_for_uuid: target $device_uuid confirmed on TN "
-                        . "but not visible after ~7.5s; "
-                        . scalar(@dev_paths) . " subsystem device(s) in use, "
-                        . "deferring reconnect to i==125 last-resort");
+                        . "but not visible after " . ($i == 75 ? '~7.5s' : '~12.5s') . "; "
+                        . scalar(@dev_paths) . " subsystem device(s) in use, NOT reconnecting "
+                        . "(it would drop every controller of the subsystem under running guests)")
+                        if $i == 75 || $i == 125;
                 } else {
                     $reconnect_attempted = 1;
-                    my $when = $is_last_resort ? 'i==125 last-resort' : 'i==75 halfway';
-                    my $note = $in_use ? " (forcing despite $in_use device(s) in use)" : '';
+                    my $when = $i == 125 ? 'i==125 late' : 'i==75 halfway';
                     _log($scfg, 1, 'warning',
-                        "[TrueNAS] nvme_device_for_uuid: $when reconnect for target $device_uuid"
-                        . $note);
+                        "[TrueNAS] nvme_device_for_uuid: $when reconnect for target $device_uuid, none in use");
                     eval { _nvme_disconnect($scfg) };
                     usleep(500_000);
                     eval { _nvme_connect($scfg) };
@@ -8483,6 +8468,17 @@ sub _nvme_device_for_uuid {
         _log($scfg, 0, 'warning',
             "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
             . "(_nvme_is_connected=0) — subsystem not currently connected");
+    } elsif (do {
+            my @dp = _nvme_get_subsystem_device_paths($scfg);
+            _nvme_check_devices_in_use($scfg, @dp) ? 1 : 0;
+        }) {
+        # Upstream reconnected here unconditionally ("the pause wins"). This
+        # fork does not: the disconnect hits every controller of the
+        # subsystem, and a running guest on another namespace would see EIO.
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
+            . "(subsystem devices are in use) - not dropping the subsystem under running guests; "
+            . "the activation fails instead");
     } else {
         # Before the emergency reconnect, sweep orphan namespaces off our
         # subsystem. Under multi-node load the publication-mismatch that
