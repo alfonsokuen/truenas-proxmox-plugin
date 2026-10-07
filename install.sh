@@ -5824,27 +5824,47 @@ run_health_check() {
         fi
         # Sanitize for zvol name (replace non-alphanumeric with dash)
         target_suffix=$(echo "$target_suffix" | sed 's/[^a-zA-Z0-9]/-/g; s/-\+/-/g; s/^-//; s/-$//')
-        local new_weight_name="pve-weight-$target_suffix"
-        local old_weight_name="pve-plugin-weight"
 
-        # Check for new format first, then old format for backwards compatibility
-        local weight_zvol_new="${dataset}/${new_weight_name}"
-        local weight_zvol_old="${dataset}/${old_weight_name}"
+        # Weight zvol naming has changed across releases. Check all three
+        # historical names, newest first (issue #125 — reporter saw this
+        # healthcheck flag a freshly provisioned storage as "Weight zvol
+        # missing" because install.sh was only looking for the two
+        # legacy forms while the plugin had been creating the canonical
+        # name since v2.0.20).
+        #
+        #   canonical (v2.0.20+): pve-weight-<suffix>-<sha1(iqn)[0:8]>
+        #   legacy    (pre-2.0.20): pve-weight-<suffix>
+        #   very-old              : pve-plugin-weight
+        #
+        # The 8-char hash disambiguates sanitized-suffix collisions
+        # (e.g. iqn ...:target.foo and ...:target-foo both sanitize to
+        # "target-foo"). sha1sum is in GNU coreutils, present on PVE.
+        local iqn_hash8
+        iqn_hash8=$(printf '%s' "$target_iqn" | sha1sum | cut -c1-8)
+        local weight_name_canonical="pve-weight-${target_suffix}-${iqn_hash8}"
+        local weight_name_legacy="pve-weight-${target_suffix}"
+        local weight_name_very_old="pve-plugin-weight"
 
-        # Check if weight zvol exists via WebSocket API (try new format first)
+        local weight_zvol_canonical="${dataset}/${weight_name_canonical}"
+        local weight_zvol_legacy="${dataset}/${weight_name_legacy}"
+        local weight_zvol_very_old="${dataset}/${weight_name_very_old}"
+
         local zvol_response
-        zvol_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$weight_zvol_new\"]]]" 2>/dev/null)
-
+        zvol_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$weight_zvol_canonical\"]]]" 2>/dev/null)
         if echo "$zvol_response" | grep -q '"id"'; then
-            weight_name="$new_weight_name"
+            weight_name="$weight_name_canonical"
         else
-            # Try old format for backwards compatibility
-            zvol_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$weight_zvol_old\"]]]" 2>/dev/null)
+            zvol_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$weight_zvol_legacy\"]]]" 2>/dev/null)
             if echo "$zvol_response" | grep -q '"id"'; then
-                weight_name="$old_weight_name"
+                weight_name="$weight_name_legacy"
             else
-                check_result "Weight volume presence" "WARNING" "Weight zvol missing"
-                weight_check_failed=1
+                zvol_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$weight_zvol_very_old\"]]]" 2>/dev/null)
+                if echo "$zvol_response" | grep -q '"id"'; then
+                    weight_name="$weight_name_very_old"
+                else
+                    check_result "Weight volume presence" "WARNING" "Weight zvol missing"
+                    weight_check_failed=1
+                fi
             fi
         fi
 

@@ -1,3 +1,50 @@
+truenas-proxmox-plugin (2.1.23~beta10) unstable; urgency=medium
+
+  * fix(#124): end-anchor every IQN/NQN comparison so a longer-IQN
+    (NQN) session on the same portal no longer gets treated as
+    "connected" for a shorter one. Reporter matobodo: two targets
+    ...:proxmox-nvme-protected and ...:proxmox-nvme-protected-16k on
+    the same portal, where the shorter target's login was silently
+    skipped after a reboot because _portal_connected's bare
+    substring regex matched the longer target's session line. Every
+    VM with a disk on that storage then failed to start with "Could
+    not locate by-path device for LUN <N>". Seven comparison sites
+    patched: six adopt the (?![\w.:-]) end anchor, which refuses any
+    IQN-legal suffix continuation, and the seventh (by-path error
+    diagnostic) uses the natural "-lun-" suffix anchor instead. Live
+    verified by creating a prefix-colliding iSCSI target on the test
+    TrueNAS, logging into both targets concurrently, and confirming
+    _target_sessions_active / _portal_connected correctly separate
+    them; crafted long-only session table reproduces the reporter's
+    exact failure signature and the fix returns 0 for the short IQN
+    where pre-fix returned 1.
+
+  * fix(#4): tools/truenas-plugin-lvm-filter now also rejects
+    TrueNAS iSCSI LUNs by their /dev/disk/by-path/ip-*-iscsi-*
+    symlinks. Reporter lucasblack29: the iSCSI reject regex has been
+    missing from this helper since the tool was introduced; the
+    original #4 fix only installed the NVMe by-id reject, so hosts
+    with VMs on iSCSI-mode truenasplugin storage got the same
+    duplicate-VG / slow-pvs symptom the NVMe case was already
+    protecting against. OUR_SET refactor keeps install/uninstall/
+    status iterating over both regexes with a shared marker tag.
+    Live symptom-silence verified: pvcreate on a real iSCSI LUN
+    makes it visible to pvs; install → pvs filters it out; uninstall
+    → pvs sees it again.
+
+  * fix(#125): install.sh's "Weight volume presence" healthcheck now
+    looks up the canonical weight zvol name (pve-weight-<suffix>-
+    <sha1(iqn)[0:8]>, present since v2.0.20) in addition to the two
+    older names it already probed. Reporter lucasblack29 ran the
+    healthcheck against a freshly provisioned storage and saw
+    "Weight zvol missing" even though the zvol existed and the LUN
+    was mounted — because the healthcheck was only ever asking for
+    the pre-v2.0.20 names. All four cascade branches live-exercised
+    (canonical hit, legacy fallback, very-old fallback, truly-
+    missing WARN).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Tue, 07 Oct 2026 09:30:00 -0400
+
 truenas-proxmox-plugin (2.1.23~beta9) unstable; urgency=medium
 
   * fix(#123): LXC snapshot-mode vzdump cleanup now surfaces clone

@@ -1,25 +1,29 @@
 #!/bin/bash
-# truenas-plugin-lvm-filter -- add or remove an LVM global_filter
-# entry that prevents LVM from scanning TrueNAS-served NVMe/TCP
-# namespaces on the Proxmox host. Addresses GitHub issue #4.
+# truenas-plugin-lvm-filter -- add or remove LVM global_filter entries
+# that prevent LVM from scanning TrueNAS-served NVMe/TCP namespaces
+# and iSCSI LUNs on the Proxmox host. Addresses GitHub issue #4.
 #
 # WHY:
-#   A guest VM whose disk lives on a TN NVMe namespace often has its
-#   own LVM inside (Ubuntu, RHEL and their derivatives default to
-#   LVM). The host's LVM scanner sees the guest's PV signatures at
-#   the outer namespace level and treats them as host-level PVs.
-#   With many namespaces and many VMs cloned from the same template,
-#   this produces duplicate-VG warnings on every LVM invocation
-#   (pvesm, pvesh, qm, pvestatd polls), and can slow storage-list
-#   API calls past the 596s API timeout -- which in turn breaks
-#   external tools such as Veeam's backup/restore scans.
+#   A guest VM whose disk lives on a TN NVMe namespace or iSCSI LUN
+#   often has its own LVM inside (Ubuntu, RHEL and their derivatives
+#   default to LVM). The host's LVM scanner sees the guest's PV
+#   signatures at the outer device level and treats them as host-level
+#   PVs. With many namespaces/LUNs and many VMs cloned from the same
+#   template, this produces duplicate-VG warnings on every LVM
+#   invocation (pvesm, pvesh, qm, pvestatd polls), and can slow
+#   storage-list API calls past the 596s API timeout -- which in turn
+#   breaks external tools such as Veeam's backup/restore scans.
 #
 #   The fix is to teach LVM's global_filter to reject the block
-#   devices that come from TrueNAS. We match by /dev/disk/by-id/
-#   symlinks whose name starts with `nvme-TrueNAS_`. Those symlinks
-#   are populated by udev from the NVMe controller MODEL string
-#   (e.g. `TrueNAS PowerEdge R730xd`, `TrueNAS FREENAS-MINI-2.0`)
-#   -- local NVMe drives never match, so LOCAL LVM is unaffected.
+#   devices that come from TrueNAS. We match two symlink paths:
+#     - /dev/disk/by-id/nvme-TrueNAS_*            (NVMe/TCP namespaces)
+#     - /dev/disk/by-path/ip-*-iscsi-*            (iSCSI LUNs)
+#   The NVMe by-id symlinks are populated by udev from the NVMe
+#   controller MODEL string (e.g. `TrueNAS PowerEdge R730xd`,
+#   `TrueNAS FREENAS-MINI-2.0`); local NVMe drives never match.
+#   The iSCSI by-path symlinks are populated for every iSCSI LUN
+#   open-iscsi has logged into, which on a plugin-managed PVE node is
+#   exactly the LUNs we serve.
 #
 # WHICH FILE:
 #   /etc/lvm/lvmlocal.conf is read AFTER /etc/lvm/lvm.conf and
@@ -28,17 +32,18 @@
 #   lvmlocal.conf. Editing lvm.conf alone would be silently
 #   overridden, so this tool targets the EFFECTIVE file: lvmlocal.conf
 #   when it carries a global_filter line, else lvm.conf. It detects
-#   whether the filter is already active via `lvm dumpconfig`, so it
+#   whether each filter is already active via `lvm dumpconfig`, so it
 #   stays idempotent regardless of which file the filter lives in.
 #
 # WHAT THIS SCRIPT DOES:
-#   --install    Append the reject regex to the effective global_filter
-#                list (lvmlocal.conf preferred, else lvm.conf).
-#                Timestamped backup first. Idempotent (no-op if the
-#                filter is already active in the effective config).
-#   --uninstall  Remove only the regex we added; leave the rest of the
-#                global_filter alone. Timestamped backup first.
-#   --status     Report where the filter lives and whether it is active.
+#   --install    Append each missing reject regex to the effective
+#                global_filter list (lvmlocal.conf preferred, else
+#                lvm.conf). Timestamped backup first. Idempotent per
+#                regex (no-op for regexes already active).
+#   --uninstall  Remove only the regexes we added; leave the rest of
+#                the global_filter alone. Timestamped backup first.
+#   --status     Report where the filter lives and which of our
+#                regexes are active.
 #   --help       Show this help.
 #
 # WHY THIS ISN'T DONE AT PACKAGE INSTALL:
@@ -59,14 +64,25 @@ set -eu
 
 LVM_CONF=/etc/lvm/lvm.conf
 LVM_LOCAL_CONF=/etc/lvm/lvmlocal.conf
-# Marker used to identify our-inserted regex on uninstall. The regex
-# itself is already unique enough that a plain string match on it is
-# safe, but keeping a stable marker gives operators grepping the
-# file a clear "yes, this is from us" signal.
-OUR_REGEX='"r|/dev/disk/by-id/nvme-TrueNAS_.*|"'
+# Pairs of (regex, dumpconfig-detection-fragment, label) that we
+# manage. The dumpconfig fragment is the substring we grep in
+# `lvm dumpconfig` output to decide if that specific reject is
+# already active, independent of the exact regex quoting the
+# admin chose. Both regexes carry the same marker comment so
+# uninstall can strip them without ambiguity.
+OUR_REGEX_NVME='"r|/dev/disk/by-id/nvme-TrueNAS_.*|"'
+OUR_DETECT_NVME='nvme-TrueNAS_'
+OUR_REGEX_ISCSI='"r|/dev/disk/by-path/ip-.*-iscsi-.*|"'
+OUR_DETECT_ISCSI='by-path/ip-[^"]*iscsi-'
+# The whole set, pretty-printable:
+#   name          regex                 detection-fragment  label
+OUR_SET=(
+    "nvme:${OUR_REGEX_NVME}:${OUR_DETECT_NVME}:TrueNAS NVMe"
+    "iscsi:${OUR_REGEX_ISCSI}:${OUR_DETECT_ISCSI}:TrueNAS iSCSI"
+)
 MARKER_TAG='truenas-proxmox-plugin issue #4'
 
-usage() { sed -n '2,57p' "$0"; }
+usage() { sed -n '2,62p' "$0"; }
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -92,18 +108,23 @@ target_conf() {
     return 1
 }
 
-# True if the filter is ALREADY ACTIVE in the effective LVM config,
-# regardless of which file it lives in or whether it is anchored (^...).
-is_effective() {
+# True if the given detection fragment is ACTIVE in the effective LVM
+# config. Independent of which file holds the filter and of exact
+# regex quoting / anchors the admin may have added by hand.
+is_effective_one() {
+    local detect="$1"
     command -v lvm >/dev/null 2>&1 || return 1
-    lvm dumpconfig 2>/dev/null | awk '/global_filter/ && /r\|[^"]*nvme-TrueNAS_/{f=1} END{exit f?0:1}'
+    lvm dumpconfig 2>/dev/null | awk -v d="$detect" '
+        /global_filter/ && $0 ~ ("r\\|[^\"]*"d) { f=1 }
+        END { exit f?0:1 }
+    '
 }
 
 # True if our regex+marker are present in the given file.
-file_has_ours() {
-    local f="$1"
+file_has_ours_one() {
+    local f="$1" regex="$2"
     [ -f "$f" ] || return 1
-    grep -F "$OUR_REGEX" "$f" >/dev/null 2>&1 \
+    grep -F "$regex" "$f" >/dev/null 2>&1 \
         && grep -F "$MARKER_TAG" "$f" >/dev/null 2>&1
 }
 
@@ -117,17 +138,22 @@ show_status() {
         echo "-- no active global_filter line in $LVM_LOCAL_CONF or $LVM_CONF --"
     fi
     echo
-    if is_effective; then
-        echo "TrueNAS NVMe filter: ACTIVE in the effective LVM config"
-    else
-        echo "TrueNAS NVMe filter: NOT active"
-    fi
-    if file_has_ours "$LVM_LOCAL_CONF"; then
-        echo "  (our marker found in $LVM_LOCAL_CONF)"
-    fi
-    if file_has_ours "$LVM_CONF"; then
-        echo "  (our marker found in $LVM_CONF)"
-    fi
+
+    local entry name regex detect label
+    for entry in "${OUR_SET[@]}"; do
+        IFS=: read -r name regex detect label <<<"$entry"
+        if is_effective_one "$detect"; then
+            echo "$label filter: ACTIVE in the effective LVM config"
+        else
+            echo "$label filter: NOT active"
+        fi
+        if file_has_ours_one "$LVM_LOCAL_CONF" "$regex"; then
+            echo "  (our marker for $name found in $LVM_LOCAL_CONF)"
+        fi
+        if file_has_ours_one "$LVM_CONF" "$regex"; then
+            echo "  (our marker for $name found in $LVM_CONF)"
+        fi
+    done
 }
 
 backup() {
@@ -136,46 +162,89 @@ backup() {
     echo "backup: $b"
 }
 
-do_install() {
-    if is_effective; then
-        echo "TrueNAS NVMe filter is already active. Nothing to do."
-        show_status
+# Insert a single regex into the effective global_filter line. Idempotent:
+# no-op if is_effective_one already reports active for the matching
+# detection fragment. Returns 0 on success or no-op; dies on failure.
+install_one() {
+    local regex="$1" detect="$2" label="$3" t="$4"
+
+    if is_effective_one "$detect"; then
+        echo "$label filter already active, skipping."
         return 0
     fi
+
+    # Insert our regex before the closing "]" of the array on the
+    # global_filter line. Handle both "[a,b,c]" and "[ a, b, c ]"
+    # spacings. Add a same-line comment carrying the marker tag.
+    #
+    # Preserve any existing trailing comment on the global_filter line.
+    # Multi-regex installs land in order: the first install_one appends
+    # the marker comment after "]"; the second install_one sees that
+    # same marker already present and keeps it rather than requiring
+    # pure whitespace after "]". Idempotent on reinstall of the same
+    # regex (grep check after this is the real idempotency gate).
+    #
+    # Pass regex + marker as perl -s vars so double-quotes inside the
+    # regex don't have to be shell-escaped into a perl literal.
+    perl -i -spe '
+        if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(.*)$/) {
+            my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
+            $body =~ s/\s+$//;
+            $body .= "," unless $body =~ /,\s*$/ || $body =~ /^\s*$/;
+            if ($tail =~ /\Q$m\E/) {
+                $_ = "${lead}${body} ${r} ${close}${tail}\n";
+            } else {
+                my $extra = $tail;
+                $extra =~ s/\s+$//;
+                $_ = "${lead}${body} ${r} ${close}${extra} # ${m}\n";
+            }
+        }
+    ' -- -r="$regex" -m="$MARKER_TAG" "$t"
+
+    # Verify the regex actually landed. The perl edit is a silent no-op
+    # if the global_filter array spans multiple lines or the closing ]
+    # already has a trailing comment. Use fgrep on the regex itself
+    # rather than the marker alone, since the marker may already be
+    # present from a previous install_one for the sibling regex.
+    if ! grep -qF "$regex" "$t"; then
+        echo "ERROR: edit not applied for $label -- global_filter is multi-line" >&2
+        echo "or has a trailing comment after ]. File unchanged for this entry" >&2
+        echo "(backup kept). Collapse the array to one line and re-run." >&2
+        exit 5
+    fi
+
+    echo "Installed $label filter in $t."
+}
+
+do_install() {
     local t
     if ! t=$(target_conf); then
         echo "No active global_filter line in $LVM_LOCAL_CONF or $LVM_CONF." >&2
         echo "Cowardly refusing to create one because that could override" >&2
         echo "defaults set by pve-manager. Add manually inside a devices { ... } section:" >&2
-        echo "    global_filter = [ $OUR_REGEX ]   # $MARKER_TAG" >&2
+        echo "    global_filter = [ $OUR_REGEX_NVME, $OUR_REGEX_ISCSI ]   # $MARKER_TAG" >&2
         exit 3
     fi
 
-    backup "$t"
-    # Insert our regex before the closing "]" of the array on the
-    # global_filter line. Handle both "[a,b,c]" and "[ a, b, c ]"
-    # spacings. Add a same-line comment carrying the marker tag.
-    # Pass regex + marker as perl -s vars so double-quotes inside
-    # the regex don't have to be shell-escaped into a perl literal.
-    perl -i -spe '
-        if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(\s*)$/) {
-            my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
-            $body =~ s/\s+$//;
-            $body .= "," unless $body =~ /,\s*$/ || $body =~ /^\s*$/;
-            $_ = "${lead}${body} ${r} ${close} # ${m}\n";
-        }
-    ' -- -r="$OUR_REGEX" -m="$MARKER_TAG" "$t"
-
-    # The perl edit is a silent no-op (exit 0) when the global_filter array
-    # spans multiple lines or the closing ] carries a trailing comment. The
-    # parse check below cannot catch that because nothing changed -- verify
-    # the marker actually landed (it is absent here: idempotency ran first).
-    if ! grep -qF "$MARKER_TAG" "$t"; then
-        echo "ERROR: edit not applied -- global_filter is multi-line or has a" >&2
-        echo "trailing comment after ]. File unchanged (backup kept). Collapse" >&2
-        echo "the array to one line and re-run." >&2
-        exit 5
+    # Decide if there's anything to do at all. If every regex is
+    # already active we don't want to produce a redundant backup.
+    local entry name regex detect label need=0
+    for entry in "${OUR_SET[@]}"; do
+        IFS=: read -r name regex detect label <<<"$entry"
+        if ! is_effective_one "$detect"; then need=1; break; fi
+    done
+    if [ "$need" -eq 0 ]; then
+        echo "All TrueNAS filters are already active. Nothing to do."
+        show_status
+        return 0
     fi
+
+    backup "$t"
+
+    for entry in "${OUR_SET[@]}"; do
+        IFS=: read -r name regex detect label <<<"$entry"
+        install_one "$regex" "$detect" "$label" "$t"
+    done
 
     # Sanity-check the merged config still parses (lvm dumps config on
     # stdout; exits non-zero on parse error).
@@ -185,31 +254,18 @@ do_install() {
         exit 4
     fi
 
-    echo "Installed in $t. Refresh LVM's device cache with:"
+    echo "Refresh LVM's device cache with:"
     echo "  pvscan --cache"
     echo "  vgscan --cache"
     echo "  systemctl restart lvm2-monitor"
     show_status
 }
 
-do_uninstall() {
-    # Find where our marker lives (lvmlocal.conf preferred, else lvm.conf).
-    local t=""
-    if file_has_ours "$LVM_LOCAL_CONF"; then
-        t="$LVM_LOCAL_CONF"
-    elif file_has_ours "$LVM_CONF"; then
-        t="$LVM_CONF"
-    fi
-    if [ -z "$t" ]; then
-        echo "TrueNAS NVMe filter is not installed by this plugin. Nothing to do."
-        return 0
-    fi
-    backup "$t"
-    # Remove our regex (plus any preceding comma or whitespace) and
-    # the tail comment marker. Keep the rest of the list intact.
-    # Pass regex + marker via perl -s so double-quotes need no
-    # shell-escape and \Q...\E works over $r without interpolation
-    # of the literal string as a pattern.
+# Remove a single regex from the given file. No-op if the regex is
+# not present.
+uninstall_one() {
+    local regex="$1" t="$2"
+
     perl -i -spe '
         if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(.*)$/) {
             my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
@@ -219,10 +275,51 @@ do_uninstall() {
             # normalise stray inner whitespace/comma left after removal
             $body =~ s/^\s+//; $body =~ s/\s+$//;
             $body =~ s/,\s*,/,/g;
-            $tail =~ s/\s*#\s*\Q$m\E\s*$//;
             $_ = "${lead}${body}${close}${tail}\n";
         }
-    ' -- -r="$OUR_REGEX" -m="$MARKER_TAG" "$t"
+    ' -- -r="$regex" "$t"
+}
+
+do_uninstall() {
+    # Find any file that holds any of our regexes (lvmlocal.conf preferred).
+    local t="" entry name regex detect label
+    for f in "$LVM_LOCAL_CONF" "$LVM_CONF"; do
+        [ -f "$f" ] || continue
+        for entry in "${OUR_SET[@]}"; do
+            IFS=: read -r name regex detect label <<<"$entry"
+            if file_has_ours_one "$f" "$regex"; then
+                t="$f"; break 2
+            fi
+        done
+    done
+    if [ -z "$t" ]; then
+        echo "No TrueNAS filters installed by this plugin. Nothing to do."
+        return 0
+    fi
+
+    backup "$t"
+
+    for entry in "${OUR_SET[@]}"; do
+        IFS=: read -r name regex detect label <<<"$entry"
+        uninstall_one "$regex" "$t"
+    done
+
+    # Drop the trailing marker comment only if no filters we manage are
+    # left on the line. The marker is shared across regexes.
+    local any_left=0
+    for entry in "${OUR_SET[@]}"; do
+        IFS=: read -r name regex detect label <<<"$entry"
+        if grep -qF "$regex" "$t"; then any_left=1; break; fi
+    done
+    if [ "$any_left" -eq 0 ]; then
+        perl -i -spe '
+            if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(.*)$/) {
+                my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
+                $tail =~ s/\s*#\s*\Q$m\E\s*$//;
+                $_ = "${lead}${body}${close}${tail}\n";
+            }
+        ' -- -m="$MARKER_TAG" "$t"
+    fi
 
     if ! lvm dumpconfig >/dev/null 2>&1; then
         echo "WARNING: LVM config appears to no longer parse. Restore backup:" >&2
