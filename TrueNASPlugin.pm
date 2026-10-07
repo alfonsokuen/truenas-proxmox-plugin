@@ -4217,9 +4217,13 @@ sub _target_sessions_active($scfg) {
     my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
     return 0 if $@; # If command fails (no sessions exist), return false
 
-    # Check if our target has active sessions
+    # Check if our target has active sessions. Negative lookahead
+    # (?![\w.:-]) refuses to count a longer-IQN session as this one:
+    # IQN syntax allows [\w.:-] in the suffix, so without the anchor a
+    # bare substring match treats iqn:...-protected as present when
+    # only iqn:...-protected-16k is logged in (issue #124).
     for my $line (@session_lines) {
-        return 1 if $line =~ /\Q$iqn\E/;
+        return 1 if $line =~ /\Q$iqn\E(?![\w.:-])/;
     }
     return 0;
 }
@@ -4256,14 +4260,17 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
         return 0 if $@;
     }
 
-    # Check if this portal has an active session
+    # Check if this portal has an active session.  (?![\w.:-]) at the
+    # end of the IQN refuses to count a longer-IQN session as this one
+    # (issue #124: ...:proxmox-nvme-protected-16k would otherwise match
+    # ...:proxmox-nvme-protected via bare substring).
     for my $line (@session_lines) {
         # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
-        if ($line =~ /\Q$norm_portal\E.*\Q$iqn\E/) {
+        if ($line =~ /\Q$norm_portal\E.*\Q$iqn\E(?![\w.:-])/) {
             return 1;
         }
         if ($ip_portal ne $norm_portal
-            && $line =~ /\Q$ip_portal\E.*\Q$iqn\E/) {
+            && $line =~ /\Q$ip_portal\E.*\Q$iqn\E(?![\w.:-])/) {
             return 1;
         }
     }
@@ -4346,10 +4353,15 @@ sub _iscsi_login_all($scfg) {
                  "iscsiadm login failed ($p)");
     }
 
-    # Verify a session exists; if not, retry once
+    # Verify a session exists; if not, retry once. \b alone is not
+    # enough: \b matches between a word char and a non-word char, so
+    # ...-protected ends on a \b against ...-protected-16k and the
+    # longer target's session would wrongly count as this one's
+    # (issue #124). (?![\w.:-]) also rejects any IQN-legal trailing
+    # char.
     my $have_session = 0;
     for my $line (_run_lines(['iscsiadm','-m','session'])) {
-        if ($line =~ /\b\Q$iqn\E\b/) { $have_session = 1; last; }
+        if ($line =~ /\b\Q$iqn\E(?![\w.:-])/) { $have_session = 1; last; }
     }
     if (!$have_session) {
         _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary], "iSCSI discovery retry");
@@ -4646,7 +4658,11 @@ sub _device_for_lun($scfg, $lun, $max_retries_override = undef) {
         eval {
             opendir(my $dh, "/dev/disk/by-path") or die "open by-path failed";
             if ($iqn) {
-                @paths = grep { /iscsi-\Q$iqn\E/ } readdir($dh);
+                # by-path entries have the shape ip-...-iscsi-<iqn>-lun-N,
+                # so anchor on -lun- after the IQN to avoid listing a
+                # longer-IQN target's by-path entries when the diagnostic
+                # should only show this one's (issue #124).
+                @paths = grep { /iscsi-\Q$iqn\E-lun-/ } readdir($dh);
             } else {
                 @paths = grep { /iscsi-/ } readdir($dh);
             }
@@ -4827,8 +4843,12 @@ sub _nvme_is_connected {
             outfunc => sub {
                 my $line = shift;
                 if ($line =~ /NQN=/) {
-                    # New subsystem section — check if it's ours
-                    $in_our_subsys = ($line =~ /\Q$nqn\E/) ? 1 : 0;
+                    # New subsystem section — check if it's ours. End
+                    # anchor rejects longer-NQN matches: NQN syntax
+                    # allows [\w.:-] in the suffix, so bare substring
+                    # would treat nqn.X:a as present when the live
+                    # subsystem is nqn.X:a-2 (issue #124).
+                    $in_our_subsys = ($line =~ /\Q$nqn\E(?![\w.:-])/) ? 1 : 0;
                 } elsif ($in_our_subsys && $line =~ /tcp\s.*\blive\b/) {
                     # Found a live TCP transport controller for our subsystem
                     $connected = 1;
@@ -7838,7 +7858,11 @@ sub _session_has_no_luns {
 
     my @stanzas = split(/\n\s*\n/s, $buf);
     for my $s (@stanzas) {
-        next unless $s =~ /Target:\s*\Q$target_iqn\E\b/s;
+        # (?![\w.:-]) rejects longer-IQN matches; \b alone matches
+        # between a word char and '-' in the IQN suffix, so a
+        # ...-protected-16k target would be treated as our
+        # ...-protected (issue #124).
+        next unless $s =~ /Target:\s*\Q$target_iqn\E(?![\w.:-])/s;
         # If any "Lun:" lines remain, do not logout
         return 0 if $s =~ /Lun:\s*\d+/;
         # If section exists and shows no Lun lines, safe to logout
@@ -8593,7 +8617,10 @@ sub _ensure_target_visible {
     eval {
         my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
         for my $line (@discovery_output) {
-            if ($line =~ /\b\Q$iqn\E\b/) {
+            # End anchor stops a longer-IQN target from reporting as
+            # this one's discovery hit (issue #124). \b between d and
+            # - counts as a word boundary and would otherwise match.
+            if ($line =~ /\b\Q$iqn\E(?![\w.:-])/) {
                 $target_discoverable = 1;
                 last;
             }
