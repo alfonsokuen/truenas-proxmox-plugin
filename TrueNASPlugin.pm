@@ -16,7 +16,8 @@ use IO::Socket::SSL;
 use IO::Select;
 use Time::HiRes qw(usleep);
 use POSIX ();
-use Socket qw(inet_ntoa);
+use Socket qw(inet_ntoa inet_aton inet_pton inet_ntop getaddrinfo getnameinfo
+    AF_INET6 SOCK_STREAM NI_NUMERICHOST NIx_NOSERV);
 use Cwd qw(abs_path);
 use Sys::Syslog qw(openlog syslog);
 use Carp qw(carp croak);
@@ -5399,12 +5400,23 @@ sub _nvme_connect {
 
     for my $portal (@connect_list) {
         my ($host, $port) = _nvme_parse_portal($portal);
-        $host = _nvme_untaint_cli_host($host);
-        # Numify first: _nvme_portal_key() already compares ports numerically, so
-        # a config entry of "04420" matches its controller and never reaches a
-        # connect - until a cold start, where the untainter's ^[1-9] would reject
-        # it and die outside the per-portal eval, taking the other portals down.
-        $port = _nvme_untaint_cli_port(0 + $port);
+        # Untaint inside a per-portal guard. A malformed host/port makes the
+        # untainter die; done bare, that die would abort the loop and drop the
+        # other, healthy portals with it. Numify the port first so a config entry
+        # of "04420" survives the ^[1-9] anchor on the common path; the guard is
+        # the backstop for anything the numify does not cover. A bad portal is
+        # held off by backoff like a failed connect, not fatal to its siblings.
+        eval {
+            $host = _nvme_untaint_cli_host($host);
+            $port = _nvme_untaint_cli_port(0 + $port);
+            1;
+        } or do {
+            my $uerr = $@ || 'invalid portal';
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: skipping malformed portal $portal: $uerr");
+            $_nvme_portal_backoff{"$hostkey|$portal"} = time();
+            delete $_portal_sync_last_ok{_cache_host_key($scfg)};
+            next;
+        };
 
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_connect: connecting to $host:$port");
 

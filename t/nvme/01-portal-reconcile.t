@@ -30,6 +30,7 @@ my $OURS = 'nqn.2011-06.com.truenas:uuid:1111-2222:pve';
 my @RAN;
 my %CONNECT_FAILS;   # "host:port" => 1  -> nvme connect dies for that portal
 my $DNS_DOWN = 0;    # when true, every hostname lookup fails
+my %DNS_MAP;         # name => IPv4 string: a hermetic resolve-success for repair-mode tests
 {
     no strict 'refs';
     no warnings 'redefine';
@@ -46,9 +47,21 @@ my $DNS_DOWN = 0;    # when true, every hostname lookup fails
         return 0;
     };
     *{"${PKG}::_log"}    = sub { 1 };
-    # Lets the DNS-failure case be exercised without touching the host resolver.
+    # Lets the DNS-failure case be exercised without touching the host resolver,
+    # and %DNS_MAP lets a name resolve to a fixed address with no real lookup, so
+    # the resolve-success path can be tested hermetically. The mapped result is a
+    # genuine packed sockaddr, so the plugin's own getnameinfo() decodes it back.
     my $real_gai = \&Socket::getaddrinfo;
-    *{"Socket::getaddrinfo"} = sub { return ('EAI_AGAIN') if $DNS_DOWN; $real_gai->(@_) };
+    *{"Socket::getaddrinfo"} = sub {
+        my ($host) = @_;
+        return ('EAI_AGAIN') if $DNS_DOWN;
+        if (defined($host) && defined(my $ip = $DNS_MAP{$host})) {
+            my $addr = Socket::pack_sockaddr_in(0, Socket::inet_aton($ip));
+            return (undef, { family => Socket::AF_INET(),
+                             socktype => Socket::SOCK_STREAM(), addr => $addr });
+        }
+        return $real_gai->(@_);
+    };
     *{"${PKG}::usleep"}  = sub ($) { 1 };
 }
 
@@ -563,6 +576,96 @@ sysfs(ctrl($LOGNQN, "traddr=192.0.2.10,trsvcid=4420,src_addr=192.0.2.10", "live"
     eval { $connect->($s) };
     is(scalar(grep { $_ == 0 } @warned), 1,
         "a portal that is genuinely missing still warns, visibly");
+}
+
+# ---------------------------------------------------------------------------
+# IPv6 addresses
+# ---------------------------------------------------------------------------
+
+# _nvme_normalize_addr must canonicalise IPv6 the same way the kernel does, or a
+# portal written [2001:db8::1] keys differently from the controller's 2001:db8::1
+# and gets reconnected on every poll - the same phantom-portal failure the IPv4
+# leading-zero handling guards against. This path runs through Socket::inet_pton
+# / inet_ntop, which earlier had no test at all.
+{
+    my $norm = $PKG->can("_nvme_normalize_addr");
+    is($norm->("2001:0DB8::0001"), "2001:db8::1",
+        "a non-canonical IPv6 address is compressed and lowercased");
+    is($norm->("[2001:db8::1]"), "2001:db8::1",
+        "brackets are stripped from an IPv6 literal");
+    is($norm->("fe80::1%eth0"), "fe80::1",
+        "an IPv6 zone index is dropped");
+    is($norm->("2001:db8::1"), "2001:db8::1",
+        "an already canonical IPv6 address is unchanged");
+
+    my $key = $PKG->can("_nvme_portal_key");
+    is($key->("[2001:0DB8::1]", "4420"), $key->("2001:db8::1", "4420"),
+        "config and sysfs spellings of one IPv6 address produce one key");
+}
+
+# A live IPv6 controller must be recognised as its configured portal, so no
+# connect is issued for a healthy IPv6 fabric.
+sysfs(ctrl($OURS, 'traddr=2001:db8::1,trsvcid=4420,src_addr=2001:db8::2', 'live'));
+{
+    my $s = scfg();
+    $s->{tn_discovery_portal} = '[2001:db8::1]:4420';
+    $s->{tn_portals}          = '[2001:DB8::0001]:4420';   # same addr, non-canonical spelling
+    @RAN = ();
+    my $err = "";
+    eval { $connect->($s, repair => 1); 1 } or $err = $@;
+    is($err, "", "healthy IPv6 portal: no error");
+    is(scalar(grep { /^nvme connect/ } @RAN), 0,
+        "a live IPv6 controller is matched to its portal - no reconnect");
+}
+
+# ---------------------------------------------------------------------------
+# By-name portal that resolves (repair mode)
+# ---------------------------------------------------------------------------
+
+# The core goal of the resolver is to match a portal configured by name to the
+# numeric address its controller actually carries. Every other DNS test drives
+# the failure (DNS_DOWN) direction; this drives success: the name resolves to an
+# address that a live controller already uses, so repair must count it live and
+# issue no connect.
+sysfs(ctrl($OURS, 'traddr=203.0.113.50,trsvcid=4420,src_addr=203.0.113.50', 'live'));
+{
+    %DNS_MAP = ('nas.example.com' => '203.0.113.50');
+    my $s = scfg();
+    $s->{tn_discovery_portal} = '203.0.113.50:4420';
+    $s->{tn_portals}          = 'nas.example.com:4420';   # resolves to the live controller
+    @RAN = ();
+    my $err = "";
+    eval { $connect->($s, repair => 1); 1 } or $err = $@;
+    is($err, "", "resolvable by-name portal already live: no error");
+    is(scalar(grep { /^nvme connect/ } @RAN), 0,
+        "a by-name portal is matched to its live controller after resolution - no reconnect");
+    %DNS_MAP = ();
+}
+
+# ---------------------------------------------------------------------------
+# A malformed portal must not take its healthy siblings down
+# ---------------------------------------------------------------------------
+
+# The per-portal untaint can die on a bad host/port. Done outside the loop's
+# guard that abort would skip every portal after it, including good ones. A
+# malformed entry must be dropped like a failed connect, leaving the healthy
+# portal connected.
+sysfs();   # nothing live
+{
+    my $s = scfg();
+    # A distinct NQN so per-portal backoff left by earlier blocks (all keyed on
+    # the base NQN) cannot hold off this block's healthy portal.
+    $s->{tn_subsystem_nqn}    = $OURS . "-malformed";
+    $s->{tn_discovery_portal} = '192.0.2.10 bogus:4420';   # invalid host - untaint dies
+    $s->{tn_portals}          = '198.51.100.10:4420';      # healthy, must still connect
+    @RAN = ();
+    my $err = "";
+    eval { $connect->($s, repair => 1); 1 } or $err = $@;
+    is($err, "", "a malformed portal does not propagate a fatal error");
+    ok((grep { /^nvme connect .* -a 198\.51\.100\.10 / } @RAN),
+        "the healthy sibling portal is still connected despite the malformed one");
+    ok(!(grep { /-a 192\.0\.2\.10 bogus/ } @RAN),
+        "the malformed portal is never handed to nvme connect");
 }
 
 done_testing();
