@@ -199,9 +199,16 @@ truenasplugin: truenas-nvme
     tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     tn_dataset tank/proxmox
     tn_discovery_portal 192.168.1.100:4420
+    tn_api_insecure 1
     content images,rootdir
     shared 1
 ```
+
+`tn_api_insecure 1` is needed when TrueNAS is still using its
+default self-signed HTTPS certificate — the plugin's WebSocket
+transport verifies the server cert otherwise and the connection
+fails before activation. Omit this line once you've replaced the
+TrueNAS cert with one your Proxmox hosts trust.
 
 **NVMe/TCP Requirements**:
 - TrueNAS SCALE 25.10.0 or later
