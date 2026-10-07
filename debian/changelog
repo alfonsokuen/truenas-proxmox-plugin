@@ -1,3 +1,48 @@
+truenas-proxmox-plugin (2.1.23~beta11) unstable; urgency=medium
+
+  * fix(#94): NVMe/TCP reconcile restores a portal that was down at
+    connect time. Original diagnosis and patch from Alfonso Kuen
+    Arroyo (github.com/alfonsokuen); landed via branch pr94-fixes
+    which also layers portal-untaint + explicit Socket import +
+    regression tests on top (filed separately as #128). The
+    reconcile call sits at status() entry and only runs when
+    transport mode is nvme-tcp; a stuck portal costs at most one
+    bounded connect per poll window and never on the VM start path.
+
+  * fix(#95): iSCSI CHAP against TrueNAS SCALE 25.10 — dead login
+    loop plus implicit discovery-CHAP. Original diagnosis and patch
+    from Alfonso Kuen Arroyo; landed via branch pr95-cleanup as two
+    commits: 'iscsiadm -m node -T <iqn>' prints a record (not the
+    list) so the login loop was walking the wrong structure, and
+    sendtargets discovery now gets the CHAP credentials fed to it
+    on the retry that re-establishes the discoverydb record.
+
+  * fix(#97): storage poll resilience — bounded API retries while
+    the array is unreachable. From Alfonso Kuen Arroyo. A fresh
+    recent-failure marker short-circuits status() to "inactive"
+    inside the probe-backoff window, and activate_storage()'s
+    subsystem ensure runs under a capped API deadline so pvestatd
+    polls do not pay a full API timeout on every tick during an
+    outage. Ensure failures are classified against the retry
+    engine's own two death strings (anchored at start to avoid
+    foreign-payload substring matches) so budget hits are logged
+    quietly while real faults still warn.
+
+  * docs(#111): wiki Best-Practices now carries the "Snapshots taken
+    on TrueNAS" section describing crash-consistency semantics, the
+    import-snapshots workflow, and why PVE rollback can be blocked
+    by an unimported array-side snapshot. From Alfonso Kuen Arroyo;
+    supersedes the earlier shorter note so there is one authoritative
+    section.
+
+  * No API or storage-cfg changes relative to beta10. Deployed to the
+    3-node test cluster (pve/proxmox2/pvevm1) and single-iteration
+    Max storage-plugin-validation suite against truenas-storage passed
+    18 capabilities (1 unrelated timeout on cluster_migration from
+    unreachable TrueNAS portals advertised to the SAN — pre-existing).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Tue, 07 Oct 2026 17:30:00 -0400
+
 truenas-proxmox-plugin (2.1.23~beta10) unstable; urgency=medium
 
   * fix(#124): end-anchor every IQN/NQN comparison so a longer-IQN
