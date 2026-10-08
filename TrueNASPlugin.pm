@@ -22,7 +22,8 @@ use Time::HiRes qw(usleep);
 use POSIX ();
 use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
 use Errno qw(EEXIST);
-use Socket qw(inet_ntoa getaddrinfo getnameinfo AF_INET SOCK_STREAM NI_NUMERICHOST NIx_NOSERV);
+use Socket qw(inet_ntoa inet_aton inet_pton inet_ntop getaddrinfo getnameinfo
+    AF_INET AF_INET6 SOCK_STREAM NI_NUMERICHOST NIx_NOSERV);
 use Cwd qw(abs_path);
 use Sys::Syslog qw(openlog syslog);
 use Carp qw(carp croak);
@@ -581,13 +582,27 @@ sub _rpc_error_message {
 
 
 # ======== Retry logic with exponential backoff ========
+# Classify the error into "retry at the generic layer" or not. All of the
+# non-retryable classifiers below MUST run before _is_connection_error:
+# that one is a loose substring match against the full error string
+# (including the pretty-printed Python traceback middlewared embeds in
+# JSON-RPC error payloads), so any error whose trace mentions a frame
+# or local named "timeout", "connection reset", etc. will false-match.
+# Barbapapade's #123 report caught the shape in production: a real EBUSY
+# from pool.dataset.delete and a dependent EINVAL from pool.snapshot.delete
+# both carry Python frames with those strings, and gating connection-
+# detection first classified the EINVAL as retryable (looping on an
+# operation that could not succeed) while skipping the retry budget the
+# real EBUSY actually needed. The ordering below puts every authoritative
+# non-retryable classifier (structured errname / explicit error codes)
+# ahead of the substring heuristic.
 sub _is_retryable_error {
     my ($error) = @_;
     return 0 if !defined $error;
 
-    # Do NOT retry on database integrity errors — check BEFORE connection patterns
-    # because FK errors include Python traceback paths containing "connection.py"
-    # which would otherwise false-match the /connection.*failed/ pattern below
+    # Do NOT retry on database integrity errors — FK errors include Python
+    # traceback paths containing "connection.py" which would otherwise
+    # false-match the connection-error substring list.
     return 0 if $error =~ /FOREIGN KEY constraint failed|IntegrityError|constraint failed/i;
 
     # Do NOT retry on ZFS "already exists": that is a definitive verdict from
@@ -598,15 +613,28 @@ sub _is_retryable_error {
     # activate_volume of an LXC snapshot backup paid a useless retry and left
     # a "Max retries exhausted" line at err level. Same gate as upstream.
     return 0 if $error =~ /already exists|EEXIST|EZFS_EXISTS|zfs_create.*failed/i;
+    # Same for a snapshot that still has dependent clones (issue #123): the
+    # verdict is deterministic, every retry fails the same way.
+    return 0 if $error =~ /ZFSPathAlreadyExistsException|has dependent clones|dependent clones/i;
 
-    # Retry on transient connection/network errors
-    return 1 if _is_connection_error($error);
+    # Do NOT retry on EBUSY — the backing device is held by someone, and
+    # a blind retry at this layer just hammers the same error. The one
+    # place that can productively retry EBUSY is the clone teardown, via
+    # _delete_dataset_with_retry (bounded, after a udev settle barrier).
+    # (issue #123)
+    return 0 if $error =~ /\bEBUSY\b|dataset is busy|is busy|device.*busy/i;
 
-    # Do NOT retry on authentication, not found, or validation errors
+    # Do NOT retry on authentication / not-found / validation errors.
+    # These are authoritative structured classifications; moving them
+    # ahead of the connection substring match is the ordering fix.
     return 0 if _is_auth_error($error);
     return 0 if _is_not_found_error($error);
     return 0 if $error =~ /validation.*error|invalid.*parameter/i;
-    return 0 if $error =~ /EINVAL|Invalid params/i;
+    return 0 if $error =~ /\bEINVAL\b|Invalid params/i;
+
+    # Retry on transient connection/network errors (substring heuristic;
+    # last so authoritative classifiers above win on conflict).
+    return 1 if _is_connection_error($error);
 
     return 0; # Default: don't retry unknown errors
 }
@@ -1346,8 +1374,7 @@ sub check_config {
 
     if (defined($opts->{tn_nvme_ctrl_loss_tmo}) && $opts->{tn_nvme_ctrl_loss_tmo} == 0) {
         die "tn_nvme_ctrl_loss_tmo must be -1 (retry forever) or a positive "
-          . "number of seconds; 0 disables reconnection entirely
-";
+          . "number of seconds; 0 disables reconnection entirely\n";
     }
 
     if (defined $opts->{tn_api_retry_max}) {
@@ -2996,8 +3023,13 @@ sub _confirm_dataset_gone {
 }
 
 # Helper function to delete dataset with retry logic on "busy" errors
+#
+# $opts->{verify_gone}: after an API "success", read the dataset back. Still
+# present = the delete was masked (TN 26.0 BETA.36), handled like "busy"; only
+# an ENOENT-class answer from the array confirms it is gone, anything else
+# (empty answer, transport error) dies - an unconfirmed absence is not success.
 sub _delete_dataset_with_retry {
-    my ($scfg, $full_ds, $max_retries) = @_;
+    my ($scfg, $full_ds, $max_retries, $opts) = @_;
     $max_retries //= DATASET_DELETE_RETRY_COUNT;
 
     my $id = URI::Escape::uri_escape($full_ds);
@@ -3017,7 +3049,27 @@ sub _delete_dataset_with_retry {
         };
 
         if (!$@) {
-            return;  # Success
+            return if !($opts && $opts->{verify_gone});    # Success
+            my $still_there = eval { _tn_dataset_get($scfg, $full_ds) };
+            my $probe_err = $@;
+            return if !$still_there && $probe_err && _is_dataset_absent_error($probe_err);
+            if ($still_there) {
+                my $masked = "pool.dataset.delete reported success but "
+                    . "pool.dataset.get_instance still finds $full_ds (TN masked EBUSY)";
+                if ($attempt < $max_retries) {
+                    my $delay = 2 ** ($attempt - 1);
+                    _log($scfg, 1, 'warning', "[TrueNAS] $masked; retrying in ${delay}s ($attempt/$max_retries)");
+                    select(undef, undef, undef, $delay);
+                    next;
+                }
+                die "$masked after $max_retries attempts
+";
+            }
+            die "Cannot confirm $full_ds was deleted: the delete reported success but "
+              . ($probe_err ? "the follow-up query failed with '$probe_err'"
+                            : "the follow-up query returned nothing at all, which is not the same as the dataset being gone")
+              . ". Retry once the TrueNAS API answers.
+";
         }
 
         my $err = $@;
@@ -3754,11 +3806,32 @@ sub volume_snapshot_delete {
         # volume_snapshot_delete directly — it never calls deactivate_volume with a
         # snapname — so the clone would otherwise be orphaned. A clone also holds the
         # snapshot as its origin, blocking the snapshot delete below until removed.
-        # Best-effort: _teardown_snapshot_device is idempotent and no-ops when no
-        # clone exists.
+        # _teardown_snapshot_device is idempotent and no-ops when no clone exists.
+        #
+        # Teardown failures were previously swallowed to a warn here, and the code
+        # proceeded to pool.snapshot.delete regardless (issue #123). That path
+        # produced two bad outcomes together:
+        #   - the dependent clone kept the origin snapshot alive, so the ZFS delete
+        #     returned "has dependent clones" / EINVAL, and
+        #   - PVE's vzdump cleanup treats volume_snapshot_delete failures as
+        #     warnings on top of an already-written PBS archive, so operators saw
+        #     TASK OK while the CT retained lock=snapshot-delete + parent=vzdump
+        #     metadata, blocking every subsequent backup until manual recovery.
+        # Propagate teardown failure and SKIP the origin snapshot delete so the
+        # dependency chain is explicit in the task log and PVE's cleanup phase
+        # has an actual error to surface. The bounded EBUSY retry inside
+        # _teardown_snapshot_device absorbs the typical settle race first.
         if (defined($snapname) && $snapname ne '') {
             eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
-            $class->_log_clone_teardown_failure($scfg, 'volume_snapshot_delete', $volname, $snapname, $@) if $@;
+            if (my $teardown_err = $@) {
+                # Name the exact orphaned clone at error level first (the die
+                # below may be turned into a warning by PVE's vzdump cleanup).
+                $class->_log_clone_teardown_failure($scfg, 'volume_snapshot_delete', $volname, $snapname, $teardown_err);
+                die "volume_snapshot_delete: refusing to delete $snap_full while "
+                    . "its ephemeral vzdump clone cannot be torn down "
+                    . "(leaves the origin held by the clone; manual cleanup needed): "
+                    . "$teardown_err";
+            }
         }
 
         my $result = _api_call_mutate(
@@ -6308,9 +6381,13 @@ sub _target_sessions_active($scfg) {
     my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
     return 0 if $@; # If command fails (no sessions exist), return false
 
-    # Check if our target has active sessions
+    # Check if our target has active sessions. Negative lookahead
+    # (?![\w.:-]) refuses to count a longer-IQN session as this one:
+    # IQN syntax allows [\w.:-] in the suffix, so without the anchor a
+    # bare substring match treats iqn:...-protected as present when
+    # only iqn:...-protected-16k is logged in (issue #124).
     for my $line (@session_lines) {
-        return 1 if $line =~ /\Q$iqn\E/;
+        return 1 if $line =~ /\Q$iqn\E(?![\w.:-])/;
     }
     return 0;
 }
@@ -6350,7 +6427,9 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
     # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
     # Match hostname portals against the IP open-iscsi actually logged.
     for my $line (@session_lines) {
-        next unless $line =~ /\Q$iqn\E/;
+        # (?![\w.:-]) refuses to count a longer-IQN session as this one (issue
+        # #124: ...:protected-16k would otherwise match ...:protected).
+        next unless $line =~ /\Q$iqn\E(?![\w.:-])/;
         for my $needle (@needles) {
             return 1 if $line =~ /\Q$needle\E/;
         }
@@ -6443,7 +6522,7 @@ sub _iscsi_login_all($scfg) {
 
     # Login to all discovered portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
-        # the list form is "190.0.2.1:3260,1 iqn..." - strip the ,tpgt suffix
+        # the list form is "192.0.2.1:3260,1 iqn..." - strip the ,tpgt suffix
         next unless $n =~ /^(\S+?)(?:,\d+)?\s+\Q$iqn\E$/;
         my $portal = _normalize_portal($1);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
@@ -6471,14 +6550,19 @@ sub _iscsi_login_all($scfg) {
                  "iscsiadm login failed ($p)");
     }
 
-    # Verify a session exists; if not, retry once
+    # Verify a session exists; if not, retry once. \b alone is not
+    # enough: \b matches between a word char and a non-word char, so
+    # ...-protected ends on a \b against ...-protected-16k and the
+    # longer target's session would wrongly count as this one's
+    # (issue #124). (?![\w.:-]) also rejects any IQN-legal trailing
+    # char.
     my $have_session = 0;
     for my $line (_run_lines(['iscsiadm','-m','session'])) {
-        if ($line =~ /\b\Q$iqn\E\b/) { $have_session = 1; last; }
+        if ($line =~ /\b\Q$iqn\E(?![\w.:-])/) { $have_session = 1; last; }
     }
     if (!$have_session) {
         # CHAP-aware retry: the plain `-m discovery` this used to run RESETS
-        # the discoverydb record, wiping the auth idk8 just configured - the
+        # the discoverydb record, wiping the auth just configured - the
         # fallback must go through the same helper as the main path.
         _iscsi_discover($scfg, $primary, 'retry');
         for my $p (@extra, $primary) {
@@ -6774,7 +6858,11 @@ sub _device_for_lun($scfg, $lun, $max_retries_override = undef) {
         eval {
             opendir(my $dh, "/dev/disk/by-path") or die "open by-path failed";
             if ($iqn) {
-                @paths = grep { /iscsi-\Q$iqn\E/ } readdir($dh);
+                # by-path entries have the shape ip-...-iscsi-<iqn>-lun-N,
+                # so anchor on -lun- after the IQN to avoid listing a
+                # longer-IQN target's by-path entries when the diagnostic
+                # should only show this one's (issue #124).
+                @paths = grep { /iscsi-\Q$iqn\E-lun-/ } readdir($dh);
             } else {
                 @paths = grep { /iscsi-/ } readdir($dh);
             }
@@ -7568,6 +7656,18 @@ sub _nvme_connect {
         push @missing, $portal;
     }
 
+
+    # A name that could not be resolved is only ambiguous while a controller
+    # exists that it might be. With none at all for this NQN there is nothing
+    # it could match, and upstream always handed the configured string to
+    # `nvme connect -a` and let nvme-cli resolve it. Keep doing that: without
+    # it a cold start, or the disconnect->connect recovery in a fresh worker
+    # (whose memo is empty), would die without ever issuing a connect for a
+    # storage whose portals are configured by name.
+    if (!$live && !%$ctrl && @unknown) {
+        push @missing, @unknown;
+        @unknown = ();
+    }
     # Healthy: every configured portal has a live controller.
     if (!@missing && !@recovering && !@unknown) {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_connect: all $live configured portal(s) live");
@@ -7674,12 +7774,23 @@ sub _nvme_connect {
 
     for my $portal (@connect_list) {
         my ($host, $port) = _nvme_parse_portal($portal);
-        $host = _nvme_untaint_cli_host($host);
-        # Numify first: _nvme_portal_key() already compares ports numerically, so
-        # a config entry of "04420" matches its controller and never reaches a
-        # connect - until a cold start, where the untainter's ^[1-9] would reject
-        # it and die outside the per-portal eval, taking the other portals down.
-        $port = _nvme_untaint_cli_port(0 + $port);
+        # Untaint inside a per-portal guard. A malformed host/port makes the
+        # untainter die; done bare, that die would abort the loop and drop the
+        # other, healthy portals with it. Numify the port first so a config entry
+        # of "04420" survives the ^[1-9] anchor on the common path; the guard is
+        # the backstop for anything the numify does not cover. A bad portal is
+        # held off by backoff like a failed connect, not fatal to its siblings.
+        eval {
+            $host = _nvme_untaint_cli_host($host);
+            $port = _nvme_untaint_cli_port(0 + $port);
+            1;
+        } or do {
+            my $uerr = $@ || 'invalid portal';
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: skipping malformed portal $portal: $uerr");
+            $_nvme_portal_backoff{"$hostkey|$portal"} = time();
+            delete $_portal_sync_last_ok{_cache_host_key($scfg)};
+            next;
+        };
 
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_connect: connecting to $host:$port");
 
@@ -11187,7 +11298,11 @@ sub _session_has_no_luns {
 
     my @stanzas = split(/\n\s*\n/s, $buf);
     for my $s (@stanzas) {
-        next unless $s =~ /Target:\s*\Q$target_iqn\E\b/s;
+        # (?![\w.:-]) rejects longer-IQN matches; \b alone matches
+        # between a word char and '-' in the IQN suffix, so a
+        # ...-protected-16k target would be treated as our
+        # ...-protected (issue #124).
+        next unless $s =~ /Target:\s*\Q$target_iqn\E(?![\w.:-])/s;
         # If any "Lun:" lines remain, do not logout
         return 0 if $s =~ /Lun:\s*\d+/;
         # If section exists and shows no Lun lines, safe to logout
@@ -11638,6 +11753,16 @@ sub _log_api_down_note {
     # survive a >=warning syslog filter, or nobody who filters ever reads it.
     _log($scfg, 0, $sev // 'info', "[TrueNAS] $tag: '" . ($storeid // '-') . "' $what; "
         . "array marked down for another " . int($left) . "s");
+}
+
+# Test-only escape hatch: control the throttle state without a symbolic
+# reference into this lexical hash.
+sub _reset_api_down_throttle { %_api_down_log_last = (); }
+
+sub _seed_api_down_throttle {
+    my ($scfg, $tag, $storeid, $ago_s) = @_;
+    my $key = _cache_host_key($scfg) . "|$tag|" . ($storeid // '-');
+    $_api_down_log_last{$key} = time() - $ago_s;
 }
 
 # ======== status(): dataset capacity ========
@@ -12107,7 +12232,10 @@ sub _ensure_target_visible {
     eval {
         my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
         for my $line (@discovery_output) {
-            if ($line =~ /\b\Q$iqn\E\b/) {
+            # End anchor stops a longer-IQN target from reporting as
+            # this one's discovery hit (issue #124). \b between d and
+            # - counts as a word boundary and would otherwise match.
+            if ($line =~ /\b\Q$iqn\E(?![\w.:-])/) {
                 $target_discoverable = 1;
                 last;
             }
@@ -12147,7 +12275,13 @@ sub activate_storage {
             die "NVMe/TCP storage activation failed: $@\n";
         }
 
-        # Ensure subsystem exists and connect
+        # Ensure subsystem exists and connect. activate_storage() runs
+        # BEFORE status() on every pvestatd sweep, so the ensure below has
+        # to honour the marker too, or it pays a full API timeout on every
+        # poll for as long as the array is unreachable. CAP it, don't skip
+        # it: it also republishes portals the target lost, which matters
+        # most exactly when the array is flaky - and the 2s cap covers its
+        # mutations too (an abandoned create is reconciled by the next poll).
         eval {
             # storage_info() calls activate_storage() BEFORE status(), so the marker
             # status() sets has to be honoured here too. Otherwise every pvestatd
@@ -12498,7 +12632,21 @@ sub _teardown_snapshot_device {
     # also confirms with the array before treating "does not exist" as done.
     # A failure is raised, not warned: swallowing it is how the job reported
     # success over an orphan.
-    eval { _delete_dataset_with_retry($scfg, $clone_full) };
+    #
+    # Readiness barrier first (issue #123): the initiator-side device removal,
+    # multipath -f and the extent/namespace delete all return before
+    # middlewared / the target / udev finish releasing the zvol, so a same-tick
+    # pool.dataset.delete can race and be refused. udevadm settle drains the
+    # in-flight removal uevents; the retry inside _delete_dataset_with_retry
+    # covers the array's own release lag. ONE retry engine, deliberately: the
+    # upstream #123 ladder (5 steps, ENOENT = success, empty readback = gone)
+    # was not adopted because it treats an unconfirmed absence as success.
+    #
+    # verify_gone: TrueNAS 26.0 BETA.36 can answer pool.dataset.delete with
+    # success while the zvol is still live (a holder has the device open), so
+    # for the clone a "success" is confirmed by reading the dataset back.
+    eval { run_command(['udevadm','settle'], outfunc=>sub{}, errfunc=>sub{}) };
+    eval { _delete_dataset_with_retry($scfg, $clone_full, undef, { verify_gone => 1 }) };
     if (my $err = $@) {
         die "[TrueNAS] _teardown_snapshot_device: could not delete the snapshot clone $clone_full: $err";
     }

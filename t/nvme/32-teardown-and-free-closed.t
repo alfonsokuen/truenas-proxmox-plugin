@@ -34,8 +34,9 @@ my (@calls, %get, $delete_script);
     *{"${PKG}::_tn_dataset_get"} = sub {
         my ($s, $id) = @_;
         push @calls, "get:$id";
-        die $get{$id}{die} if $get{$id} && $get{$id}{die};
-        return $get{$id} ? $get{$id}{ret} : { id => $id };
+        my $g = $get{$id} // $get{'*'};    # '*' = answer for any other dataset
+        die $g->{die} if $g && $g->{die};
+        return $g ? $g->{ret} : { id => $id };
     };
     *{"${PKG}::_api_call"} = sub {
         my ($s, $m, $p) = @_; push @calls, $m;
@@ -57,10 +58,25 @@ sub deletes { scalar grep { $_ eq 'pool.dataset.delete' } @calls }
 
 # --- B1 --------------------------------------------------------------------
 {
+    # The clone teardown now reads the dataset back after an API "success"
+    # (TN 26.0 BETA.36 can answer success with the zvol still live): the array
+    # must answer ENOENT for the clone, or the delete is not believed.
+    %get = ('*' => { die => "[ENOENT] InstanceNotFound: does not exist\n" });
     @calls = (); $delete_script = [ "[EBUSY] dataset is busy\n", "[EBUSY] dataset is busy\n", 'ok' ];
     my $ok = eval { $PKG->_teardown_snapshot_device($scfg, 'vol-vm-101-disk-0-ns11111111-2222-3333-4444-555555555555', 's1'); 1 };
     ok($ok, 'B1: EBUSY twice then OK -> the teardown completes') or diag($@);
     is(deletes(), 3, '  ...after exactly three delete attempts');
+}
+{
+    # B1b: the array says "deleted" but the zvol is still live (masked EBUSY):
+    # that is a failed teardown, not a success. Seen on TN 26.0 BETA.36.
+    %get = ();    # default answer: the dataset exists
+    @calls = (); $delete_script = [ ('ok') x 5 ];
+    local $SIG{__WARN__} = sub { };
+    my $ok = eval { $PKG->_teardown_snapshot_device($scfg, 'vol-vm-101-disk-0-ns11111111-2222-3333-4444-555555555555', 's1'); 1 };
+    ok(!$ok, 'B1b: delete reported success but the clone is still there -> the teardown FAILS');
+    like($@ // '', qr/masked EBUSY|still finds/, '  ...saying the delete was not real');
+    %get = ('*' => { die => "[ENOENT] InstanceNotFound: does not exist\n" });
 }
 {
     @calls = (); $delete_script = [ ("[EBUSY] dataset is busy\n") x 10 ];

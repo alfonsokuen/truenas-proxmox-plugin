@@ -1473,6 +1473,196 @@ truenas-proxmox-plugin (2.1.24~alpha1) unstable; urgency=medium
     neither TrueNAS nor a configured storage.
 
  -- Alfonso Kuen <alfonsok@gmail.com>  Sun, 16 Aug 2026 20:30:00 +0000
+truenas-proxmox-plugin (2.1.23+deb1) unstable; urgency=medium
+
+  * Promote 2.1.23~beta11 to 2.1.23+deb1 (stable). First stable
+    release of the 2.1.23 line after a thirty-six-alpha / eleven-beta
+    development cycle, following external validation from Max R.
+    Carrara (Proxmox VE team, 2026-09-02: "passes all testing at
+    their end") on alpha36, and a 20-iteration local run of Max's
+    storage-plugin-validation suite against truenas-storage on the
+    pve/proxmox2/pvevm1 cluster on 2026-10-07/08:
+
+      - 19 / 20 rounds PASS, 19 capabilities validated each (0 failed,
+        2 unsupported, 3 not tested for prerequisite reasons).
+      - 1 / 20 FAIL in round 17: three backup tests (backup_vm,
+        backup_ct, backup_running) hit their per-test 180s/300s
+        deadlines while a cron-scheduled nightly PBS backup held the
+        host-wide vzdump global lock. Not a plugin fault; the vzdump
+        tasks the test triggered all completed cleanly once the lock
+        was released. Rounds 18-20 (after the cron window) all PASS.
+
+    This stable also carries the four PRs from Alfonso Kuen Arroyo
+    merged in beta11 (NVMe/TCP portal reconcile hardening, iSCSI CHAP
+    against TrueNAS SCALE 25.10, bounded API retries while the array
+    is unreachable, and the Snapshots-on-TrueNAS best-practices
+    section). Credit lines appear in the per-item beta11 entry below.
+
+  * No functional changes from 2.1.23~beta11; version string and
+    changelog only.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 08 Oct 2026 02:00:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta11) unstable; urgency=medium
+
+  * fix(#94): NVMe/TCP reconcile restores a portal that was down at
+    connect time. Original diagnosis and patch from Alfonso Kuen
+    Arroyo (github.com/alfonsokuen); landed via branch pr94-fixes
+    which also layers portal-untaint + explicit Socket import +
+    regression tests on top (filed separately as #128). The
+    reconcile call sits at status() entry and only runs when
+    transport mode is nvme-tcp; a stuck portal costs at most one
+    bounded connect per poll window and never on the VM start path.
+
+  * fix(#95): iSCSI CHAP against TrueNAS SCALE 25.10 — dead login
+    loop plus implicit discovery-CHAP. Original diagnosis and patch
+    from Alfonso Kuen Arroyo; landed via branch pr95-cleanup as two
+    commits: 'iscsiadm -m node -T <iqn>' prints a record (not the
+    list) so the login loop was walking the wrong structure, and
+    sendtargets discovery now gets the CHAP credentials fed to it
+    on the retry that re-establishes the discoverydb record.
+
+  * fix(#97): storage poll resilience — bounded API retries while
+    the array is unreachable. From Alfonso Kuen Arroyo. A fresh
+    recent-failure marker short-circuits status() to "inactive"
+    inside the probe-backoff window, and activate_storage()'s
+    subsystem ensure runs under a capped API deadline so pvestatd
+    polls do not pay a full API timeout on every tick during an
+    outage. Ensure failures are classified against the retry
+    engine's own two death strings (anchored at start to avoid
+    foreign-payload substring matches) so budget hits are logged
+    quietly while real faults still warn.
+
+  * docs(#111): wiki Best-Practices now carries the "Snapshots taken
+    on TrueNAS" section describing crash-consistency semantics, the
+    import-snapshots workflow, and why PVE rollback can be blocked
+    by an unimported array-side snapshot. From Alfonso Kuen Arroyo;
+    supersedes the earlier shorter note so there is one authoritative
+    section.
+
+  * No API or storage-cfg changes relative to beta10. Deployed to the
+    3-node test cluster (pve/proxmox2/pvevm1) and single-iteration
+    Max storage-plugin-validation suite against truenas-storage passed
+    18 capabilities (1 unrelated timeout on cluster_migration from
+    unreachable TrueNAS portals advertised to the SAN — pre-existing).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Tue, 07 Oct 2026 17:30:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta10) unstable; urgency=medium
+
+  * fix(#124): end-anchor every IQN/NQN comparison so a longer-IQN
+    (NQN) session on the same portal no longer gets treated as
+    "connected" for a shorter one. Reporter matobodo: two targets
+    ...:proxmox-nvme-protected and ...:proxmox-nvme-protected-16k on
+    the same portal, where the shorter target's login was silently
+    skipped after a reboot because _portal_connected's bare
+    substring regex matched the longer target's session line. Every
+    VM with a disk on that storage then failed to start with "Could
+    not locate by-path device for LUN <N>". Seven comparison sites
+    patched: six adopt the (?![\w.:-]) end anchor, which refuses any
+    IQN-legal suffix continuation, and the seventh (by-path error
+    diagnostic) uses the natural "-lun-" suffix anchor instead. Live
+    verified by creating a prefix-colliding iSCSI target on the test
+    TrueNAS, logging into both targets concurrently, and confirming
+    _target_sessions_active / _portal_connected correctly separate
+    them; crafted long-only session table reproduces the reporter's
+    exact failure signature and the fix returns 0 for the short IQN
+    where pre-fix returned 1.
+
+  * fix(#4): tools/truenas-plugin-lvm-filter now also rejects
+    TrueNAS iSCSI LUNs by their /dev/disk/by-path/ip-*-iscsi-*
+    symlinks. Reporter lucasblack29: the iSCSI reject regex has been
+    missing from this helper since the tool was introduced; the
+    original #4 fix only installed the NVMe by-id reject, so hosts
+    with VMs on iSCSI-mode truenasplugin storage got the same
+    duplicate-VG / slow-pvs symptom the NVMe case was already
+    protecting against. OUR_SET refactor keeps install/uninstall/
+    status iterating over both regexes with a shared marker tag.
+    Live symptom-silence verified: pvcreate on a real iSCSI LUN
+    makes it visible to pvs; install → pvs filters it out; uninstall
+    → pvs sees it again.
+
+  * fix(#125): install.sh's "Weight volume presence" healthcheck now
+    looks up the canonical weight zvol name (pve-weight-<suffix>-
+    <sha1(iqn)[0:8]>, present since v2.0.20) in addition to the two
+    older names it already probed. Reporter lucasblack29 ran the
+    healthcheck against a freshly provisioned storage and saw
+    "Weight zvol missing" even though the zvol existed and the LUN
+    was mounted — because the healthcheck was only ever asking for
+    the pre-v2.0.20 names. All four cascade branches live-exercised
+    (canonical hit, legacy fallback, very-old fallback, truly-
+    missing WARN).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Tue, 07 Oct 2026 09:30:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta9) unstable; urgency=medium
+
+  * fix(#123): LXC snapshot-mode vzdump cleanup now surfaces clone
+    teardown failure instead of silently leaving the CT with
+    lock=snapshot-delete + parent=vzdump after a successful PBS
+    archive. Reporter Barbapapade saw 14 CTs in production stuck in
+    that state because _teardown_snapshot_device wrapped the clone
+    pool.dataset.delete in eval+warn with no readiness barrier and
+    no retry, and volume_snapshot_delete continued to the dependent
+    origin snapshot delete regardless. Three changes together:
+      - _teardown_snapshot_device: udevadm settle after the
+        initiator-side scsi/multipath/extent teardown, then a bounded
+        retry ladder around pool.dataset.delete (0, +500, +1000,
+        +2000, +4000 ms worst case) with a pool.dataset.get_instance
+        readback after each reported success. The readback is
+        required because TN 26.0 BETA.3 can report delete success
+        while the underlying zfs destroy returned EBUSY -- 25.10.x
+        surfaces the EBUSY correctly, 26.0 BETA swallows it. On
+        persistent failure after the budget we die with an
+        authoritative "after bounded retry" message instead of
+        warning.
+      - _is_retryable_error: ordering fix. The structured classifiers
+        (EBUSY, dependent-clones, ZFSPathAlreadyExistsException,
+        EINVAL, auth, not-found, validation) now run BEFORE the loose
+        substring heuristic in _is_connection_error. The old order
+        meant any JSON-RPC error whose embedded Python traceback
+        happened to mention "timeout" or "connection reset" was
+        false-matched as retryable and looped at the generic retry
+        layer -- Barbapapade's EINVAL from pool.snapshot.delete did
+        this while the real EBUSY from pool.dataset.delete was
+        swallowed by the eval+warn.
+      - volume_snapshot_delete: dies when _teardown_snapshot_device
+        fails, instead of warning + continuing to pool.snapshot.delete.
+        PVE's vzdump cleanup now surfaces our authoritative error
+        ("refusing to delete ... clone cannot be torn down") rather
+        than a confused "has dependent clones" from the ZFS layer, and
+        no origin snapshot is removed while the clone is still live.
+    Validation: new t/rate-limit/13-issue-123-clone-teardown.t with
+    23 TAP assertions covering all three fix paths including the
+    silent-success readback case. Live end-to-end against iSCSI on TN
+    26.0 BETA.3, NVMe/TCP on TN 26.0 BETA.3, and iSCSI on TN 25.10.3.1
+    -- all three force a persistent EBUSY via a held FD on the TN
+    side, confirm the authoritative error chain reaches the vzdump
+    task log, then release the FD and run a second vzdump to verify
+    the leftover-clone regex (#59/#121) reuses the stale clone and
+    cleans up normally.
+
+  * docs: new "Installing a specific pre-release build" subsection in
+    wiki/Installation.md plus matching note in README.md explaining
+    that the APT repository is intentionally stable-only (the publish
+    job skips -alpha*/-beta*/-rc* tags, so apt upgrade never pulls an
+    unstable build) and that install.sh's "Install specific version"
+    menu or the GitHub release page's .deb are the two paths that get
+    a beta onto a node. Prompted by a user who ran plain apt install
+    and landed on 2.1.17 after being asked to try beta8.
+
+  * install.sh: --apt-install validator now accepts binary OpenPGP
+    public keys (first byte 0x98/0x99) in addition to ASCII-armored
+    "BEGIN PGP PUBLIC KEY BLOCK" blocks. Our hosted pubkey at
+    truenas.github.io/truenas-proxmox-plugin/apt/pubkey.gpg is served
+    as a binary export; validators that only accepted the armored
+    form hard-failed the install at the key-import step.
+
+  * docs(Known-Limitations): scope trim. All upstream Proxmox /
+    QEMU / CPU-arch references removed; our wiki documents the
+    plugin only. Proxmox owns their own issue tracker.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 06 Oct 2026 12:30:00 -0400
 
 truenas-proxmox-plugin (2.1.23~beta8) unstable; urgency=medium
 

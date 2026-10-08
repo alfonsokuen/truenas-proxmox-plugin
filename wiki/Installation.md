@@ -257,6 +257,17 @@ apt-get update
 apt-get install --only-upgrade -y truenas-proxmox-plugin
 ```
 
+> **Note:** The APT repository only serves **stable releases**. Pre-release
+> builds (`-alpha*`, `-beta*`, `-rc*`) are intentionally excluded so that
+> `apt upgrade` on a production cluster never pulls in an unstable build.
+> If a maintainer has asked you to try a beta, or if you need a newer
+> release than what APT serves, use `install.sh`'s **"Install specific
+> version"** menu entry (interactive mode) or the Debian package attached
+> to the corresponding
+> [GitHub release](https://github.com/truenas/truenas-proxmox-plugin/releases).
+> See [Installing a specific pre-release build](#installing-a-specific-pre-release-build)
+> below.
+
 ### Quick Start - One-Line Installation
 
 Install the plugin with a single command:
@@ -413,6 +424,52 @@ Non-interactive mode will:
 - Use safe defaults for all options
 - Log all actions to `/var/log/truenas-installer.log`
 - Exit with appropriate status codes (0=success, 1=error)
+
+### Installing a specific pre-release build
+
+The APT repository only publishes stable releases. Pre-release builds
+(`v*-alpha*`, `v*-beta*`, `v*-rc*`) are not pushed there, so running
+`apt install truenas-proxmox-plugin` on a fresh system always lands on
+the current stable (e.g. `2.1.17+deb1`), even when a newer beta is the
+one tagged **Latest** on GitHub. This is intentional — it keeps
+unattended upgrades on production clusters from pulling in a beta — but
+it means you need to use `install.sh` or a direct download when a
+maintainer asks you to try a specific build.
+
+**Interactive (menu):**
+
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh)
+```
+
+Select **"Install specific version"** from the main menu, then pick
+the beta from the list (pre-releases are flagged in the version list).
+
+**Direct `.deb` from the GitHub release page:**
+
+Each release attaches a signed `.deb` plus `SHA256SUMS`. Open the
+release page in a browser (e.g.
+<https://github.com/truenas/truenas-proxmox-plugin/releases/tag/v2.1.23-beta8>),
+right-click the `.deb` link to copy its URL, then from any cluster
+node:
+
+```bash
+curl -sSL -O "<the .deb URL you copied>"
+curl -sSL -O "<the SHA256SUMS URL from the same page>"
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i truenas-proxmox-plugin_*.deb
+```
+
+(Note: GitHub converts `~` to `.` in asset filenames at upload time, so
+the file you download is named `truenas-proxmox-plugin_2.1.23.beta8_all.deb`
+while `SHA256SUMS` references the original `~beta8` form. `sha256sum -c
+--ignore-missing` tolerates the mismatch; if you want strict
+verification, verify the hash by hand with `sha256sum
+truenas-proxmox-plugin_*.deb` and compare to the value in `SHA256SUMS`.)
+
+When the beta you installed is later promoted to a stable release and
+published to the APT repo, `apt upgrade` will catch up to it on its own
+on the next run.
 
 ### Installer Workflow Examples
 

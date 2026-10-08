@@ -180,6 +180,14 @@ apt-get update
 apt-get install -y truenas-proxmox-plugin
 ```
 
+> **Note:** The APT repository only serves **stable releases**.
+> Pre-release builds (`-alpha*`, `-beta*`, `-rc*`) are intentionally
+> excluded so that `apt upgrade` on a production cluster never pulls in
+> an unstable build. To install a beta — or any version newer than what
+> APT currently serves — use **Option 2** below with the matching tag,
+> or run `install.sh` interactively and choose **"Install specific
+> version"** from the menu.
+
 **Option 2: Direct .deb Installation**
 
 Download a release package and install it directly:
@@ -189,6 +197,12 @@ wget https://github.com/truenas/truenas-proxmox-plugin/releases/download/v<RELEA
 dpkg -i truenas-proxmox-plugin_<DEB_VERSION>_all.deb
 apt-get -f install -y
 ```
+
+The release page lists every build (stable and pre-release); the tag
+to use is the one shown in that release's title. Verify against the
+attached `SHA256SUMS` before installing. When a beta is later promoted
+to a stable release and published to the APT repo, `apt upgrade` will
+catch up to it on its own.
 
 **Option 3: Interactive Installer (Existing Workflow)**
 
@@ -276,9 +290,16 @@ truenasplugin: truenas-nvme
     tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     tn_dataset tank/proxmox
     tn_discovery_portal 192.168.1.100:4420
+    tn_api_insecure 1
     content images,rootdir
     shared 1
 ```
+
+`tn_api_insecure 1` is needed when TrueNAS is still using its
+default self-signed HTTPS certificate — the plugin's WebSocket
+transport verifies the server cert otherwise and the connection
+fails before activation. Omit this line once you've replaced the
+TrueNAS cert with one your Proxmox hosts trust.
 
 **NVMe/TCP Requirements**:
 - TrueNAS SCALE 25.10.0 or later

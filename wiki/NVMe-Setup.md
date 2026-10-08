@@ -128,12 +128,20 @@ nvme gen-hostnqn > /etc/nvme/hostnqn
 
 **Option 1: Using Interactive Installer (Recommended)**
 
-The installer (v1.1.0+) includes a built-in configuration wizard that simplifies NVMe/TCP setup:
+The installer (v1.1.0+) includes a built-in configuration wizard that simplifies NVMe/TCP setup. Download and run it in one line:
 
 ```bash
-./install.sh
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh)
 # Choose "Configure storage" from main menu
 # Select "2) NVMe/TCP (modern, lower latency)" when prompted for transport mode
+```
+
+Or download first and run locally:
+
+```bash
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh
+chmod +x install.sh
+./install.sh
 ```
 
 **The installer will automatically:**
@@ -161,9 +169,24 @@ truenasplugin: truenas-nvme
     tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     tn_dataset tank/proxmox
     tn_discovery_portal 10.15.14.172:4420
-    content images
+    tn_api_insecure 1
+    content images,rootdir
     shared 1
 ```
+
+> **About `tn_api_insecure 1`:** TrueNAS SCALE ships with a self-signed
+> HTTPS certificate out of the box, and the plugin's default
+> transport (`tn_api_scheme = wss`) verifies the server certificate.
+> With the default cert the WebSocket handshake fails on cert
+> verification and the storage never activates. `tn_api_insecure 1`
+> tells the plugin to skip verification. If you have replaced the
+> TrueNAS cert with one from your own CA (or a public CA), omit this
+> parameter so verification stays on.
+>
+> **About `content`:** `images,rootdir` lets both VM disks and LXC
+> container rootfs live on this storage. If you only ever run VMs
+> here, `content images` is fine; it does not stop VMs from working,
+> it just hides the storage from the LXC create UI.
 
 **With Optional Parameters:**
 ```ini
@@ -179,7 +202,7 @@ truenasplugin: truenas-nvme
     tn_api_port 443
     tn_api_insecure 1
     tn_zvol_blocksize 64K
-    content images
+    content images,rootdir
     shared 1
 ```
 
