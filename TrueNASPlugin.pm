@@ -3090,10 +3090,14 @@ sub _delete_dataset_with_retry {
                     my $delay = 2 ** ($attempt - 1);
                     _log($scfg, 1, 'warning', "[TrueNAS] $masked; retrying in ${delay}s ($attempt/$max_retries)");
                     _backoff_sleep($delay);
+                    # The wait may have used up what was left: no new attempt.
+                    die "$masked; stopped after $attempt attempt(s) because the deadline ran out during the backoff\n"
+                        if !_retry_time_left();
                     next;
                 }
-                die "$masked after $max_retries attempts
-";
+                my $why_stop = ($attempt < $max_retries)
+                    ? "stopped by the deadline after $attempt attempt(s)" : "after $attempt attempt(s)";
+                die "$masked, $why_stop\n";
             }
             die "Cannot confirm $full_ds was deleted: the delete reported success but "
               . ($probe_err ? "the follow-up query failed with '$probe_err'"
@@ -3119,6 +3123,11 @@ sub _delete_dataset_with_retry {
             my $delay = 2 ** ($attempt - 1);  # Exponential backoff: 1s, 2s, 4s
             _log($scfg, 1, 'info', "[TrueNAS] Dataset busy, retrying in ${delay}s... ($err)");
             _backoff_sleep($delay);
+            if (!_retry_time_left()) {
+                chomp(my $busy_why = $err);
+                die "Dataset $full_ds still busy; stopped after $attempt attempt(s) because the "
+                  . "deadline ran out during the backoff: $busy_why\n";
+            }
             next;
         }
 

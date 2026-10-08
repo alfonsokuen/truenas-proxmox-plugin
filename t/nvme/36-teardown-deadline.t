@@ -65,4 +65,21 @@ for my $m ('ebusy', 'masked') {
     like($settle // '', qr/--timeout=(?:[1-9]|10)\b/, '  ...settle bounded (<= 10 s) even with plenty of budget');
 }
 
+# The backoff itself can cross the deadline: the check before sleeping passes
+# (1 s left), the wait takes longer, and the next attempt would start AFTER the
+# deadline. A stub that really waits 2 s stands in for a backoff longer than the
+# time left; no further attempt may start once the deadline is gone.
+{
+    no strict 'refs'; no warnings 'redefine';
+    local *{"${PKG}::_backoff_sleep"} = sub { sleep 2 };
+    for my $m ('ebusy', 'masked') {
+        my ($ok, $err) = teardown($m, time() + 1);
+        ok(!$ok, "$m: backoff crosses the deadline -> the teardown fails visibly");
+        is($deletes, 1, '  ...and NO second attempt starts after the deadline');
+        like($err, qr/after 1 attempt\(s\)/, '  ...the message says how many attempts there really were');
+        like($err, qr/deadline/, '  ...and that the deadline cut it short');
+        unlike($err, qr/after 3 attempts/, '  ...not the configured maximum');
+    }
+}
+
 done_testing;
