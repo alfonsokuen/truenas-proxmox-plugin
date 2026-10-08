@@ -108,4 +108,15 @@ is(gate(world(mount => '40 26 8:5 / /mnt/other rw - ext4 /dev/sdb1 rw'), 1), 0,
 is(gate(world(), 1, ()), 0, 'default path list works');
 is($check->($scfg), 0, 'no devices at all is free (nothing to protect)');
 
+# The seam above replaces fuser, so it cannot see HOW fuser is called. `-m`
+# is what makes a container's open head (another mount namespace) show up:
+# measured in the lab and on prod hardware, `fuser -s` alone answers rc=1 for
+# those. Pin the real invocation in the source: removing the -m turns this red.
+{
+    open(my $src, '<', $PLUGIN) or die "cannot read $PLUGIN: $!";
+    local $/; my $text = <$src>; close $src;
+    like($text, qr/system\(\$fuser,\s*'-s',\s*'-m',\s*\@args\)/,
+         "the in-use gate asks fuser with -m (mount-namespace aware)");
+}
+
 done_testing;

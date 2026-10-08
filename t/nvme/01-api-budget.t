@@ -1,7 +1,8 @@
 #!/usr/bin/perl
-# One API call must be bounded in TIME, not just in attempts - but only when
-# something asked for that: tn_api_budget_s is opt-in, so this file also
-# pins the default (unconfigured) path to the plugin's original behavior.
+# One API call must be bounded in TIME, not just in attempts. Upstream leaves
+# tn_api_budget_s opt-in; THIS FORK turns it on by default (120 s), so a call
+# with nothing configured still runs under a 120 s deadline - pinned below.
+# The attempt counting and the classic exhaustion message are unchanged by it.
 #
 # _retry_with_backoff() used to count attempts and never look at the clock,
 # so the worst case was a product nobody multiplied: tn_api_retry_max times
@@ -64,9 +65,21 @@ sub drive {
 }
 
 # --------------------------------------------- default mode is unchanged ----
-# tn_api_budget_s unset, no outer deadline: this must behave exactly like
-# the plugin always has - unbounded by wall clock, bounded only by
-# tn_api_retry_max, and the classic exhaustion message.
+# tn_api_budget_s unset, no outer deadline: the attempt count and the classic
+# exhaustion message are those of the original engine (the fork's default
+# 120 s budget does not show until the clock runs out - see the next block).
+
+# The fork default: nothing configured => a 120 s budget is ACTIVE.
+{
+    no strict 'refs';
+    my $seen;
+    $retry->({ tn_api_retry_max => 0 }, 'test op',
+             sub { $seen = ${"${PKG}::_api_deadline"}; return 1 }, undef);
+    my $left = defined $seen ? $seen - time() : undef;
+    ok(defined $left && $left > 118 && $left <= 120.5,
+       'fork default: with tn_api_budget_s unset the call runs under a 120 s deadline')
+        or diag(defined $left ? "left=$left" : 'no deadline installed');
+}
 
 {
     my $r = drive(retry_max => 3, retry_delay => 0.01);
