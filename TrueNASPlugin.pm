@@ -931,7 +931,7 @@ sub properties {
         },
         tn_force_delete_on_inuse => {
             title => 'Force Delete When In Use',
-            description => 'Temporarily logout the target on this node to force delete when TrueNAS reports "target is in use".',
+            description => 'Temporarily logout the target on this node to force delete when TrueNAS reports "target is in use". NOT hardened and not recommended: on NVMe/TCP the retry after the disconnect accepts an empty namespace query as "namespace absent", and the compensating reconnect is best effort. See wiki/Known-Limitations.md.',
             type => 'boolean',
             default => 'false',
         },

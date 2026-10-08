@@ -62,6 +62,21 @@ truenas-proxmox-plugin (1:2.1.23+deb1+idk23) unstable; urgency=medium
     siendo necesaria como segunda defensa y NO debe quitarse. Etiqueta de
     release: v2.1.23-deb1+idk23.
 
+  * tn_force_delete_on_inuse (opt-in, off by default) NO esta endurecido y NO se
+    recomienda activarlo. Cerrado en idk23: no desconecta con dispositivos en
+    uso ni con un recuento desconocido o vacio, y no destruye el dataset si el
+    namespace sigue exportado. Abierto: (1) el reintento tras la desconexion usa
+    _nvme_delete_namespace, que acepta una consulta vacia como "namespace
+    ausente" y puede seguir al borrado del dataset; (2) la reconexion
+    compensatoria es best effort (se loguea a nivel 0 si falla). Backlog idk24:
+    "lista vacia = desconocida tambien en el camino normal de
+    _nvme_delete_namespace/free" y "primer intento de borrado sin guarda de
+    deadline".
+
+  * Verificacion de despliegue: dos builds comparten la version
+    1:2.1.23+deb1+idk23. Instalar con `dpkg -i` y comparar el md5 del .pm
+    instalado con el del .deb antes de dar el nodo por actualizado.
+
  -- Alfonso Kuen <alfonsok@gmail.com>  Thu, 08 Oct 2026 12:00:00 +0000
 
 truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium

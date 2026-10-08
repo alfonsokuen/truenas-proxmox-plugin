@@ -733,6 +733,13 @@ tn_nvme_keep_alive_tmo 5
 
 When enabled, forces iSCSI target logout if volume deletion fails due to "target in use" errors.
 
+> **Not hardened - do not enable it on a production cluster.** On NVMe/TCP the
+> retry after the subsystem disconnect goes through the namespace-delete helper,
+> which accepts an empty `nvmet.namespace.query` answer as "namespace absent", so
+> a transient empty answer can let the free continue to the dataset delete while
+> the namespace is still exported. The reconnect that follows a failed retry is
+> best effort. Details and the idk24 backlog: [Known-Limitations.md](Known-Limitations.md#tn_force_delete_on_inuse-is-not-hardened).
+
 ```ini
 tn_force_delete_on_inuse 1
 ```

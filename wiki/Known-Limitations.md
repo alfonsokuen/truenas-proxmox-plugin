@@ -190,6 +190,26 @@ is not in use (`grep -rl <clone-or-volume-name> /etc/pve/nodes/*/{qemu-server,lx
 rc=1 means no reference, rc=2 means it could not look). Destroy the clone first, then
 the snapshot (`zfs destroy`), then run the backup again.
 
+### `tn_force_delete_on_inuse` is not hardened
+
+Opt-in, off by default, and **not recommended**. From idk23 the NVMe/TCP path
+refuses to destroy a dataset whose namespace could not be removed, treats an
+unknown or empty namespace count as "shared", and never disconnects with a
+device in use. Two gaps remain:
+
+1. The retry after the disconnect uses the namespace-delete helper
+   (`_nvme_delete_namespace`), which accepts an empty query answer as "namespace
+   absent". TrueNAS can answer `nvmet.namespace.query` with an empty list
+   transiently under load, so the free can go on to the dataset delete with the
+   namespace still exported.
+2. The reconnect after a failed retry is best effort: if it fails it is logged
+   at level 0 and named in the error, and `status()` repairs the paths on its
+   next poll, but until then the node may have none.
+
+Backlog for idk24: an empty list must mean "unknown" on the normal path of
+`_nvme_delete_namespace` and the free as well, and the first dataset-delete
+attempt needs a deadline guard like the retries have.
+
 ### DH-HMAC-CHAP: generate the key with `nvme gen-dhchap-key`
 
 For NVMe/TCP in-band authentication (`tn_nvme_dhchap_secret` /
