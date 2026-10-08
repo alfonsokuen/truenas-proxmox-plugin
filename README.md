@@ -111,19 +111,28 @@ Manual repository setup, and the signing key
 
 This fork publishes its builds as release assets on
 `github.com/alfonsokuen/truenas-proxmox-plugin`. GitHub rewrites `~` in asset
-names (the `.deb` is served as `…_2.1.23.alpha1+idkN_all.deb`), so download it
-to its original name for `sha256sum -c` to match:
+names (a `.deb` whose version has a `~`, such as idk22's, is served as
+`…_2.1.23.beta8+idk22_all.deb`). From idk23 on the version is
+`2.1.23+deb1+idk23` - no `~` - so the asset keeps its name and the download
+needs no renaming:
 
 ```bash
-V=2.1.23~beta8+idk22
-B=https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/download/v2.1.23-beta8+idk22
-wget -O "truenas-proxmox-plugin_${V}_all.deb" "$B/truenas-proxmox-plugin_2.1.23.beta8+idk22_all.deb"
+V=2.1.23+deb1+idk23
+B=https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/download/v2.1.23-deb1+idk23
+wget "$B/truenas-proxmox-plugin_${V}_all.deb"
 wget "$B/SHA256SUMS"
 sha256sum -c SHA256SUMS
 apt install "./truenas-proxmox-plugin_${V}_all.deb"
 ```
 
-> **Rolling upgrade to idk22:** do not write the new `storage.cfg` keys
+idk23 is built on upstream's stable `2.1.23+deb1`. Upstream also names its
+release `2.1.23+deb1`, but the fork's package carries the epoch `1:`
+(`1:2.1.23+deb1+idk23`), which is what keeps it above upstream's: without the
+epoch, `+deb1` would sort above idk22's `~beta8`. Keep the `Pin-Priority -1`
+on upstream's origin described in the [Installation Guide](wiki/Installation.md)
+anyway.
+
+> **Rolling upgrade to idk22 (still applies when coming from idk21):** do not write the new `storage.cfg` keys
 > (`tn_use_cluster_lock`, `tn_device_ready_retries`, or a `tn_api_host` in
 > bracketed-IPv6 / portal-dns form) until all three nodes run idk22. Measured
 > in the lab: idk21 does NOT drop the section; it discards that one unknown key

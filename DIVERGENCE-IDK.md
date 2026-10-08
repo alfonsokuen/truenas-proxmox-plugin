@@ -1,7 +1,21 @@
 # Divergencia del fork IDK respecto a upstream (github.com/truenas/truenas-proxmox-plugin)
 
-Version instalada en pve1/pve2/pve3: `2.1.24~alpha1+idk6` + campana idk7 (v3..v6, 2026-08-23).
-Protegida con pin de APT (`/etc/apt/preferences.d/truenas-proxmox-plugin`, Pin-Priority -1).
+Version del arbol: `1:2.1.23+deb1+idk23`, sobre upstream **2.1.23+deb1** (estable). Los nodos en
+produccion corren idk22 hasta que se despliegue idk23. Los nodos llevan un pin de APT contra el
+origen de upstream (`/etc/apt/preferences.d`, `Pin: origin truenas.github.io`, Pin-Priority -1):
+se mantiene aunque el epoch `1:` ya gana la comparacion de versiones.
+
+> **Estado idk23 (2026-10-08).** Los PR #94 (portales NVMe/TCP), #95 (CHAP iSCSI), #97 (reintentos
+> acotados) y #111 (docs) YA ESTAN EN UPSTREAM (2.1.23~beta11 / 2.1.23+deb1): dejan de ser
+> divergencia. Lo que sigue en este fichero describe el historial; la divergencia VIGENTE es lo
+> que upstream no tiene: secretos fuera de storage.cfg, lock CFS siempre tomado, guarda de
+> dispositivos en uso, borrados fail-closed, volume_import bajo lock, cloud-init con el volname de
+> idk21, import-snapshots, cap de I/O + udev, presupuestos de API ACTIVOS por defecto
+> (`tn_api_budget_s` 120, `tn_op_budget_s`, `tn_status_budget_s` 8; upstream deja el presupuesto
+> opt-in y sin tope de status), curacion del nodo rechazado, redaccion DH-HMAC-CHAP, install-idk.sh
+> y repo APT firmado. Solapes resueltos al integrar 2.1.23+deb1: #123 (una sola via de reintento,
+> `_delete_dataset_with_retry` + `verify_gone`), #124 (adoptado), #125 (adoptado), lvm-filter
+> (adoptado, opt-in). Detalle en la entrada idk23 de `debian/changelog`.
 
 ## Serie idk6 (previa, ya en este arbol)
 - Hot-publish de namespaces en TrueNAS 25.10.4 (el bloqueo que upstream resolvia "esperar a 26.04").
@@ -69,7 +83,7 @@ El arbol del fork lleva, ademas de idk6/7/8, TRES capas previas sin serie propia
 de portales desde status() (`_nvme_connect(repair=>1)` en cada poll). El "2.1.24~alpha1" base
 fue bump PROPIO (la alpha upstream mas nueva es 2.1.23-alpha34) — estas capas son nuestras.
 
-## PRs/issues upstream (estado 2026-08-26)
+## PRs/issues upstream (estado 2026-08-26; #94/#95/#97/#111 fusionados el 2026-10-08)
 - PR #95 (OPEN): fixes CHAP iSCSI (idk8+idk8b).
 - Issue #96: bug del target nvmet (sc 0x6 en I/O 6-32MB bajo carga) + mitigacion max_sectors_kb.
 - PR #97 (OPEN): resiliencia con budget opt-in — port de idk7 piezas 1/3/5/6 + prerrequisitos

@@ -86,6 +86,14 @@ coexist without either being removed.
 
 ### Pinning policy on a node that runs the fork
 
+Since upstream's 2.1.23+deb1 (October 2026) upstream's stable APT repository
+serves a package that is also called `2.1.23+deb1`. The fork's `idk23` is
+`1:2.1.23+deb1+idk23`: the `1:` epoch is what keeps it above upstream's, and
+`1:2.1.23~beta8+idk22` (idk22) below it, whichever repositories are configured.
+This is checked with `dpkg --compare-versions`, and by an `apt-cache policy` run
+against two throwaway repositories (see `debian/changelog`). The pin below is
+a second line of defence, not a replacement for the epoch: keep it.
+
 A node that had only the release `.deb` often carries this, to stop a routine
 upgrade from replacing the local build with upstream's package:
 

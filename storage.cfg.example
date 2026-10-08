@@ -291,7 +291,7 @@ truenasplugin: truenas-soho
 # - NVMe/TCP and iSCSI cannot be mixed on same storage ID
 #
 # Resilience:
-# - tn_api_budget_s: wall-clock cap for one retry sequence (unset = unbounded by tn_api_retry_max only, as always)
+# - tn_api_budget_s: wall-clock cap for one retry sequence (this fork: default 120 s; upstream leaves it unset)
 # - tn_status_probe_backoff_s: suppress re-probing a just-failed array (default 30s; 0 = always probe)
 #
 # Monitoring:
