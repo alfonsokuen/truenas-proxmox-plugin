@@ -65,6 +65,16 @@ for my $m ('ebusy', 'masked') {
     like($settle // '', qr/--timeout=(?:[1-9]|10)\b/, '  ...settle bounded (<= 10 s) even with plenty of budget');
 }
 
+# The stop messages say the real attempt count and why it stopped, whichever path.
+{
+    my ($ok, $err) = teardown('ebusy', time() - 5);
+    like($err, qr/after 1 attempt\(s\)/, 'busy + deadline spent before the first retry: says 1 attempt');
+    like($err, qr/deadline/, '  ...and that the deadline cut it');
+    ($ok, $err) = teardown('ebusy', undef);
+    like($err, qr/after 3 attempt\(s\) \(retries exhausted\)/, 'busy, no deadline: 3 attempts, retries exhausted');
+    unlike($err, qr/deadline/, '  ...and does not blame a deadline');
+}
+
 # The backoff itself can cross the deadline: the check before sleeping passes
 # (1 s left), the wait takes longer, and the next attempt would start AFTER the
 # deadline. A stub that really waits 2 s stands in for a backoff longer than the

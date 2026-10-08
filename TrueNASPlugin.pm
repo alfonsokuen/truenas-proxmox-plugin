@@ -3165,7 +3165,14 @@ sub _delete_dataset_with_retry {
               . "  verification failure: $check_err";
         }
 
-        # Otherwise, this is a real error
+        # Otherwise, this is a real error. For a busy dataset say how many attempts
+        # really happened and why the retrying stopped, as the other stop paths do.
+        if ($error_info->{type} eq 'busy') {
+            chomp(my $busy_cause = $err);
+            my $stop = ($attempt < $max_retries)
+                ? 'the deadline was spent before the next retry' : 'retries exhausted';
+            die "Dataset $full_ds still busy; stopped after $attempt attempt(s) ($stop): $busy_cause\n";
+        }
         die $err;
     }
 
