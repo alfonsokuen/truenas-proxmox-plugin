@@ -41,6 +41,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [tn_nvme_ctrl_loss_tmo](#tn_nvme_ctrl_loss_tmo)
   - [tn_nvme_reconnect_delay](#tn_nvme_reconnect_delay)
   - [tn_nvme_keep_alive_tmo](#tn_nvme_keep_alive_tmo)
+  - [tn_nvme_manage_ports](#tn_nvme_manage_ports)
 - [iSCSI Behavior](#iscsi-behavior)
   - [tn_force_delete_on_inuse](#tn_force_delete_on_inuse)
   - [tn_logout_on_free](#tn_logout_on_free)
@@ -579,6 +580,46 @@ seconds to move out of `live`.
 ```ini
 tn_nvme_keep_alive_tmo 5
 ```
+
+### `tn_nvme_manage_ports`
+**Description**: Whether the plugin manages nvmet port + port_subsys records
+**Type**: Boolean (0 or 1)
+**Default**: `1`
+
+With the default `1`, the plugin creates an `nvmet.port` and
+`nvmet.port_subsys` record for every portal listed in
+`tn_discovery_portal`/`tn_portals`, matching the schema the plugin was
+originally designed around (single-head TrueNAS).
+
+Set to `0` for a TrueNAS HA pair with NVMe/TCP. On 25.10.x, the
+middleware's nvmet `map_attrs` only accepts the VIP as an
+`addr_traddr`; a physical-IP port record triggers a `KeyError` that
+aborts `write_config()` and leaves the subsystem's namespaces
+unrendered in configfs. With `tn_nvme_manage_ports 0`, the plugin
+leaves `nvmet.port.*` to the admin, who pre-provisions exactly one
+port record pointing at the VIP:
+
+```bash
+midclt call nvmet.subsys.create '{"name":"ha-nvme","allow_any_host":true}'
+midclt call nvmet.port.create   '{"addr_trtype":"TCP","addr_traddr":"<VIP>","addr_trsvcid":4420}'
+midclt call nvmet.port_subsys.create '{"port_id":<N>,"subsys_id":<M>}'
+```
+
+TrueNAS renders that one port on both controllers (each binding its
+own physical IP, advertising its ANA state); the kernel's NVMe
+multipath handles failover. `tn_discovery_portal` should still name a
+physical IP so `nvme discover` can walk the subsystem's
+`xport_referral` list and connect every path.
+
+```ini
+tn_nvme_manage_ports 0
+```
+
+The plugin still manages the subsystem lookup, the namespace
+lifecycle, and the initiator-side connect. If `tn_nvme_manage_ports`
+is `0` and the subsystem named by `tn_subsystem_nqn` does not exist,
+the plugin refuses to create it and prints the three `midclt` calls
+above.
 
 ## iSCSI Behavior
 
