@@ -1324,7 +1324,7 @@ is_idk_fork_install() {
     # The fork's own APT source is proof on its own: a failing dpkg-query (db
     # locked, package half-configured) must not turn a fork node into one that
     # would fetch upstream's releases.
-    [[ -f "$APT_SOURCES_PATH_IDK" ]] && return 0
+    [[ -s "$APT_SOURCES_PATH_IDK" ]] && return 0    # non-empty: an empty file proves nothing
     v=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || return 1
     # +idkNN, also behind upstream's own suffix (+deb1+idkNN)
     [[ "$v" =~ \+idk[0-9]+ ]]

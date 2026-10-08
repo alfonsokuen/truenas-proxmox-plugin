@@ -56,8 +56,20 @@ like($out, qr/NETWORK/, 'no sources file and no installed package: not a fork no
 open(my $fh, '>', $idk_src) or die; close $fh;
 $out = run_fn('1:2.1.23~beta8+idk22', 'get_install_source');
 like($out, qr/^apt$/m, "the fork's -idk.sources counts as an APT install");
+# An EMPTY file at that path proves nothing (touched by hand, truncated): with
+# dpkg-query failing too, nothing says fork, so it must not block the lookup;
+# and if dpkg-query does say +idk, that alone still blocks.
+$out = run_fn(undef, 'if github_api_call /releases/latest; then echo RC=0; else echo RC=1; fi');
+like($out, qr/NETWORK/, 'empty -idk.sources and dpkg-query failing: not proof of a fork node');
+$out = run_fn('1:2.1.23+deb1+idk23', 'if github_api_call /releases/latest; then echo RC=0; else echo RC=1; fi');
+unlike($out, qr/NETWORK/, 'empty -idk.sources but dpkg-query says +idk: still a fork node');
 # dpkg-query failing (database locked, package half-configured) on a node that
 # has the fork's APT source must still be a fork node: the source file is proof.
+open(my $sf, '>', $idk_src) or die;
+print $sf "Types: deb
+URIs: https://alfonsokuen.github.io/truenas-proxmox-plugin/apt
+";
+close $sf;
 $out = run_fn(undef, 'if github_api_call /releases/latest; then echo RC=0; else echo RC=1; fi');
 unlike($out, qr/NETWORK/, '-idk.sources present, dpkg-query failing: no request goes to upstream GitHub');
 like($out, qr/RC=1/, '  ...and the lookup fails instead of pretending');
