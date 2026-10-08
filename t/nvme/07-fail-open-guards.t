@@ -93,7 +93,10 @@ my $wait_result;  # what the stubbed job wait reports; default is a timeout
         # One namespace, pointing at our zvol.
         return [ { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0' } ]
             if $method eq 'nvmet.namespace.query';
-        return [] if $method eq 'nvmet.subsys.query';
+        # A real subsystem: the namespace under test exists, so an empty answer here
+        # would be a transient glitch, not a clean zero (see _free_image_nvme).
+        return [ { id => 7, subnqn => 'nqn.2011-06.com.example:test' } ]
+            if $method eq 'nvmet.subsys.query';
         # The clone lookup: default is a well-formed empty answer, i.e. a
         # base image with no clones. Cases override it deliberately.
         return [] if $method eq 'pool.dataset.query';
@@ -300,24 +303,26 @@ my $BASE_VOL = 'vol-base-9001-disk-0-nsfeedface1234';   # zname base-9001-disk-0
         },
     );
     is(disconnects($calls), 0, 'three known namespaces: no subsystem disconnect');
-    # This pins today's behaviour: the > 1 branch still falls through to the
-    # force destroy with the namespace attached. That residual is documented
-    # in failopen.patch.md as out of scope; when it is fixed, flip these two.
-    ok($ok, '...the free itself currently still succeeds') or diag("died with: $err");
-    ok(destroyed($calls), '...and currently still destroys the dataset');
+    # The namespace delete failed "in use" and nothing was disconnected: the
+    # namespace is STILL EXPORTED, so the free must stop before the dataset
+    # (it used to fall through to the force destroy under a live export).
+    ok(!$ok, '...and the free fails closed') or diag("it succeeded");
+    like($err, qr/namespace still exported/, '...saying the namespace is still exported');
+    ok(!destroyed($calls), '...and the dataset is NOT destroyed');
 }
 
 # ---------------------------------------------------------------------------
 # Defect B control: the known last namespace still disconnects, both worlds
 # ---------------------------------------------------------------------------
 
-# Subsystem lookup answers cleanly with nothing: count is a known zero, the
+# One namespace left (a known count of one): the
 # operator opted into force_delete_on_inuse, and the disconnect-and-retry
 # machinery must keep working or the option is dead.
 {
+    my $tries = 0;    # the delete fails "in use" the first time, works after the disconnect
     my ($ok, $err, $calls) = run_free_nvme(
         scfg => { tn_force_delete_on_inuse => 1 },
-        fail => { 'nvmet.namespace.delete' => "Namespace is in use\n" },
+        ret  => { 'nvmet.namespace.delete' => sub { die "Namespace is in use\n" if ++$tries == 1; 1 } },
     );
     is(disconnects($calls), 1, 'a known last namespace still disconnects to retry');
     ok($ok, '...and the free completes') or diag("died with: $err");

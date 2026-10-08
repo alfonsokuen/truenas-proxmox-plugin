@@ -11182,19 +11182,20 @@ sub _free_image_nvme {
             my $subsystems = _api_call($scfg, 'nvmet.subsys.query',
                 [[ ["subnqn", "=", $nqn] ]]);
 
-            die "nvmet.subsys.query returned a non-list answer
-" if ref($subsystems) ne 'ARRAY';
-            # A clean empty answer is a known zero (no such subsystem), not unknown.
-            $active_ns_count = 0 if !@$subsystems;
-            if (@$subsystems) {
+            die "nvmet.subsys.query returned a non-list answer\n" if ref($subsystems) ne 'ARRAY';
+            # The namespace is KNOWN to exist (its delete just said "in use"), so an
+            # empty list is not "zero": namespace.query is documented to answer
+            # empty transiently under load. Unknown => assume shared.
+            die "nvmet.subsys.query returned an empty list although the namespace exists\n" if !@$subsystems;
+            {
                 my $subsys_id = $subsystems->[0]{id};
                 # Count all namespaces in this subsystem. Query results nest the
                 # subsystem under 'subsys.id' (the 'subsys_id' form is create-only
                 # input), so filter on 'subsys.id'.
                 my $namespaces = _api_call($scfg, 'nvmet.namespace.query',
                     [[ ["subsys.id", "=", $subsys_id] ]]);
-                die "nvmet.namespace.query returned a non-list answer
-" if ref($namespaces) ne 'ARRAY';
+                die "nvmet.namespace.query returned a non-list answer\n" if ref($namespaces) ne 'ARRAY';
+                die "nvmet.namespace.query returned an empty list although the namespace exists\n" if !@$namespaces;
                 $active_ns_count = scalar(@$namespaces);
             }
         };
@@ -11218,8 +11219,7 @@ sub _free_image_nvme {
         # undef/non-list answers (no exception) are unknown too, handled by the
         # dies inside the eval above.
         if ($count_err || !defined $active_ns_count) {
-            $count_err ||= "unknown
-";
+            $count_err ||= "unknown\n";
             chomp(my $count_msg = $count_err);
             _log($scfg, 0, 'warning',
                 "[TrueNAS] _free_image_nvme: skipping subsystem disconnect for $zname: "
@@ -11242,8 +11242,7 @@ sub _free_image_nvme {
                 die "[TrueNAS] refusing to destroy $full_ds: its namespace is still in use "
                   . "and the NVMe subsystem has device(s) in use on this node ("
                   . join(', ', @busy_devs) . "), so the disconnect-and-retry step was "
-                  . "skipped. Stop whatever uses them and retry.
-";
+                  . "skipped. Stop whatever uses them and retry.\n";
             }
             _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: disconnecting NVMe subsystem to retry namespace deletion (active namespaces: $active_ns_count)");
             _nvme_disconnect($scfg);
@@ -11256,8 +11255,14 @@ sub _free_image_nvme {
             eval {
                 _nvme_delete_namespace($scfg, $zname, $full_ds);
             };
-            if ($@) {
-                _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: could not delete namespace for $zname (may be in use by other cluster nodes)");
+            if (my $retry_err = $@) {
+                # The namespace is still exported. Carrying on would hand the
+                # dataset to the delete worker (force => true) under a live export.
+                _log($scfg, 0, 'warning', "[TrueNAS] _free_image_nvme: could not delete namespace for $zname after the disconnect: $retry_err");
+                eval { _nvme_connect($scfg) };    # do not leave the node cut off
+                die "[TrueNAS] refusing to destroy $full_ds: namespace still exported "
+                  . "(it could not be deleted even after disconnecting the subsystem; "
+                  . "it may be in use by another cluster node).\n  cause: $retry_err";
             } else {
                 # Reconnect after successful deletion
                 eval { _nvme_connect($scfg) };
@@ -11269,6 +11274,11 @@ sub _free_image_nvme {
             }
         } else {
             _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: skipping disconnect - $active_ns_count other namespaces active");
+            # Its delete failed "in use" and the subsystem is shared, so the
+            # namespace is still exported: the free stops here.
+            die "[TrueNAS] refusing to destroy $full_ds: namespace still exported "
+              . "(its delete failed as in use and the subsystem is shared with "
+              . "$active_ns_count namespaces, so no disconnect was attempted).\n";
         }
     }
 

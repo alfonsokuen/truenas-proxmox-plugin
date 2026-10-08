@@ -21,7 +21,7 @@ my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 my $scfg = { tn_dataset => 'tank/pve', tn_api_host => '198.51.100.7', tn_transport_mode => 'nvme-tcp',
              tn_subsystem_nqn => 'nqn.x:y', tn_force_delete_on_inuse => 1 };
 
-my ($ns_answer, $busy, $disconnects, $deletes, $ns_calls);
+my ($ns_answer, $subsys_answer, $busy, $disconnects, $deletes, $ns_calls, $retry_fails, $ds_deletes);
 {
     no strict 'refs'; no warnings 'redefine';
     *{"${PKG}::_log"} = sub { 1 };
@@ -35,10 +35,17 @@ my ($ns_answer, $busy, $disconnects, $deletes, $ns_calls);
     *{"${PKG}::sleep"} = sub { 1 };
     *{"${PKG}::_nvme_disconnect"} = sub { $disconnects++; 1 };
     *{"${PKG}::_nvme_subsystem_busy"} = sub { return $busy ? (1, '/dev/nvme0n1') : (0, '/dev/nvme0n1') };
-    *{"${PKG}::_nvme_delete_namespace"} = sub { $deletes++; die "[EBUSY] namespace is in use\n" if $deletes == 1; 1 };
+    *{"${PKG}::_nvme_delete_namespace"} = sub {
+        $deletes++;
+        die "[EBUSY] namespace is in use\n" if $deletes == 1 || $retry_fails;
+        1;
+    };
+    *{"${PKG}::_api_call_mutate"} = sub { $ds_deletes++ if $_[1] eq 'pool.dataset.delete'; 1 };
+    *{"${PKG}::_handle_api_result_with_job_support"} = sub { { success => 1, result => 1 } };
+    *{"${PKG}::_invalidate_status_capacity_cache"} = sub { 1 };
     *{"${PKG}::_api_call"} = sub {
         my ($s, $m) = @_;
-        return [ { id => 3 } ] if $m eq 'nvmet.subsys.query';
+        return $subsys_answer if $m eq 'nvmet.subsys.query';
         if ($m eq 'nvmet.namespace.query') { $ns_calls++; return $ns_answer; }
         return [];
     };
@@ -47,10 +54,13 @@ my ($ns_answer, $busy, $disconnects, $deletes, $ns_calls);
 sub run_free {
     my (%o) = @_;
     ($ns_answer, $busy) = ($o{ns}, $o{busy});
-    ($disconnects, $deletes, $ns_calls) = (0, 0, 0);
+    $subsys_answer = exists $o{subsys} ? $o{subsys} : [ { id => 3 } ];
+    $retry_fails = $o{retry_fails};
+    ($disconnects, $deletes, $ns_calls, $ds_deletes) = (0, 0, 0, 0);
     my $ok = eval {
-        $PKG->can('_free_image_nvme')->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-ns11111111-2222-3333-4444-555555555555',
+        my $w = $PKG->can('_free_image_nvme')->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-ns11111111-2222-3333-4444-555555555555',
             'vm-101-disk-0', 'tank/pve/vm-101-disk-0', '11111111-2222-3333-4444-555555555555');
+        $w->('UPID:t') if ref($w) eq 'CODE';
         1;
     };
     return ($ok, $@);
@@ -81,6 +91,38 @@ sub run_free {
 {
     my ($ok) = run_free(ns => [ { id => 1 }, { id => 2 } ], busy => 0);
     is($disconnects, 0, 'two namespaces -> shared subsystem, never disconnected');
+}
+
+# K3: the namespace is KNOWN to exist (its delete said "in use"). An empty list
+# from either query is therefore not "zero": it is documented to come back empty
+# transiently under load. Unknown => no disconnect, the free dies.
+{
+    my ($ok) = run_free(ns => [ { id => 1 } ], subsys => []);
+    ok(!$ok, 'empty nvmet.subsys.query although the namespace exists -> the free dies');
+    is($disconnects, 0, '  ...and NO nvme disconnect');
+    ($ok) = run_free(ns => []);
+    ok(!$ok, 'empty nvmet.namespace.query although the namespace exists -> the free dies');
+    is($disconnects, 0, '  ...and NO nvme disconnect');
+    is($ds_deletes, 0, '  ...and the dataset is not touched');
+}
+# K2: when the namespace could not be removed it is STILL EXPORTED: the dataset
+# must not be handed to the delete worker.
+{
+    my ($ok, $err) = run_free(ns => [ { id => 1 }, { id => 2 } ], busy => 0);
+    ok(!$ok, 'shared subsystem (2 namespaces), namespace delete failed -> the free dies');
+    like($err, qr/namespace still exported/, '  ...saying the namespace is still exported');
+    is($ds_deletes, 0, '  ...and NO dataset delete was issued');
+    is($disconnects, 0, '  ...and no disconnect');
+
+    ($ok, $err) = run_free(ns => [ { id => 1 } ], busy => 0, retry_fails => 1);
+    ok(!$ok, 'last namespace, disconnect done, retry still fails -> the free dies');
+    like($err, qr/namespace still exported/, '  ...saying the namespace is still exported');
+    is($ds_deletes, 0, '  ...and NO dataset delete was issued');
+    is($disconnects, 1, '  ...after exactly the one disconnect it had made');
+
+    ($ok, $err) = run_free(ns => [ { id => 1 } ], busy => 0);
+    ok($ok, 'retry succeeds -> the free continues as before') or diag($err);
+    is($ds_deletes, 1, '  ...and the dataset delete is issued');
 }
 
 done_testing;
