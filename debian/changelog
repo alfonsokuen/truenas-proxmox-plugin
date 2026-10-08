@@ -1,3 +1,33 @@
+truenas-proxmox-plugin (2.1.23+deb1) unstable; urgency=medium
+
+  * Promote 2.1.23~beta11 to 2.1.23+deb1 (stable). First stable
+    release of the 2.1.23 line after a thirty-six-alpha / eleven-beta
+    development cycle, following external validation from Max R.
+    Carrara (Proxmox VE team, 2026-09-02: "passes all testing at
+    their end") on alpha36, and a 20-iteration local run of Max's
+    storage-plugin-validation suite against truenas-storage on the
+    pve/proxmox2/pvevm1 cluster on 2026-10-07/08:
+
+      - 19 / 20 rounds PASS, 19 capabilities validated each (0 failed,
+        2 unsupported, 3 not tested for prerequisite reasons).
+      - 1 / 20 FAIL in round 17: three backup tests (backup_vm,
+        backup_ct, backup_running) hit their per-test 180s/300s
+        deadlines while a cron-scheduled nightly PBS backup held the
+        host-wide vzdump global lock. Not a plugin fault; the vzdump
+        tasks the test triggered all completed cleanly once the lock
+        was released. Rounds 18-20 (after the cron window) all PASS.
+
+    This stable also carries the four PRs from Alfonso Kuen Arroyo
+    merged in beta11 (NVMe/TCP portal reconcile hardening, iSCSI CHAP
+    against TrueNAS SCALE 25.10, bounded API retries while the array
+    is unreachable, and the Snapshots-on-TrueNAS best-practices
+    section). Credit lines appear in the per-item beta11 entry below.
+
+  * No functional changes from 2.1.23~beta11; version string and
+    changelog only.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 08 Oct 2026 02:00:00 -0400
+
 truenas-proxmox-plugin (2.1.23~beta11) unstable; urgency=medium
 
   * fix(#94): NVMe/TCP reconcile restores a portal that was down at
