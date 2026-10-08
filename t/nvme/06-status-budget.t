@@ -41,6 +41,13 @@ my $throw   = undef;  # error to throw from every API call
 {
     no strict 'refs';
     no warnings 'redefine';
+    # status() keeps a cross-process capacity stamp under /run/truenas-plugin
+    # (issue #106). Without this stub a run writes a stamp for the fake host,
+    # the next run inside the TTL reads it and makes no API call at all (a
+    # flaky "asked it something" assertion), and the test pollutes /run on
+    # whatever node it runs on.
+    *{"${PKG}::_read_status_stamp"}  = sub { undef };
+    *{"${PKG}::_write_status_stamp"} = sub { 1 };
     *{"${PKG}::_log"} = sub { 1 };
     # status() also reconciles NVMe portals; that path is pure sysfs and is
     # covered elsewhere. Stub it so this file measures the API side only.

@@ -47,6 +47,13 @@ my $THROTTLE_STATE = do { no strict 'refs'; \%{"${PKG}::_api_down_log_last"} };
     no warnings 'redefine';
     # THE fixture: capture, don't discard. Stubbing this to `sub { 1 }` is
     # exactly how the throttle went untested through two review rounds.
+    # status() keeps a cross-process capacity stamp under /run/truenas-plugin
+    # (issue #106). Without this stub a run writes a stamp for the fake host,
+    # the next run inside the TTL reads it and makes no API call at all (a
+    # flaky "asked it something" assertion), and the test pollutes /run on
+    # whatever node it runs on.
+    *{"${PKG}::_read_status_stamp"}  = sub { undef };
+    *{"${PKG}::_write_status_stamp"} = sub { 1 };
     *{"${PKG}::_log"} = sub { my (undef, $lvl, $sev, $msg) = @_;
                               push @LOG, { lvl => $lvl, sev => $sev, msg => $msg }; };
     *{"${PKG}::_nvme_check_cli"} = sub { 1 };
