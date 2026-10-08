@@ -22,7 +22,7 @@ plan skip_all => "bash not available" if system("command -v bash >/dev/null 2>&1
 my $tmp  = tempdir(CLEANUP => 1);
 my $bin  = "$tmp/bin";  make_path($bin);
 my $log  = "$tmp/calls.log";
-my @fake = qw(qm pvesm pct zfs nvme systemctl apt-get dpkg pvesh apt-cache udevadm curl wget ssh scp);
+my @fake = qw(qm pvesm pct zfs nvme systemctl apt-get dpkg pvesh apt-cache udevadm curl wget ssh scp hostname);
 for my $name (@fake) {
     open(my $f, '>', "$bin/$name") or die;
     print $f "#!/bin/sh\necho \"$name \$*\" >> '$log'\n" . ($name eq 'pvesm' ? 'if [ "$1" = list ]; then echo "Volid Format Type Size VMID"; fi' . "\n" : '') . "exit 0\n";

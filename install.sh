@@ -1321,7 +1321,12 @@ download_stdout() {
 # dropping the secrets-in-priv work; the fork updates through install-idk.sh.
 is_idk_fork_install() {
     local v
+    # The fork's own APT source is proof on its own: a failing dpkg-query (db
+    # locked, package half-configured) must not turn a fork node into one that
+    # would fetch upstream's releases.
+    [[ -f "$APT_SOURCES_PATH_IDK" ]] && return 0
     v=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || return 1
+    # +idkNN, also behind upstream's own suffix (+deb1+idkNN)
     [[ "$v" =~ \+idk[0-9]+ ]]
 }
 
@@ -3406,7 +3411,7 @@ run_diagnostics_bundle() {
 
         # Section 10: System info
         echo "=== System Information ==="
-        echo "Hostname: $(hostname)"
+        echo "Hostname: ${NODE_NAME:-unknown}"
         echo "Kernel: $(uname -r)"
         echo "Uptime: $(uptime)"
         echo "Memory:"
@@ -3544,7 +3549,10 @@ run_diagnostics_bundle() {
 # ============================================================================
 
 # Global test variables
-NODE_NAME=$(hostname)
+# Read, not exec'd: this runs at load, i.e. also for --help/--version, which
+# must not run any external command.
+NODE_NAME="${HOSTNAME:-}"
+[[ -r /proc/sys/kernel/hostname ]] && NODE_NAME=$(</proc/sys/kernel/hostname)
 TEST_VM_BASE=990
 TEST_VM_CLONE=991
 TEST_API_TIMEOUT=60
