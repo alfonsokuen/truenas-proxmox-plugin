@@ -40,6 +40,16 @@ like($out, qr/RC=1/, '  ...and the lookup fails instead of pretending');
 $out = run_fn('2.1.23~beta8', 'if github_api_call /releases/latest; then echo RC=0; else echo RC=1; fi');
 like($out, qr/NETWORK/, 'upstream build: the lookup still happens (guard is fork-only)');
 
+# idk23 onward: the fork version embeds upstream's own "+deb1" suffix
+# (1:2.1.23+deb1+idk23). The guard keys on +idkN, so it must still fire on it,
+# and upstream's stable 2.1.23+deb1 (which also contains a '+') must not be
+# mistaken for a fork build.
+$out = run_fn('1:2.1.23+deb1+idk23', 'if github_api_call /releases/latest; then echo RC=0; else echo RC=1; fi');
+unlike($out, qr/NETWORK/, 'idk23 (1:2.1.23+deb1+idk23): no request goes to upstream GitHub');
+like($out, qr/RC=1/, '  ...and the lookup fails instead of pretending');
+$out = run_fn('2.1.23+deb1', 'if github_api_call /releases/latest; then echo RC=0; else echo RC=1; fi');
+like($out, qr/NETWORK/, "upstream's stable 2.1.23+deb1 is not a fork build: the lookup still happens");
+
 open(my $fh, '>', $idk_src) or die; close $fh;
 $out = run_fn('1:2.1.23~beta8+idk22', 'get_install_source');
 like($out, qr/^apt$/m, "the fork's -idk.sources counts as an APT install");

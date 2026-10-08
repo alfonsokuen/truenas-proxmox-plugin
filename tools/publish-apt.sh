@@ -52,12 +52,15 @@
 # shellcheck disable=SC2029
 set -euo pipefail
 
-# idk12..idk21 were cut from upstream 2.1.23~alpha1, idk22 onward from
-# 2.1.23~beta8; the release tag carries the upstream base it was cut from.
+# idk12..idk21 were cut from upstream 2.1.23~alpha1, idk22 from 2.1.23~beta8,
+# idk23 onward from the stable 2.1.23+deb1; the release tag carries the
+# upstream base it was cut from.
 base_version_for() {
     local n="${1#idk}"
-    case "$n" in ''|*[!0-9]*) echo '2.1.23-beta8'; return ;; esac
-    if [ "$n" -le 21 ]; then echo '2.1.23-alpha1'; else echo '2.1.23-beta8'; fi
+    case "$n" in ''|*[!0-9]*) echo '2.1.23-deb1'; return ;; esac
+    if [ "$n" -le 21 ]; then echo '2.1.23-alpha1'
+    elif [ "$n" -eq 22 ]; then echo '2.1.23-beta8'
+    else echo '2.1.23-deb1'; fi
 }
 VAULT_KEY='apt_signing_truenas_plugin'
 MIN_REVISION=15          # idk15 is the first revision worth serving
