@@ -1,3 +1,69 @@
+truenas-proxmox-plugin (1:2.1.23+deb1+idk23) unstable; urgency=medium
+
+  * Base: integra upstream 2.1.23+deb1 (estable; = beta11 promovida). Trae
+    beta9 (#123 desmontaje del clon de snapshot con reintento acotado,
+    validador PGP de install.sh, docs), beta10 (#124 anclaje final de IQN/NQN,
+    #4 lvm-filter tambien rechaza LUNs iSCSI por by-path, #125 el healthcheck
+    busca el zvol weight canonico) y beta11, que FUSIONA los PR del fork #94
+    (reconciliacion de portales NVMe/TCP + su endurecimiento), #95 (CHAP iSCSI
+    contra TrueNAS 25.10), #97 (reintentos acotados con la API caida) y #111
+    (docs de consistencia). Esos cambios dejan de ser divergencia: donde el
+    fork llevaba la misma pieza se adopta la de upstream.
+
+  * Se conserva todo lo propio del fork (superconjunto de lo que upstream
+    fusiono): secretos fuera de storage.cfg (sensitive-properties, hooks,
+    migrate-secrets), lock CFS siempre tomado, guarda fail-closed de
+    dispositivos en uso, borrados fail-closed, volume_import bajo lock,
+    import-snapshots, cap de I/O + udev, presupuestos de API con su default
+    (tn_api_budget_s 120, tn_op_budget_s, tn_status_budget_s), curacion del
+    nodo rechazado, redaccion de secretos DH-HMAC-CHAP, install-idk.sh y el
+    repo APT firmado, postinst, debian/rules.
+
+  * Solape #123 (desmontaje del clon): UNA sola via de reintento,
+    _delete_dataset_with_retry. Se le anade la barrera `udevadm settle` y,
+    solo para el clon, una relectura tras un "borrado correcto"
+    (verify_gone): TrueNAS 26.0 BETA.36 puede contestar "deleted" con el zvol
+    vivo, y eso ahora es un fallo visible ("TN masked EBUSY"), no un exito.
+    NO se adopta la escalera de 5 pasos de upstream porque daba por borrado un
+    mensaje "does not exist" sin confirmarlo y una relectura vacia; aqui la
+    ausencia solo la prueba un error ENOENT del array. EBUSY permanente =>
+    error con la causa; clon ya inexistente confirmado => idempotente.
+    volume_snapshot_delete ahora se niega a borrar el snapshot origen si el
+    desmontaje del clon falla (comportamiento de upstream) y deja en el log,
+    a nivel error, el dataset exacto huerfano.
+
+  * _is_retryable_error: orden de upstream (los errores autoritativos EBUSY,
+    EINVAL, auth, not-found, "dependent clones" antes de la heuristica de
+    conexion). Efecto a vigilar: un EBUSY ya no se reintenta en la capa
+    generica; lo reintenta quien sabe hacerlo (el borrado de dataset).
+
+  * #124: se adopta el ancla final (?![\w.:-]) de IQN en todos los
+    comparadores iSCSI, y _portal_connected la conserva sobre la
+    coincidencia por portal con nombre de host del fork. Los comparadores de
+    NQN NVMe leen sysfs con `eq` y no tienen el problema.
+
+  * #4 / #125: tools/truenas-plugin-lvm-filter y el healthcheck de install.sh
+    son los de upstream, sin cambios (el empaquetado ya instala el filtro en
+    /usr/sbin; sigue siendo opt-in, el postinst no lo ejecuta).
+
+  * Tests: t/rate-limit/13 (Fix A) reescrito para el motor del fork, con casos
+    fail-closed; t/nvme/05 afirma el presupuesto de status por defecto (8 s)
+    del fork en vez de "sin deadline"; t/nvme/32 relee el clon; t/nvme/01 une
+    los casos de upstream (IPv6, nombres que resuelven, portal malformado) con
+    los del fork (nodo rechazado); t/installer/06 fija el mapa de etiquetas.
+
+  * Version y APT: 1:2.1.23+deb1+idk23. El epoch 1 se mantiene porque
+    upstream sirve ahora "2.1.23+deb1" en su repo estable: sin epoch su
+    "+deb1" ordenaria por ENCIMA de "2.1.23~beta8+idk22" (la tilde ordena por
+    debajo) y un `apt upgrade` pisaria el fork. Con epoch 1:
+      1:2.1.23+deb1+idk23 > 1:2.1.23~beta8+idk22 > 2.1.23+deb1
+    (verificado con dpkg --compare-versions). La prioridad -1 del origen de
+    upstream (/etc/apt/preferences.d, Pin: origin truenas.github.io) sigue
+    siendo necesaria como segunda defensa y NO debe quitarse. Etiqueta de
+    release: v2.1.23-deb1+idk23.
+
+ -- Alfonso Kuen <alfonsok@gmail.com>  Thu, 08 Oct 2026 12:00:00 +0000
+
 truenas-proxmox-plugin (1:2.1.23~beta8+idk22) unstable; urgency=medium
 
   * Base: integra upstream 2.1.23~beta8 (beta1..beta8: install.sh con corte a
