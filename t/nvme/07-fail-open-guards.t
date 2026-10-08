@@ -69,6 +69,9 @@ my $wait_result;  # what the stubbed job wait reports; default is a timeout
     *{"${PKG}::_nvme_disconnect"}   = sub { push @calls, 'nvme_disconnect'; 1 };
     *{"${PKG}::_nvme_connect"}      = sub { push @calls, 'nvme_connect'; 1 };
     *{"${PKG}::run_command"}        = sub { 1 };
+    # The disconnect is now gated on the subsystem having no device in use; that
+    # looks at the host's real sysfs, which a unit test must not depend on.
+    *{"${PKG}::_nvme_subsystem_busy"} = sub { (0) };
 
     # The job wait is the API layer's time domain: driving the real one
     # through a RUNNING job would make this file sleep for the full

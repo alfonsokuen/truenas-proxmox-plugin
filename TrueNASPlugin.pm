@@ -11175,9 +11175,9 @@ sub _free_image_nvme {
 
             die "nvmet.subsys.query returned a non-list answer
 " if ref($subsystems) ne 'ARRAY';
-            die "subsystem $nqn not found on the array
-" if !@$subsystems;
-            {
+            # A clean empty answer is a known zero (no such subsystem), not unknown.
+            $active_ns_count = 0 if !@$subsystems;
+            if (@$subsystems) {
                 my $subsys_id = $subsystems->[0]{id};
                 # Count all namespaces in this subsystem. Query results nest the
                 # subsystem under 'subsys.id' (the 'subsys_id' form is create-only
