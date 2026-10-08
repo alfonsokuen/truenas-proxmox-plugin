@@ -3028,6 +3028,36 @@ sub _confirm_dataset_gone {
 # present = the delete was masked (TN 26.0 BETA.36), handled like "busy"; only
 # an ENOENT-class answer from the array confirms it is gone, anything else
 # (empty answer, transport error) dies - an unconfirmed absence is not success.
+# Seconds left on the outer API deadline, or undef when none stands.
+sub _deadline_left {
+    return undef if !defined $_api_deadline;
+    return $_api_deadline - time();
+}
+
+# Sleep for a retry backoff without outliving the deadline (a test seam too).
+sub _backoff_sleep {
+    my ($delay) = @_;
+    my $left = _deadline_left();
+    $delay = $left if defined($left) && $delay > $left;
+    select(undef, undef, undef, $delay) if $delay > 0;
+}
+
+# True while a retry may still START: no deadline, or time left on it.
+sub _retry_time_left {
+    my $left = _deadline_left();
+    return !defined($left) || $left > 0;
+}
+
+# udevadm settle bounded by the deadline (min 1 s, never the 120 s default):
+# a settle inside the storage lock must not outlive the operation's budget.
+sub _udev_settle_bounded {
+    my $left = _deadline_left();
+    my $t = defined($left) ? int($left) : 10;
+    $t = 10 if $t > 10;
+    $t = 1 if $t < 1;
+    eval { run_command(['udevadm', 'settle', "--timeout=$t"], outfunc => sub {}, errfunc => sub {}) };
+}
+
 sub _delete_dataset_with_retry {
     my ($scfg, $full_ds, $max_retries, $opts) = @_;
     $max_retries //= DATASET_DELETE_RETRY_COUNT;
@@ -3056,10 +3086,10 @@ sub _delete_dataset_with_retry {
             if ($still_there) {
                 my $masked = "pool.dataset.delete reported success but "
                     . "pool.dataset.get_instance still finds $full_ds (TN masked EBUSY)";
-                if ($attempt < $max_retries) {
+                if ($attempt < $max_retries && _retry_time_left()) {
                     my $delay = 2 ** ($attempt - 1);
                     _log($scfg, 1, 'warning', "[TrueNAS] $masked; retrying in ${delay}s ($attempt/$max_retries)");
-                    select(undef, undef, undef, $delay);
+                    _backoff_sleep($delay);
                     next;
                 }
                 die "$masked after $max_retries attempts
@@ -3085,10 +3115,10 @@ sub _delete_dataset_with_retry {
         }
 
         # If busy and more retries available, wait and retry
-        if ($error_info->{type} eq 'busy' && $attempt < $max_retries) {
+        if ($error_info->{type} eq 'busy' && $attempt < $max_retries && _retry_time_left()) {
             my $delay = 2 ** ($attempt - 1);  # Exponential backoff: 1s, 2s, 4s
             _log($scfg, 1, 'info', "[TrueNAS] Dataset busy, retrying in ${delay}s... ($err)");
-            select(undef, undef, undef, $delay);
+            _backoff_sleep($delay);
             next;
         }
 
@@ -12667,7 +12697,7 @@ sub _teardown_snapshot_device {
     # verify_gone: TrueNAS 26.0 BETA.36 can answer pool.dataset.delete with
     # success while the zvol is still live (a holder has the device open), so
     # for the clone a "success" is confirmed by reading the dataset back.
-    eval { run_command(['udevadm','settle'], outfunc=>sub{}, errfunc=>sub{}) };
+    _udev_settle_bounded();
     eval { _delete_dataset_with_retry($scfg, $clone_full, undef, { verify_gone => 1 }) };
     if (my $err = $@) {
         die "[TrueNAS] _teardown_snapshot_device: could not delete the snapshot clone $clone_full: $err";
