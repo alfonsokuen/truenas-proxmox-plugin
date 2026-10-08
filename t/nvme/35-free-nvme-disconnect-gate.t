@@ -21,19 +21,19 @@ my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 my $scfg = { tn_dataset => 'tank/pve', tn_api_host => '198.51.100.7', tn_transport_mode => 'nvme-tcp',
              tn_subsystem_nqn => 'nqn.x:y', tn_force_delete_on_inuse => 1 };
 
-my ($ns_answer, $subsys_answer, $busy, $disconnects, $deletes, $ns_calls, $retry_fails, $ds_deletes);
+my ($ns_answer, $subsys_answer, $busy, $disconnects, $deletes, $ns_calls, $retry_fails, $ds_deletes, @events, @log0, $connect_dies);
 {
     no strict 'refs'; no warnings 'redefine';
-    *{"${PKG}::_log"} = sub { 1 };
+    *{"${PKG}::_log"} = sub { push @log0, $_[3] if $_[1] == 0; 1 };
     *{"${PKG}::_defer_after_lock"} = sub { 1 };
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_verify_devices_disconnected"} = sub { 1 };
     *{"${PKG}::_nvme_find_device_by_subsystem"} = sub { undef };
     *{"${PKG}::_assert_no_child_datasets"} = sub { 1 };
-    *{"${PKG}::_nvme_connect"} = sub { 1 };
+    *{"${PKG}::_nvme_connect"} = sub { push @events, 'connect'; die "nvme connect failed: Connection timed out\n" if $connect_dies; 1 };
     *{"${PKG}::usleep"} = sub ($) { 1 };
     *{"${PKG}::sleep"} = sub { 1 };
-    *{"${PKG}::_nvme_disconnect"} = sub { $disconnects++; 1 };
+    *{"${PKG}::_nvme_disconnect"} = sub { $disconnects++; push @events, 'disconnect'; 1 };
     *{"${PKG}::_nvme_subsystem_busy"} = sub { return $busy ? (1, '/dev/nvme0n1') : (0, '/dev/nvme0n1') };
     *{"${PKG}::_nvme_delete_namespace"} = sub {
         $deletes++;
@@ -56,6 +56,8 @@ sub run_free {
     ($ns_answer, $busy) = ($o{ns}, $o{busy});
     $subsys_answer = exists $o{subsys} ? $o{subsys} : [ { id => 3 } ];
     $retry_fails = $o{retry_fails};
+    $connect_dies = $o{connect_dies};
+    (@events, @log0) = ();
     ($disconnects, $deletes, $ns_calls, $ds_deletes) = (0, 0, 0, 0);
     my $ok = eval {
         my $w = $PKG->can('_free_image_nvme')->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-ns11111111-2222-3333-4444-555555555555',
@@ -123,6 +125,32 @@ sub run_free {
     ($ok, $err) = run_free(ns => [ { id => 1 } ], busy => 0);
     ok($ok, 'retry succeeds -> the free continues as before') or diag($err);
     is($ds_deletes, 1, '  ...and the dataset delete is issued');
+}
+
+# L2: the compensating reconnect after a failed retry.
+{
+    my ($ok, $err) = run_free(ns => [ { id => 1 } ], busy => 0, retry_fails => 1);
+    is_deeply(\@events, [ 'disconnect', 'connect' ], 'retry failed: exactly one connect, AFTER the disconnect');
+    like($err, qr/namespace still exported/, '  ...the death keeps "namespace still exported"');
+    like($err, qr/cause: \[EBUSY\] namespace is in use/, '  ...and the original cause');
+    unlike($err, qr/reconnecting the subsystem also failed/, '  ...with no reconnect warning when the reconnect worked');
+}
+{
+    my ($ok, $err) = run_free(ns => [ { id => 1 } ], busy => 0, retry_fails => 1, connect_dies => 1);
+    ok(!$ok, 'the reconnect itself dies: the free still dies');
+    like($err, qr/namespace still exported/, '  ...with the ORIGINAL message');
+    like($err, qr/cause: \[EBUSY\] namespace is in use/, '  ...and the original cause, not the connect error');
+    like($err, qr/may have no NVMe paths until status\(\) repairs/, '  ...and it says the node may have no paths');
+    ok((grep { /reconnecting the NVMe subsystem failed.*Connection timed out/ } @log0),
+       '  ...and the connect failure is logged at level 0');
+}
+{
+    run_free(ns => [ { id => 1 }, { id => 2 } ], busy => 0);
+    is_deeply(\@events, [], 'shared subsystem (no disconnect): _nvme_connect is NOT called');
+    run_free(ns => [ { id => 1 } ], busy => 0);
+    is_deeply(\@events, [ 'disconnect', 'connect' ], 'retry succeeds: the one reconnect after the disconnect (as before)');
+    run_free(ns => [ { id => 1 } ], busy => 0, connect_dies => 1);
+    ok((grep { /reconnection failed after namespace deletion/ } @log0), 'reconnect failure after a SUCCESSFUL delete is logged at level 0');
 }
 
 done_testing;

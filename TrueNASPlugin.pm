@@ -11259,15 +11259,29 @@ sub _free_image_nvme {
                 # The namespace is still exported. Carrying on would hand the
                 # dataset to the delete worker (force => true) under a live export.
                 _log($scfg, 0, 'warning', "[TrueNAS] _free_image_nvme: could not delete namespace for $zname after the disconnect: $retry_err");
-                eval { _nvme_connect($scfg) };    # do not leave the node cut off
+                # Best effort: do not leave the node cut off. A failure here never
+                # replaces the original cause; it is logged at level 0 (the
+                # run_command text _nvme_connect raises is already redacted) and
+                # named in the final message.
+                my $reconnect_note = '';
+                if (!eval { _nvme_connect($scfg); 1 }) {
+                    chomp(my $conn_err = $@ // 'unknown error');
+                    _log($scfg, 0, 'err', "[TrueNAS] _free_image_nvme: reconnecting the NVMe subsystem failed after "
+                        . "the namespace delete failed for $zname: $conn_err; this node may have no NVMe paths "
+                        . "until status() repairs them");
+                    $reconnect_note = "  WARNING: reconnecting the subsystem also failed, so this node may have no "
+                        . "NVMe paths until status() repairs them: $conn_err\n";
+                }
                 die "[TrueNAS] refusing to destroy $full_ds: namespace still exported "
                   . "(it could not be deleted even after disconnecting the subsystem; "
-                  . "it may be in use by another cluster node).\n  cause: $retry_err";
+                  . "it may be in use by another cluster node).\n  cause: $retry_err"
+                  . ($reconnect_note ne '' ? ($retry_err =~ /\n\z/ ? '' : "\n") . $reconnect_note : '');
             } else {
                 # Reconnect after successful deletion
                 eval { _nvme_connect($scfg) };
                 if ($@) {
-                    _log($scfg, 1, 'warning', "[TrueNAS] _free_image_nvme: reconnection failed after namespace deletion: $@");
+                    _log($scfg, 0, 'err', "[TrueNAS] _free_image_nvme: reconnection failed after namespace deletion: $@; "
+                        . "this node may have no NVMe paths until status() repairs them");
                 } else {
                     _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: successfully reconnected after namespace deletion");
                 }
