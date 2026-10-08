@@ -11137,20 +11137,26 @@ sub _free_image_nvme {
     # 2) If TrueNAS reported "in use" and force_delete_on_inuse=1, disconnect and retry
     if ($need_force_disconnect) {
         # Check if there are other active namespaces in this subsystem
-        my $active_ns_count = 0;
+        my $active_ns_count;    # undef = unknown; only a real list sets it
         eval {
             my $nqn = $scfg->{tn_subsystem_nqn};
             my $subsystems = _api_call($scfg, 'nvmet.subsys.query',
                 [[ ["subnqn", "=", $nqn] ]]);
 
-            if ($subsystems && @$subsystems) {
+            die "nvmet.subsys.query returned a non-list answer
+" if ref($subsystems) ne 'ARRAY';
+            die "subsystem $nqn not found on the array
+" if !@$subsystems;
+            {
                 my $subsys_id = $subsystems->[0]{id};
                 # Count all namespaces in this subsystem. Query results nest the
                 # subsystem under 'subsys.id' (the 'subsys_id' form is create-only
                 # input), so filter on 'subsys.id'.
                 my $namespaces = _api_call($scfg, 'nvmet.namespace.query',
                     [[ ["subsys.id", "=", $subsys_id] ]]);
-                $active_ns_count = $namespaces ? scalar(@$namespaces) : 0;
+                die "nvmet.namespace.query returned a non-list answer
+" if ref($namespaces) ne 'ARRAY';
+                $active_ns_count = scalar(@$namespaces);
             }
         };
 
@@ -11170,7 +11176,11 @@ sub _free_image_nvme {
         # use" - so carrying on into the force destroy below would pull the
         # zvol out from under it. The free stops here instead, the same way
         # step 1 refuses.
-        if ($count_err) {
+        # undef/non-list answers (no exception) are unknown too, handled by the
+        # dies inside the eval above.
+        if ($count_err || !defined $active_ns_count) {
+            $count_err ||= "unknown
+";
             chomp(my $count_msg = $count_err);
             _log($scfg, 0, 'warning',
                 "[TrueNAS] _free_image_nvme: skipping subsystem disconnect for $zname: "
@@ -11184,6 +11194,18 @@ sub _free_image_nvme {
         # Only disconnect if this is the known last namespace.
         # This prevents breaking multi-disk operations.
         if ($active_ns_count <= 1) {
+            # Invariant: never `nvme disconnect` with a device in use. The
+            # subsystem-wide disconnect takes down every disk of every guest on
+            # this node, so a device that is open (or whose state cannot be
+            # read) stops the free here, like an unknown count does.
+            my ($ns_busy, @busy_devs) = _nvme_subsystem_busy($scfg);
+            if ($ns_busy) {
+                die "[TrueNAS] refusing to destroy $full_ds: its namespace is still in use "
+                  . "and the NVMe subsystem has device(s) in use on this node ("
+                  . join(', ', @busy_devs) . "), so the disconnect-and-retry step was "
+                  . "skipped. Stop whatever uses them and retry.
+";
+            }
             _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: disconnecting NVMe subsystem to retry namespace deletion (active namespaces: $active_ns_count)");
             _nvme_disconnect($scfg);
             # Wait for NVMe disconnect to complete
