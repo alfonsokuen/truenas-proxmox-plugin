@@ -49,7 +49,7 @@ $call
 SH
     close $o;
     my $envs = join(' ', map { "$_='$env{$_}'" } sort keys %env);
-    my $out = `env PATH='$bin':\$PATH $envs bash $script 2>&1`;
+    my $out = `env PATH="$bin:\$PATH" $envs bash '$script' 2>&1`;
     my $calls = '';
     if (open(my $f, '<', $log)) { local $/; $calls = <$f>; close $f }
     return ($out, $calls);
@@ -58,14 +58,16 @@ SH
 # --- the immediate reload list ------------------------------------------------
 {
     my ($out, $calls) = run_fn('restart_proxmox_services');
+    isnt($calls, '', 'spies were reached: calls were recorded (the test cannot pass on nothing)');
     unlike($calls, qr/\b(?:pvedaemon|pvestatd|pvescheduler)\b/,
         '(a) no reload of pvedaemon / pvestatd / pvescheduler by the postinst (the pve-manager trigger does it once)');
     like($calls, qr/^deb-systemd-invoke reload-or-try-restart pve-ha-crm\.service$/m,
         '(b) pve-ha-crm is still reloaded (the trigger does not cover it)');
     like($calls, qr/^deb-systemd-invoke reload-or-try-restart pve-ha-lrm\.service$/m,
         '    ...and pve-ha-lrm');
-    like($calls, qr/systemd-run .*--unit=truenas-pveproxy-restart .*reload-or-try-restart pveproxy/,
-        'pveproxy keeps its deferred reload');
+    unlike($calls, qr/systemd-run|truenas-pveproxy-restart|reset-failed/,
+        'no deferred pveproxy timer: nothing is scheduled with systemd-run');
+    unlike($calls, qr/pveproxy/, '  ...and pveproxy is not touched at all (pve-manager trigger reloads it once)');
 }
 
 # --- the broker is handled as before ---------------------------------------------
@@ -82,7 +84,8 @@ SH
 {
     my ($out, $calls) = run_fn('restart_proxmox_services', TRUENAS_PLUGIN_NO_RESTART => 1);
     is($calls, '', 'NO_RESTART=1: nothing is reloaded by the postinst');
-    like($out, qr/pve-ha-crm pve-ha-lrm pveproxy/, '  ...and the manual command names the HA daemons and pveproxy');
+    like($out, qr/reload-or-try-restart pve-ha-crm pve-ha-lrm$/m, '  ...and the manual command names only the HA daemons');
+    unlike($out, qr/pveproxy$/m, '  ...not pveproxy');
     like($out, qr/trigger still reloads pvedaemon, pvestatd, pvescheduler/,
         '  ...and says the pve-manager trigger still reloads the other three');
 }

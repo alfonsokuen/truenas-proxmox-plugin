@@ -41,15 +41,9 @@ enable_broker() {
 }
 
 restart_proxmox_services() {
-    # The plugin-loading daemons (pvedaemon / pvestatd / pvescheduler / the HA
-    # daemons) do not touch the operator's web-UI session. pveproxy IS the web
-    # UI gateway and serves the xterm.js terminal that streams `apt upgrade`
-    # output when an operator updates from the UI (issue #60): restarting it
-    # synchronously drops that terminal mid-transaction. So we restart the
-    # plugin-loading daemons now and DEFER pveproxy ~10s via a systemd one-shot
-    # timer -- by the time it fires the apt transaction (and its terminal) has
-    # closed, so pveproxy still picks up the new plugin without dropping the
-    # session.
+    # Only the HA daemons are reloaded here (see below). pvedaemon, pvestatd,
+    # pvescheduler, pveproxy and spiceproxy are left to pve-manager's dpkg
+    # trigger.
     #
     # pvedaemon / pvestatd / pvescheduler are NOT reloaded here. pve-manager's
     # dpkg trigger (/var/lib/dpkg/info/pve-manager.triggers: interest-noawait
@@ -62,24 +56,35 @@ restart_proxmox_services() {
     # lab, small n). The trigger does NOT cover pve-ha-crm / pve-ha-lrm, so
     # those stay below.
     #
-    # Edge case: `dpkg --no-triggers` / `--triggers-only` skips the trigger, and
-    # then pvedaemon / pvestatd / pvescheduler keep the old plugin until the next
-    # trigger (or a manual reload). Run `systemctl reload-or-try-restart
-    # pvedaemon pvestatd pvescheduler` yourself in that case.
+    # pveproxy is not scheduled here any more either. It used to be deferred
+    # ~10 s with a systemd-run timer so the xterm.js terminal of a UI-driven
+    # `apt upgrade` survived (issue #60), but the trigger reloads pveproxy too
+    # (reload-or-try-restart: the daemon re-execs keeping its old workers and
+    # the listening socket, so the terminal is not dropped), and a second HUP
+    # that lands after the exec and before the new perl installs its handler
+    # (SIGHUP is back to the default action = terminate) kills the daemon. Inside
+    # an apt run with more packages the trigger is deferred to the end and can
+    # coincide with a 10 s timer. A timer left pending by an earlier install is
+    # harmless: it just reloads pveproxy once more when it fires.
     #
-    # TRUENAS_PLUGIN_NO_RESTART=1 is an escape hatch for operators who reach
-    # the UI through a jump host or a PAM-mediated password vault and can't
-    # afford even the deferred pveproxy restart: it skips OUR PVE-side restarts
-    # (the HA daemons and pveproxy) and prints the command to run later. It does
-    # not, and cannot, stop pve-manager's trigger from reloading pvedaemon /
-    # pvestatd / pvescheduler / pveproxy / spiceproxy; only dpkg --no-triggers
-    # does. The truenas-plugin-broker restart in enable_broker() still runs
+    # Edge case: `dpkg --no-triggers` skips the trigger, and then pvedaemon /
+    # pvestatd / pvescheduler / pveproxy / spiceproxy keep the old plugin until
+    # the next trigger. Run `systemctl reload-or-try-restart pvedaemon pvestatd
+    # pvescheduler pveproxy` yourself in that case. (`--triggers-only` is the
+    # opposite: it PROCESSES the pending triggers.)
+    #
+    # TRUENAS_PLUGIN_NO_RESTART=1 is an escape hatch for operators who cannot
+    # afford the HA daemon reload on this node: it skips OUR restarts (pve-ha-crm
+    # and pve-ha-lrm only) and prints the command to run later. It does not, and
+    # cannot, stop pve-manager's trigger from reloading pvedaemon / pvestatd /
+    # pvescheduler / pveproxy / spiceproxy; only dpkg --no-triggers does. The
+    # truenas-plugin-broker restart in enable_broker() still runs
     # unconditionally -- our own service, does not touch the web UI session.
     if [ "${TRUENAS_PLUGIN_NO_RESTART:-0}" = "1" ]; then
-        echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not restarting the HA daemons or pveproxy."
+        echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not reloading pve-ha-crm / pve-ha-lrm."
         echo "  (pve-manager's own dpkg trigger still reloads pvedaemon, pvestatd, pvescheduler and"
         echo "   pveproxy unless dpkg ran with --no-triggers.) When convenient, run manually:"
-        echo "    systemctl reload-or-try-restart pve-ha-crm pve-ha-lrm pveproxy"
+        echo "    systemctl reload-or-try-restart pve-ha-crm pve-ha-lrm"
         return 0
     fi
     if have_systemd; then
@@ -98,28 +103,6 @@ restart_proxmox_services() {
                 systemctl reload-or-try-restart "$unit" || true
             fi
         done
-        # pveproxy is deferred ~10s so an active web-UI upgrade terminal
-        # survives the transaction (upstream issue #60); fall back to an
-        # immediate reload if systemd-run is unavailable. A pending timer from
-        # a concurrent installer run is detected and NOT re-scheduled: a second
-        # `systemd-run` with the same unit name fails while the first timer is
-        # pending, and the fallback would act on pveproxy immediately --
-        # dropping the terminal this deferral exists to protect.
-        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
-            # A previously failed transient unit keeps its name in the failed
-            # state and makes systemd-run refuse to re-create it; reset stale
-            # failed state so the deferral does not fall back to an immediate
-            # action mid-transaction. No-op when the units are clean.
-            systemctl reset-failed truenas-pveproxy-restart.timer \
-                truenas-pveproxy-restart.service 2>/dev/null || true
-            if command -v systemd-run >/dev/null 2>&1; then
-                systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
-                    systemctl reload-or-try-restart pveproxy >/dev/null 2>&1 || \
-                    systemctl reload-or-try-restart pveproxy || true
-            else
-                systemctl reload-or-try-restart pveproxy || true
-            fi
-        fi
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true
         invoke-rc.d pvestatd restart || true

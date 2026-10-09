@@ -73,23 +73,33 @@ truenas-proxmox-plugin (1:2.1.23+deb1+idk23) unstable; urgency=medium
     _nvme_delete_namespace/free" y "primer intento de borrado sin guarda de
     deadline".
 
-  * postinst: ya NO recarga pvedaemon, pvestatd ni pvescheduler. El trigger de
-    pve-manager (interest-noawait /usr/share/perl5/PVE) se dispara porque el
-    plugin se instala bajo ese arbol y recarga esos tres demonios exactamente
-    una vez; recargarlos tambien desde el postinst mandaba a pvestatd dos HUP
-    con ~2 s de diferencia, el segundo caia durante el "server shutdown
-    (restart)" del primero y el demonio salia y no volvia solo (3 de 9 `dpkg -i`
-    en laboratorio, n pequeno). Se mantienen pve-ha-crm y pve-ha-lrm (el trigger
-    no las cubre), el broker y el pveproxy diferido. Caso borde: con
-    `dpkg --no-triggers` / `--triggers-only` esos tres demonios conservan el
-    plugin viejo hasta el siguiente trigger; recargarlos a mano
-    (`systemctl reload-or-try-restart pvedaemon pvestatd pvescheduler`).
-    TRUENAS_PLUGIN_NO_RESTART=1 solo omite las recargas propias (HA y pveproxy);
-    no puede impedir el trigger de pve-manager. Test: t/installer/07.
+  * postinst: ya NO recarga pvedaemon, pvestatd, pvescheduler ni pveproxy. El
+    trigger de pve-manager (interest-noawait /usr/share/perl5/PVE) se dispara
+    porque el plugin se instala bajo ese arbol y recarga esos demonios (y
+    spiceproxy) exactamente una vez; recargarlos tambien desde el postinst
+    mandaba a pvestatd dos HUP con ~2 s de diferencia: el segundo llega tras el
+    exec de PVE::Daemon y antes de que el perl nuevo instale su handler, SIGHUP
+    vuelve a su accion por defecto (terminar) y el demonio sale y no vuelve solo
+    (3 de 9 `dpkg -i` en laboratorio, n pequeno). Por lo mismo se QUITA el timer
+    de ~10 s (systemd-run) que recargaba pveproxy: el trigger ya lo recarga con
+    reload-or-try-restart, que conserva los workers viejos y el socket, asi que
+    el terminal de la UI no se pierde; dentro de un apt con mas paquetes el
+    trigger se difiere al final y podia coincidir con el timer. Un timer
+    pendiente de una instalacion anterior es inofensivo. Se mantienen
+    pve-ha-crm y pve-ha-lrm (el trigger no las cubre) y el broker.
+    Caso borde: con `dpkg --no-triggers` el trigger no corre y esos demonios
+    conservan el plugin viejo hasta el siguiente trigger; recargarlos a mano:
+    `systemctl reload-or-try-restart pvedaemon pvestatd pvescheduler pveproxy`
+    (`--triggers-only` es lo contrario: PROCESA los triggers pendientes).
+    TRUENAS_PLUGIN_NO_RESTART=1 ahora solo omite pve-ha-crm/pve-ha-lrm; no
+    puede impedir el trigger de pve-manager. Test: t/installer/07.
 
-  * Verificacion de despliegue: dos builds comparten la version
-    1:2.1.23+deb1+idk23. Instalar con `dpkg -i` y comparar el md5 del .pm
-    instalado con el del .deb antes de dar el nodo por actualizado.
+  * Verificacion de despliegue: varios builds comparten la version
+    1:2.1.23+deb1+idk23 y el MISMO TrueNASPlugin.pm (p. ej. los de 1a2e137 y
+    d681e68 solo difieren en el postinst), asi que el md5 del .pm no distingue
+    el build. Instalar solo con `dpkg -i` y verificar el sha256 del .deb y el
+    md5 de /var/lib/dpkg/info/truenas-proxmox-plugin.postinst. Runbook:
+    docs/idk23-rollout-runbook.md.
 
  -- Alfonso Kuen <alfonsok@gmail.com>  Thu, 08 Oct 2026 12:00:00 +0000
 
