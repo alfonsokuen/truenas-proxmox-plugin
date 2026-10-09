@@ -73,6 +73,20 @@ truenas-proxmox-plugin (1:2.1.23+deb1+idk23) unstable; urgency=medium
     _nvme_delete_namespace/free" y "primer intento de borrado sin guarda de
     deadline".
 
+  * postinst: ya NO recarga pvedaemon, pvestatd ni pvescheduler. El trigger de
+    pve-manager (interest-noawait /usr/share/perl5/PVE) se dispara porque el
+    plugin se instala bajo ese arbol y recarga esos tres demonios exactamente
+    una vez; recargarlos tambien desde el postinst mandaba a pvestatd dos HUP
+    con ~2 s de diferencia, el segundo caia durante el "server shutdown
+    (restart)" del primero y el demonio salia y no volvia solo (3 de 9 `dpkg -i`
+    en laboratorio, n pequeno). Se mantienen pve-ha-crm y pve-ha-lrm (el trigger
+    no las cubre), el broker y el pveproxy diferido. Caso borde: con
+    `dpkg --no-triggers` / `--triggers-only` esos tres demonios conservan el
+    plugin viejo hasta el siguiente trigger; recargarlos a mano
+    (`systemctl reload-or-try-restart pvedaemon pvestatd pvescheduler`).
+    TRUENAS_PLUGIN_NO_RESTART=1 solo omite las recargas propias (HA y pveproxy);
+    no puede impedir el trigger de pve-manager. Test: t/installer/07.
+
   * Verificacion de despliegue: dos builds comparten la version
     1:2.1.23+deb1+idk23. Instalar con `dpkg -i` y comparar el md5 del .pm
     instalado con el del .deb antes de dar el nodo por actualizado.

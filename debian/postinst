@@ -51,16 +51,35 @@ restart_proxmox_services() {
     # closed, so pveproxy still picks up the new plugin without dropping the
     # session.
     #
+    # pvedaemon / pvestatd / pvescheduler are NOT reloaded here. pve-manager's
+    # dpkg trigger (/var/lib/dpkg/info/pve-manager.triggers: interest-noawait
+    # /usr/share/perl5/PVE) fires because this package installs under
+    # /usr/share/perl5/PVE/Storage/Custom, and its `triggered` postinst does
+    # reload-or-try-restart pvedaemon pvestatd pveproxy spiceproxy pvescheduler
+    # exactly once. Reloading them here as well sent pvestatd two HUPs ~2 s
+    # apart; the second arrived during the "server shutdown (restart)" of the
+    # first and the daemon exited and did not come back (3 of 9 `dpkg -i` in the
+    # lab, small n). The trigger does NOT cover pve-ha-crm / pve-ha-lrm, so
+    # those stay below.
+    #
+    # Edge case: `dpkg --no-triggers` / `--triggers-only` skips the trigger, and
+    # then pvedaemon / pvestatd / pvescheduler keep the old plugin until the next
+    # trigger (or a manual reload). Run `systemctl reload-or-try-restart
+    # pvedaemon pvestatd pvescheduler` yourself in that case.
+    #
     # TRUENAS_PLUGIN_NO_RESTART=1 is an escape hatch for operators who reach
     # the UI through a jump host or a PAM-mediated password vault and can't
-    # afford even the deferred pveproxy restart: it skips the PVE-side restarts
-    # entirely and prints the command to run later. The truenas-plugin-broker
-    # restart in enable_broker() still runs unconditionally -- our own service,
-    # does not touch the web UI session.
+    # afford even the deferred pveproxy restart: it skips OUR PVE-side restarts
+    # (the HA daemons and pveproxy) and prints the command to run later. It does
+    # not, and cannot, stop pve-manager's trigger from reloading pvedaemon /
+    # pvestatd / pvescheduler / pveproxy / spiceproxy; only dpkg --no-triggers
+    # does. The truenas-plugin-broker restart in enable_broker() still runs
+    # unconditionally -- our own service, does not touch the web UI session.
     if [ "${TRUENAS_PLUGIN_NO_RESTART:-0}" = "1" ]; then
-        echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not restarting Proxmox services."
-        echo "  When convenient, run manually to pick up the new plugin:"
-        echo "    systemctl restart pvedaemon pvestatd pvescheduler pve-ha-crm pve-ha-lrm pveproxy"
+        echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not restarting the HA daemons or pveproxy."
+        echo "  (pve-manager's own dpkg trigger still reloads pvedaemon, pvestatd, pvescheduler and"
+        echo "   pveproxy unless dpkg ran with --no-triggers.) When convenient, run manually:"
+        echo "    systemctl reload-or-try-restart pve-ha-crm pve-ha-lrm pveproxy"
         return 0
     fi
     if have_systemd; then
@@ -70,9 +89,9 @@ restart_proxmox_services() {
         # daemons are in the list because they load the plugin too and keep a
         # stale copy otherwise (upstream issue #100); a unit that is not
         # active (HA on a standalone node) is simply skipped, which is what
-        # "try" means.
-        for unit in pvedaemon.service pvestatd.service pvescheduler.service \
-                    pve-ha-crm.service pve-ha-lrm.service; do
+        # "try" means. Only the HA daemons here: see the note above on why
+        # pvedaemon / pvestatd / pvescheduler are left to pve-manager's trigger.
+        for unit in pve-ha-crm.service pve-ha-lrm.service; do
             if command -v deb-systemd-invoke >/dev/null 2>&1; then
                 deb-systemd-invoke reload-or-try-restart "$unit" || true
             else
