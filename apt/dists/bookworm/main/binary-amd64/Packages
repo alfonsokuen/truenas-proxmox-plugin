@@ -1,0 +1,19 @@
+Package: truenas-proxmox-plugin
+Version: 1:2.1.23+deb1+idk23
+Architecture: all
+Maintainer: TrueNAS Proxmox Plugin Maintainers <noreply@github.com>
+Installed-Size: 1310
+Depends: pve-manager (>= 8.0.0), libpve-storage-perl (>= 8.3.5), open-iscsi, multipath-tools, nvme-cli, perl, libio-socket-ssl-perl, liburi-perl, perl:any
+Homepage: https://github.com/truenas/truenas-proxmox-plugin
+Priority: optional
+Section: admin
+Filename: pool/main/t/truenas-proxmox-plugin/truenas-proxmox-plugin_2.1.23+deb1+idk23_all.deb
+Size: 343520
+SHA256: 002550cebf5ec8b3388dac58e30a83e0602c88fc6b025fff3f4b224866dfc37b
+SHA1: 1336f207cc5c647770cb77675468bd07db2eedf2
+MD5sum: d704c5ddf534ee3bd414656a267cadf5
+Description: TrueNAS SCALE storage plugin for Proxmox VE
+ This package provides the TrueNAS Proxmox storage plugin for shared VM disk
+ storage over iSCSI and NVMe/TCP. It integrates with TrueNAS SCALE via
+ WebSocket API calls to manage zvol-backed volumes and snapshots.
+

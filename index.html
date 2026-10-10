@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>truenas-proxmox-plugin (IDK fork) &mdash; APT repository</title>
+<style>
+  :root { color-scheme: light dark; --fg:#16181d; --bg:#fbfbfa; --mut:#5c6370; --line:#dcdde1; --code:#f1f1ef; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e8e6; --bg:#16181d; --mut:#9aa0ab; --line:#2c2f36; --code:#1e2127; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 16px 96px; }
+  h1 { font-size: 1.6rem; letter-spacing:-0.01em; margin:0 0 8px; }
+  h2 { font-size: 1.05rem; margin: 40px 0 8px; }
+  p { color: var(--mut); }
+  pre { background: var(--code); border:1px solid var(--line); border-radius:8px; padding:14px 16px; overflow-x:auto; font-size:13.5px; }
+  code { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  hr { border:0; border-top:1px solid var(--line); margin:40px 0; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+<h1>truenas-proxmox-plugin &mdash; IDKMANAGER fork</h1>
+<p>Signed APT repository for the IDKMANAGER fork of the TrueNAS storage plugin
+for Proxmox VE. Suites: <code>bookworm</code> (PVE 8) and <code>trixie</code> (PVE 9).
+Signing key: <code>C0C4BFA34273A80B1E92D71201B2C346EEC7ECF8</code>.</p>
+
+<h2>One-line install (recommended)</h2>
+<pre><code>curl -sSL https://github.com/alfonsokuen/truenas-proxmox-plugin/releases/latest/download/install-idk.sh | bash -s -- --apt</code></pre>
+
+<h2>Manual setup</h2>
+<pre><code>curl -fsSL https://alfonsokuen.github.io/truenas-proxmox-plugin/apt/KEY.gpg -o /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
+
+cat &gt;/etc/apt/sources.list.d/truenas-proxmox-plugin-idk.sources &lt;&lt;'EOF'
+Types: deb
+URIs: https://alfonsokuen.github.io/truenas-proxmox-plugin/apt/
+Suites: trixie
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/truenas-proxmox-plugin-idk.gpg
+EOF
+
+apt-get update
+apt-get install -y truenas-proxmox-plugin</code></pre>
+<p>Use <code>Suites: bookworm</code> on Proxmox VE 8.</p>
+
+<h2>Coexisting with upstream</h2>
+<p>The fork's package carries the epoch <code>1:</code>, so it outranks upstream's
+package on a node that has both sources configured. Nothing needs to be removed.</p>
+
+<hr>
+<p>Source: <a href="https://github.com/alfonsokuen/truenas-proxmox-plugin">github.com/alfonsokuen/truenas-proxmox-plugin</a>
+&middot; this branch replaces the upstream <code>gh-pages</code> copy that used to live here.</p>
+</main>
+</body>
+</html>
