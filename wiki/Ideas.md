@@ -1186,15 +1186,13 @@ truenasplugin: auto-storage
 
 **Transport Options**:
 - **NVMe/TCP** - Works over standard Ethernet (most compatible, easiest to implement)
-- **NVMe/RDMA** - Requires RDMA-capable NICs (RoCE, iWARP) for absolute best performance
-- **NVMe/FC** - Fiber Channel variant (less common in Proxmox environments)
 
 **Configuration Example**:
 ```ini
 truenasplugin: truenas-nvmeof
     tn_api_host 192.168.1.100
     tn_api_key xxx
-    transport nvme-tcp  # or nvme-rdma, nvme-fc
+    transport nvme-tcp
     target_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     tn_dataset tank/proxmox-nvme
     tn_discovery_portal 192.168.1.100:4420  # NVMe/TCP default port
@@ -1243,7 +1241,7 @@ sub discover_nvme_targets {
 
     run_command([
         'nvme', 'discover',
-        '-t', $scfg->{transport},  # tcp, rdma, or fc
+        '-t', $scfg->{transport},  # tcp
         '-a', $scfg->{tn_api_host},
         '-s', $scfg->{discovery_port} // '4420',
     ]);
@@ -1303,7 +1301,7 @@ sub list_nvme_devices {
 
 **Backward Compatibility**:
 - Keep existing iSCSI code path
-- Add transport detection in plugin: `transport_type` parameter (iscsi/nvme-tcp/nvme-rdma)
+- Add transport detection in plugin: `transport_type` parameter (iscsi/nvme-tcp)
 - Auto-detect based on TrueNAS capabilities
 
 **Testing Requirements**:
@@ -1323,11 +1321,6 @@ NVMe/TCP Target:
   Latency: 50-150μs
   IOPS (4K random): 200,000-500,000+
   CPU Usage: 5-10%
-
-NVMe/RDMA Target:
-  Latency: 20-50μs
-  IOPS (4K random): 500,000-1,000,000+
-  CPU Usage: 2-5%
 ```
 
 **Related Tools Updates**:
