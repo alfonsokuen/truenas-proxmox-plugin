@@ -329,10 +329,7 @@ original #45 reporter).
 **Scope:** This rule applies to all NVMe block devices on the host,
 including local NVMe SSDs. The cap is harmless for local devices —
 their native MDTS is already honoured and `max_sectors_kb` is simply
-clamped to the smaller of the host setting and the device limit. If
-you prefer to scope the rule to NVMe/TCP namespaces only, match on
-the subsysnqn — see
-[Issue-45-nvmet-tcp-research.md](Issue-45-nvmet-tcp-research.md).
+clamped to the smaller of the host setting and the device limit.
 
 **Remove the rule** once the kernel fix lands in your TrueNAS
 version.
