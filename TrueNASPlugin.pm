@@ -4,9 +4,9 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.23';
+our $VERSION = '2.1.24~beta1';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 15;
+our $TESTED_APIVER = 16;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -630,7 +630,7 @@ sub _retry_with_backoff {
 
 # ======== Storage plugin identity ========
 # Storage API version - dynamically adapts to PVE version
-# Supports PVE 8.x (APIVER 11) through PVE 9.2+ (APIVER 15)
+# Supports PVE 8.x (APIVER 11) through PVE 9.3+ (APIVER 16)
 sub api {
     my $tested_apiver = $TESTED_APIVER;  # Latest tested version (PVE 9.x)
 
@@ -1125,76 +1125,81 @@ sub check_config {
         );
     }
 
-    # Validate required fields are present
-    if (!$opts->{tn_api_host}) {
-        die "tn_api_host is required\n";
+    # Required-field and transport-specific checks only run on create. On
+    # edit (`pvesm set <id> -<flag>`) PVE calls check_config with just the
+    # submitted delta, not the merged stored config, so demanding required
+    # fields here breaks every edit (issue #130).
+    if ($create) {
+        if (!$opts->{tn_api_host}) {
+            die "tn_api_host is required\n";
+        }
+        if (!$opts->{tn_api_key}) {
+            die "tn_api_key is required\n";
+        }
+        if (!$opts->{tn_dataset}) {
+            die "tn_dataset is required\n";
+        }
+
+        my $mode = $opts->{tn_transport_mode} // 'iscsi';
+
+        if ($mode eq 'iscsi') {
+            if (!$opts->{tn_target_iqn}) {
+                die "tn_target_iqn is required for iSCSI transport\n";
+            }
+            if (!$opts->{tn_discovery_portal}) {
+                die "tn_discovery_portal is required for iSCSI transport\n";
+            }
+        } elsif ($mode eq 'nvme-tcp') {
+            if (!$opts->{tn_subsystem_nqn}) {
+                die "tn_subsystem_nqn is required for nvme-tcp transport\n";
+            }
+        } else {
+            die "Invalid transport_mode '$mode': must be 'iscsi' or 'nvme-tcp'\n";
+        }
     }
-    if (!$opts->{tn_api_key}) {
-        die "tn_api_key is required\n";
+
+    # Format and cross-field warnings run whenever the relevant field is
+    # actually submitted — safe on both create and edit.
+    if (defined $opts->{tn_subsystem_nqn}
+        && $opts->{tn_subsystem_nqn} !~ /^nqn\.\d{4}-\d{2}\./) {
+        die "tn_subsystem_nqn must follow NVMe NQN format (e.g., nqn.2005-10.org.example:identifier)\n";
     }
-    if (!$opts->{tn_dataset}) {
-        die "tn_dataset is required\n";
+    if (defined $opts->{tn_hostnqn}
+        && $opts->{tn_hostnqn} ne ''
+        && $opts->{tn_hostnqn} !~ /^nqn\./) {
+        die "tn_hostnqn must follow NVMe NQN format\n";
     }
 
-    # Validate transport mode and transport-specific parameters
-    my $mode = $opts->{tn_transport_mode} // 'iscsi';
-
-    if ($mode eq 'iscsi') {
-        # iSCSI mode requires target_iqn and discovery_portal
-        if (!$opts->{tn_target_iqn}) {
-            die "tn_target_iqn is required for iSCSI transport\n";
+    if (defined $opts->{tn_transport_mode}) {
+        my $mode = $opts->{tn_transport_mode};
+        if ($mode eq 'iscsi') {
+            if ($opts->{tn_subsystem_nqn}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': tn_subsystem_nqn is ignored in iSCSI mode"
+                );
+            }
+            if ($opts->{tn_hostnqn}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': tn_hostnqn is ignored in iSCSI mode"
+                );
+            }
+        } elsif ($mode eq 'nvme-tcp') {
+            if ($opts->{tn_target_iqn}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': tn_target_iqn is ignored in nvme-tcp mode"
+                );
+            }
+            if ($opts->{tn_chap_user} || $opts->{tn_chap_password}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use tn_nvme_dhchap_secret instead)"
+                );
+            }
+            if ($opts->{tn_use_by_path}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': tn_use_by_path is ignored in nvme-tcp mode (UUID paths used)"
+                );
+            }
         }
-        if (!$opts->{tn_discovery_portal}) {
-            die "tn_discovery_portal is required for iSCSI transport\n";
-        }
-
-        # Warn if NVMe-specific parameters are set in iSCSI mode
-        if ($opts->{tn_subsystem_nqn}) {
-            syslog('warning',
-                "[TrueNAS] Storage '$sectionId': tn_subsystem_nqn is ignored in iSCSI mode"
-            );
-        }
-        if ($opts->{tn_hostnqn}) {
-            syslog('warning',
-                "[TrueNAS] Storage '$sectionId': tn_hostnqn is ignored in iSCSI mode"
-            );
-        }
-
-    } elsif ($mode eq 'nvme-tcp') {
-        # NVMe/TCP mode requires subsystem_nqn
-        if (!$opts->{tn_subsystem_nqn}) {
-            die "tn_subsystem_nqn is required for nvme-tcp transport\n";
-        }
-
-        # Validate NQN format (basic check)
-        if ($opts->{tn_subsystem_nqn} !~ /^nqn\.\d{4}-\d{2}\./) {
-            die "tn_subsystem_nqn must follow NVMe NQN format (e.g., nqn.2005-10.org.example:identifier)\n";
-        }
-
-        # Validate hostnqn format if provided
-        if ($opts->{tn_hostnqn} && $opts->{tn_hostnqn} !~ /^nqn\./) {
-            die "tn_hostnqn must follow NVMe NQN format\n";
-        }
-
-        # Warn if iSCSI-specific parameters are set in NVMe mode
-        if ($opts->{tn_target_iqn}) {
-            syslog('warning',
-                "[TrueNAS] Storage '$sectionId': tn_target_iqn is ignored in nvme-tcp mode"
-            );
-        }
-        if ($opts->{tn_chap_user} || $opts->{tn_chap_password}) {
-            syslog('warning',
-                "[TrueNAS] Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use tn_nvme_dhchap_secret instead)"
-            );
-        }
-        if ($opts->{tn_use_by_path}) {
-            syslog('warning',
-                "[TrueNAS] Storage '$sectionId': tn_use_by_path is ignored in nvme-tcp mode (UUID paths used)"
-            );
-        }
-
-    } else {
-        die "Invalid transport_mode '$mode': must be 'iscsi' or 'nvme-tcp'\n";
     }
 
     return $opts;

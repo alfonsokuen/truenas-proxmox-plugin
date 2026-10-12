@@ -1,3 +1,29 @@
+truenas-proxmox-plugin (2.1.24~beta1) unstable; urgency=medium
+
+  * check_config: skip required-field validation on edit path
+    (GitHub #130). PVE calls check_config with just the submitted
+    delta on `pvesm set <id> -<flag>`, not the merged stored config,
+    so demanding tn_api_host / tn_api_key / tn_dataset (and the
+    transport-specific requires) made every edit die with
+    "tn_api_host is required". Required-field dies now gate on
+    $create; format/warning checks still fire whenever the relevant
+    field is actually submitted. Reproducer from the issue
+    (pvesm set <id> -disable true) now works. Reported by
+    O'Neill, Will (4wrxb).
+
+  * api(): bump $TESTED_APIVER from 15 to 16 (GitHub #99). PVE
+    bumped pve-storage APIVER during the 2.1.23 release cycle;
+    users on PVE 9.2+ hit "implementing an older storage API"
+    on every pvesm call. Reported by blunweon, noberasco.
+
+  * Validation: 20/20 PASS on the proxmox-test-runner
+    storage-plugin-validation suite against truenas-storage on
+    the four-node cluster (pve/pve2/proxmox2/pvevm1) on
+    2026-10-11/12. Each round: 19 validated, 2 unsupported,
+    3 not tested for prerequisite reasons, 0 failed.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 12 Oct 2026 08:00:00 -0400
+
 truenas-proxmox-plugin (2.1.23+deb1) unstable; urgency=medium
 
   * Promote 2.1.23~beta11 to 2.1.23+deb1 (stable). First stable
