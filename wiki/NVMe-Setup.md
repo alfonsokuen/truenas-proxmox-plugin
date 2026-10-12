@@ -683,6 +683,34 @@ Check kernel logs:
 dmesg | grep -i nvme | tail -20
 ```
 
+### Large-transfer I/O errors (vzdump, `qemu-img convert`)
+
+**Symptom:** backups, disk moves, or imports over NVMe/TCP fail
+partway through with `err -5 - Input/output error`. PVE logs show
+`I/O Error (sct 0x0 / sc 0x6)` on commands of around 16 MB (32768
+blocks). TrueNAS `dmesg` shows `nvmet_tcp: queue N: failed to map
+data`.
+
+**Cause:** The TrueNAS kernel `nvmet-tcp` module is missing the
+`.get_mdts` callback, so clients request transfers larger than the
+target can map. Tracked as GitHub #45 and #96; kernel patch
+pending in a TrueNAS point release.
+
+**Workaround — cap `max_sectors_kb` on every PVE node:**
+
+```bash
+cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", \
+  ATTR{queue/max_sectors_kb}="1024"
+EOF
+udevadm control --reload
+udevadm trigger --subsystem-match=block --action=change
+```
+
+See [Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors](Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors)
+for the full writeup. Remove the rule when the kernel fix lands in
+your TrueNAS version.
+
 ### Namespace Issues
 
 **Namespace creation fails**

@@ -216,6 +216,29 @@ TrueNAS cert with one your Proxmox hosts trust.
 - Install `nvme-cli` on Proxmox: `apt-get install nvme-cli`
 - Enable **NVMe-oF Target** service in TrueNAS
 
+**⚠️ Known issue — large-transfer I/O errors (GitHub #45, #96):** TrueNAS
+SCALE's `nvmet-tcp` kernel module is missing the `.get_mdts` callback,
+so clients may send transfers larger than the target can map. Any
+command that issues large direct I/O (vzdump streaming backups,
+`qemu-img convert -t none` disk moves, `pvesm` imports) can fail with
+`err -5 - Input/output error` partway through, and in some cases
+produce silent corruption. Cap the per-request transfer size on
+every Proxmox node that mounts this storage:
+
+```bash
+cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", \
+  ATTR{queue/max_sectors_kb}="1024"
+EOF
+udevadm control --reload
+udevadm trigger --subsystem-match=block --action=change
+```
+
+Validated against TN 25.10.4 and TN 26.0 BETA.x. Remove when the
+kernel patch (reviewed upstream) ships in a TrueNAS point release.
+See [wiki/Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors](wiki/Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors)
+for the full writeup.
+
 **See [wiki/NVMe-Setup.md](wiki/NVMe-Setup.md) for complete NVMe/TCP setup guide.**
 
 ### TrueNAS SCALE Setup
