@@ -272,8 +272,8 @@ shared 1
 **Tracking:** GitHub #45 (original report, 2026-06), GitHub #96
 (current tracking issue with upstream analysis).
 
-**Affected:** NVMe/TCP transport on TrueNAS SCALE 25.10.x and
-TN 26.0 BETA.x. Does not affect iSCSI.
+**Affected:** NVMe/TCP transport on TrueNAS 25.10.x and TN 26.0 BETA.x.
+Does not affect iSCSI.
 
 **Symptom:** vzdump streaming backups, `qemu-img convert -t none`
 disk moves, `pvesm export | pvesm import` transfers, and any other
@@ -313,23 +313,47 @@ version at the time of writing.
 
 ```bash
 cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
-ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", \
-  ATTR{queue/max_sectors_kb}="1024"
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
+  ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
 EOF
 udevadm control --reload
 udevadm trigger --subsystem-match=block --action=change
 ```
 
-1024 kB (2048 sectors) is the value this project validated against
-TN 25.10.4 and TN 26.0 BETA.x on HA NVMe/TCP: it stays well under
-the mapping limit while leaving streaming workloads at near-line-rate.
-If you still see sporadic errors with 1024, drop to 128 (used by the
-original #45 reporter).
+Four clauses, each necessary:
 
-**Scope:** This rule applies to all NVMe block devices on the host,
-including local NVMe SSDs. The cap is harmless for local devices —
-their native MDTS is already honoured and `max_sectors_kb` is simply
-clamped to the smaller of the host setting and the device limit.
+- `KERNEL=="nvme*n*"` — any NVMe block device.
+- `ENV{DEVTYPE}=="disk"` — namespace head only; without this, udev
+  tries to write `max_sectors_kb` on every partition (`nvme6n2p1`
+  etc.) during guest-disk partition-table scans and logs an error
+  per partition in `journalctl -p err`.
+- `ATTRS{subsysnqn}=="nqn.*truenas*"` — scopes the cap to TrueNAS
+  subsystems only; local NVMe SSDs behind `local-lvm` or `local-zfs`
+  keep their native (large) MDTS. Adjust the glob if your subsystem
+  NQNs don't contain "truenas".
+- `ATTR{queue/max_sectors_kb}="1024"` — 1024 KiB (2048 sectors) is
+  the value this project validated against TN 25.10.4 and TN 26.0
+  BETA.x; it stays well under the mapping limit while leaving
+  streaming workloads at near-line-rate. If you still see sporadic
+  errors with 1024, drop to 128 (used by the original #45 reporter).
+
+**Trap:** `ATTRS{transport}=="tcp"` as a scope filter **does not
+work** with native NVMe multipath. The `transport` attribute lives on
+the per-path controllers (`nvme0c0n1`), not the namespace head
+(`nvme0n1`) that carries the queue limits — the rule installs cleanly
+and does nothing. Use `ATTRS{subsysnqn}` instead.
+
+**Verify** the value actually changed:
+
+```bash
+cat /sys/block/<nvmeNnM>/queue/max_sectors_kb
+```
+
+A rule that doesn't match any device fails silently. Capping the
+namespace head alone is enough; the bio layer splits before
+forwarding to the paths, so per-path `max_sectors_kb` doesn't need to
+be touched. The value survives a full disconnect/reconnect of the
+subsystem.
 
 **Remove the rule** once the kernel fix lands in your TrueNAS
 version.

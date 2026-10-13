@@ -216,9 +216,9 @@ TrueNAS cert with one your Proxmox hosts trust.
 - Install `nvme-cli` on Proxmox: `apt-get install nvme-cli`
 - Enable **NVMe-oF Target** service in TrueNAS
 
-**⚠️ Known issue — large-transfer I/O errors (GitHub #45, #96):** TrueNAS
-SCALE's `nvmet-tcp` kernel module is missing the `.get_mdts` callback,
-so clients may send transfers larger than the target can map. Any
+**⚠️ Known issue — large-transfer I/O errors (GitHub #45, #96):** TrueNAS's
+`nvmet-tcp` kernel module is missing the `.get_mdts` callback, so
+clients may send transfers larger than the target can map. Any
 command that issues large direct I/O (vzdump streaming backups,
 `qemu-img convert -t none` disk moves, `pvesm` imports) can fail with
 `err -5 - Input/output error` partway through, and in some cases
@@ -227,12 +227,20 @@ every Proxmox node that mounts this storage:
 
 ```bash
 cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
-ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", \
-  ATTR{queue/max_sectors_kb}="1024"
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
+  ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
 EOF
 udevadm control --reload
 udevadm trigger --subsystem-match=block --action=change
 ```
+
+Scoped to TrueNAS subsystems (`subsysnqn` match), whole-disk only
+(`DEVTYPE==disk`, avoids partition-write errors); capping the
+namespace head is enough because the bio layer splits before
+forwarding. Verify with
+`cat /sys/block/<nvmeNnM>/queue/max_sectors_kb` — rules that don't
+match any device fail silently. If your TrueNAS subsystem NQNs don't
+contain "truenas", adjust the glob.
 
 Validated against TN 25.10.4 and TN 26.0 BETA.x. Remove when the
 kernel patch (reviewed upstream) ships in a TrueNAS point release.
