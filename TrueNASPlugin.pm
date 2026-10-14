@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.24~beta1';
+our $VERSION = '2.1.24~beta2';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 16;
 use JSON::PP qw(encode_json decode_json);
@@ -6533,11 +6533,41 @@ sub _nvme_device_for_uuid {
     # kernel needed a SECOND reconnect to see it. The single-reconnect
     # cap was silently killing recovery.
     #
-    # The only remaining safety concern with unconditional emergency
-    # reconnect: cost is ~500ms NVMe controller drop for other VMs on
-    # the shared subsystem, running at the moment the loop exhausts.
-    # Trade-off: 500ms I/O pause vs a guaranteed failure. The pause
-    # wins.
+    # alpha26 shipped the emergency reconnect unconditionally on the
+    # premise that a ~500ms NVMe controller drop for other VMs on the
+    # shared subsystem was "the lesser evil" vs a guaranteed activate
+    # failure. GitHub #131 (dsmitty166, 2026-10-14) proved that premise
+    # wrong in multi-tenant deployments: the kernel's controller-loss
+    # window is long enough that QEMU's io-error policy escalates for
+    # unrelated running VMs — they end up with /dev/nvmeN handles
+    # marked "deleted", enter paused(io-error), and require a full VM
+    # restart to recover.
+    #
+    # Fix: gate the emergency reconnect on an in-use check. If the
+    # shared subsystem has any device open by another process on this
+    # host, refuse to reconnect — fail THIS activate_volume instead,
+    # leaving the other consumers undisturbed. Requires explicit
+    # administrative intervention to resolve (verify the namespace on
+    # TrueNAS, then manually disconnect+reconnect the subsystem when
+    # safe to do so). An unused subsystem (no other consumers on it)
+    # still goes through the emergency reconnect since nothing else is
+    # harmed.
+    #
+    # _nvme_check_devices_in_use returns 1 (fail-safe assume-in-use)
+    # if `fuser` isn't on the host, so this gate also skips when we
+    # can't verify. That is intentional: if we can't tell whether the
+    # subsystem is safe to disrupt, refuse to disrupt it.
+    #
+    # TOCTOU: there is a sub-ms window between the fuser check and the
+    # reconnect decision in which a process could open or close an fd.
+    # The i==10 / i==35 gates document the same risk; PVE's storage
+    # lock serializes concurrent activate_volume calls so an in-flight
+    # VM start is not a realistic trigger, and a false-positive gate
+    # (a fd closed in the window) costs one activate retry.
+    my @_emg_dev_paths = _nvme_get_subsystem_device_paths($scfg);
+    my $_emg_in_use = @_emg_dev_paths
+        ? _nvme_check_devices_in_use($scfg, @_emg_dev_paths)
+        : 0;
     if (!$allow_reconnect) {
         _log($scfg, 0, 'warning',
             "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
@@ -6546,6 +6576,16 @@ sub _nvme_device_for_uuid {
         _log($scfg, 0, 'warning',
             "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
             . "(_nvme_is_connected=0) — subsystem not currently connected");
+    } elsif ($_emg_in_use) {
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
+            . "for UUID $device_uuid — shared subsystem is in use by "
+            . "other process(es); refusing to disrupt the consumers of "
+            . "the shared controller (GitHub #131). Admin: verify the "
+            . "namespace is published on TrueNAS, then — only when no "
+            . "consumers are using this subsystem — manually "
+            . "`nvme disconnect` + `nvme connect` to flush the "
+            . "controller's stale namespace cache.");
     } else {
         # Before the emergency reconnect, sweep orphan namespaces off our
         # subsystem. Under multi-node load the publication-mismatch that
