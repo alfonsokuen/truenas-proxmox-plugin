@@ -211,10 +211,19 @@ fails before activation. Omit this line once you've replaced the
 TrueNAS cert with one your Proxmox hosts trust.
 
 **NVMe/TCP Requirements**:
-- TrueNAS SCALE 25.10.0 or later
+- TrueNAS 25.10.0 or later
 - Proxmox VE 9.x or later
 - Install `nvme-cli` on Proxmox: `apt-get install nvme-cli`
 - Enable **NVMe-oF Target** service in TrueNAS
+
+**TrueNAS HA pair (dual-controller):** NVMe/TCP against a TrueNAS HA
+pair needs **`tn_nvme_manage_ports 0`** plus a one-time admin-run
+`midclt` recipe to pre-provision a single VIP-based port record. The
+plugin's default port-management path creates physical-IP port records,
+which TrueNAS 25.10.x's middleware rejects on HA with a KeyError that
+leaves every namespace unpublished in configfs. See
+[wiki/Best-Practices.md#nvmetcp-ha-failover](wiki/Best-Practices.md#nvmetcp-ha-failover)
+and the [HA stanza in storage.cfg.example](storage.cfg.example).
 
 **⚠️ Known issue — large-transfer I/O errors (GitHub #45, #96):** TrueNAS's
 `nvmet-tcp` kernel module is missing the `.get_mdts` callback, so

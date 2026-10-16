@@ -20,6 +20,7 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
   - [vmstate Storage Considerations](#vmstate-storage-considerations)
 - [TrueNAS Specific Limitations](#truenas-specific-limitations)
   - [nvmet-tcp missing .get_mdts → large-transfer I/O errors](#nvmet-tcp-missing-get_mdts--large-transfer-io-errors)
+  - [TrueNAS HA + NVMe/TCP needs tn_nvme_manage_ports 0](#truenas-ha--nvmetcp-needs-tn_nvme_manage_ports-0)
   - [API Rate Limits](#api-rate-limits)
   - [WebSocket Connection Stability](#websocket-connection-stability)
   - [Version Compatibility](#version-compatibility)
@@ -357,6 +358,44 @@ subsystem.
 
 **Remove the rule** once the kernel fix lands in your TrueNAS
 version.
+
+### TrueNAS HA + NVMe/TCP needs `tn_nvme_manage_ports 0`
+
+**Affected:** NVMe/TCP against a TrueNAS HA pair (dual controller)
+on 25.10.x. iSCSI is not affected.
+
+**Symptom:** the subsystem connects, but no namespaces appear as
+block devices on the Proxmox host. `nvme list-subsys` shows the
+controller as live; `nvme list` shows nothing from that subsystem.
+On the TrueNAS side the middlewared log contains a stack ending in
+`KeyError` out of `map_attrs()` whenever the plugin tries to create
+an `nvmet.port` record.
+
+**Root cause:** the `nvmet` middleware's `map_attrs()` validates
+each `nvmet.port` record's `addr_traddr` against a hard-coded
+`choices` dict. On HA, that dict contains only the pair's VIP, so a
+record whose `addr_traddr` is a physical controller IP trips a
+`KeyError` inside `write_config()`. The exception aborts the entire
+configfs render, which includes every port AND every namespace in
+the subsystem. By default this plugin creates one `nvmet.port` per
+configured portal, and those portals naturally carry physical IPs —
+exactly the pattern that triggers the KeyError. On a single-head
+TrueNAS the dict accepts the controller IP and the default works.
+
+**Workaround:** set `tn_nvme_manage_ports 0` on the HA pair's
+storage stanza and pre-provision one VIP-based `nvmet.port` by
+hand. With `manage_ports=0` the plugin skips every `nvmet.port.*`
+mutation; the subsystem lookup, the namespace lifecycle, and the
+initiator-side connect still work as before.
+
+See
+[Best-Practices.md#nvmetcp-ha-failover](Best-Practices.md#nvmetcp-ha-failover)
+for the full setup, including the three `midclt` calls that
+bootstrap the TrueNAS side.
+
+**Status:** this is a TrueNAS middleware constraint, not a plugin
+bug. The workaround stays as long as the HA `map_attrs()` dict
+only accepts the VIP.
 
 ### API Rate Limits
 
