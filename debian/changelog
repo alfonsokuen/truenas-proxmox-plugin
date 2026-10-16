@@ -1,3 +1,38 @@
+truenas-proxmox-plugin (2.1.24~beta3) unstable; urgency=medium
+
+  * feat(nvme-ha): add tn_nvme_manage_ports (boolean, default 1) so an
+    admin can disable the plugin's auto-creation of nvmet.port and
+    nvmet.port_subsys records on TrueNAS. Required for a TrueNAS HA
+    pair on 25.10.x, where the middleware's nvmet map_attrs() refuses
+    any addr_traddr that is not the VIP: a physical-IP port record
+    triggers KeyError in write_config() and aborts the whole render,
+    leaving namespaces unpublished in configfs. With
+    tn_nvme_manage_ports=0 the plugin leaves nvmet.port.* to the
+    admin, who pre-provisions exactly one VIP-based port record;
+    TrueNAS renders that port on both controllers automatically,
+    kernel multipath + ANA handles failover. The plugin still manages
+    subsystem lookup, namespace lifecycle, and initiator connect. If
+    the subsystem is missing while manage_ports=0, the plugin refuses
+    to auto-create and prints the three midclt calls needed to
+    bootstrap.
+
+  * docs(nvme-ha): discoverable HA deployment documentation beyond the
+    bare property reference. README gains an HA callout in the
+    NVMe/TCP section; wiki/NVMe-Setup.md adds an "HA Pair (Dual
+    Controller) Deployment" subsection with the midclt recipe;
+    wiki/Best-Practices.md expands the "NVMe/TCP HA failover" section
+    (previously two sentences about `nvme list-subsys`) to include the
+    storage-config, TrueNAS-side pre-provisioning, failover
+    verification, and the NGUID cross-check; wiki/Known-Limitations.md
+    documents the TrueNAS middleware constraint that drives the knob;
+    wiki/HA-NVMe-TCP-Validation.md and wiki/HA-Transport-Comparison.md
+    are added as supporting material (50-iteration failover record
+    with 50/50 PASS, 0 fio errors, 20.6 s average pause; and the
+    ANA-vs-ALUA transport-mechanism comparison that explains why the
+    NVMe/TCP recovery path behaves differently from iSCSI).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Fri, 16 Oct 2026 10:00:00 -0400
+
 truenas-proxmox-plugin (2.1.24~beta2) unstable; urgency=medium
 
   * nvme_device_for_uuid: gate the post-150-iter emergency reconnect
