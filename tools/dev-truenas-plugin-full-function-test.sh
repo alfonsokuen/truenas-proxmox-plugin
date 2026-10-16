@@ -1875,9 +1875,15 @@ test_efi_vm_creation() {
     pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
     sleep $API_SETTLE_TIME
 
-    # Create EFI VM
+    # Create EFI VM. -ostype l26 matches the rest of this suite's VM creates
+    # and avoids a pair of "Use of uninitialized value in string ne" warnings
+    # out of PVE qemu-server 9.0.30's check_efi_vars() — that sub compares
+    # $conf->{ostype} to 'win10'/'win11' without first checking it is
+    # defined, so an EFI VM created without -ostype fires the warning on
+    # every start. The real bug is in qemu-server, but silencing our test
+    # output lets a reader see when a NEW warning appears.
     log_info "Creating VM with EFI BIOS"
-    if ! qm create "$vmid" -name "test-efi-${vmid}" -memory 512 -bios ovmf >/dev/null 2>&1; then
+    if ! qm create "$vmid" -name "test-efi-${vmid}" -memory 512 -bios ovmf -ostype l26 >/dev/null 2>&1; then
         log_error "Failed to create EFI VM"
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
