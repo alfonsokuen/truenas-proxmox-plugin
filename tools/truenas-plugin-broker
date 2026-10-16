@@ -370,6 +370,35 @@ sub reap_idle {
     }
 }
 
+# ---------------- systemd Type=notify integration ----------------
+# When started under a systemd unit with Type=notify, systemd waits
+# for READY=1 on NOTIFY_SOCKET before considering the service
+# started. Downstream services (pvestatd, pvedaemon, pveproxy) with
+# After=truenas-plugin-broker.service will then wait for the broker
+# to actually be accepting connections — not just for the process
+# to be alive, which is all Type=simple guarantees. See GitHub #132:
+# at reboot, Type=simple let pvestatd start before the broker socket
+# was listening, and each pvestatd fork fell back to direct-WS auth
+# against TrueNAS, tripping TN's auth.login_with_api_key rate limit
+# (20 / 60 s) and locking the whole startup chain out for the
+# cooldown window. Type=notify + a READY=1 after bind closes that.
+#
+# Pure Perl implementation to avoid an extra process fork for a
+# `systemd-notify --ready` child during startup.
+sub sd_notify_ready {
+    my $sock_path = $ENV{NOTIFY_SOCKET};
+    return unless defined($sock_path) && length($sock_path);
+    # Abstract-namespace socket: name begins with '@' in the env var
+    # and should be sent to \0<rest> as the sun_path.
+    my $raw_path = $sock_path;
+    $raw_path = "\0" . substr($raw_path, 1) if substr($raw_path, 0, 1) eq '@';
+    my $addr = eval { Socket::sockaddr_un($raw_path) };
+    return unless defined $addr;
+    socket(my $sock, Socket::PF_UNIX(), Socket::SOCK_DGRAM(), 0) or return;
+    send($sock, "READY=1\n", 0, $addr);
+    close($sock);
+}
+
 # ---------------- Unix-socket server ----------------
 sub make_listener {
     unlink $SOCKET_PATH if -e $SOCKET_PATH;
@@ -521,6 +550,13 @@ $SIG{PIPE} = 'IGNORE';
 # and exit cleanly without touching parent's socket / pidfile.
 
 my $srv = make_listener();
+
+# The listen fd is now bound and listening. Workers haven't been forked
+# yet, but the kernel will queue incoming connections until one does
+# accept(). From a client's perspective the socket is ready, so this is
+# the right moment to tell systemd we're up (Type=notify). See
+# sd_notify_ready() comment for the ordering rationale.
+sd_notify_ready();
 
 # Prefork the worker pool. Parent creates listen fd, forks N children; each
 # child re-runs the accept loop against the shared fd. Kernel serializes

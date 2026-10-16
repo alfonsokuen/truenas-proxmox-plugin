@@ -1,3 +1,40 @@
+truenas-proxmox-plugin (2.1.24~beta4) unstable; urgency=medium
+
+  * fix(broker): correct systemd ordering so pvestatd/pvedaemon wait
+    for the broker's listen socket (GitHub #132). The broker's unit
+    was `Type=simple` + `After=network-online.target`, with nothing
+    ordering it ahead of the PVE storage services. At boot that
+    produced a race: pvestatd and pvedaemon start, call status() /
+    activate_storage() on each truenasplugin storage, find
+    /run/truenas-plugin/broker.sock not listening yet, and fall back
+    to the plugin's direct-WS path. Each PVE worker then
+    independently re-authenticates against TrueNAS, and the first
+    burst trips TN's `auth.login_with_api_key` rate limit (20 calls
+    / 60 s / IP) into a 10-minute cooldown. Every subsequent
+    status() tick stays rate-limited, pve-guests.service waits for
+    storages to become active, graphical.target is never reached,
+    autostart VMs never fire, and CPU churns on fork/respawn.
+
+    Fix:
+
+      - debian/truenas-plugin-broker.service: switch to `Type=notify`
+        with `NotifyAccess=main`, and add
+        `Before=pvestatd.service pvedaemon.service pveproxy.service`.
+        Downstream services now wait until the broker socket is
+        actually accepting connections before they start.
+
+      - tools/truenas-plugin-broker: add pure-Perl `sd_notify_ready()`
+        and call it immediately after `make_listener()` returns.
+        No extra fork, no sd-daemon dependency.
+
+    Reproduced on pvevm1 with a provisioned 5-VM load on
+    truenas-storage (onboot=1). Pre-fix: graphical.target never
+    reached in 14 min; pvestatd.log full of
+    "broker socket missing" followed by "TrueNAS API rate limited";
+    broker burned 20min of CPU time. Post-fix: boot clean.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 16 Oct 2026 12:00:00 -0400
+
 truenas-proxmox-plugin (2.1.24~beta3) unstable; urgency=medium
 
   * feat(nvme-ha): add tn_nvme_manage_ports (boolean, default 1) so an
