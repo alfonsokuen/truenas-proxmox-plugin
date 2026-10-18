@@ -1,7 +1,17 @@
-truenas-proxmox-plugin (1:2.1.25~dev+idk25) unstable; urgency=low
+truenas-proxmox-plugin (1:2.1.24~beta4+idk25) unstable; urgency=medium
 
   * Limita la regla udev de max_sectors_kb a discos NVMe completos para evitar
     intentos de escritura en particiones.
+
+  * Unidad del broker: TimeoutStartSec=30, para que un READY=1 perdido falle
+    rapido en vez de retener el arranque 90 s.
+
+  * La guarda NVMe de dispositivos en uso lee el mountinfo del host y uno por
+    cada namespace de montaje distinto en /proc. Un rootfs de CT montado solo
+    en su namespace ahora impide desconectar el subsistema aunque fuser -m
+    devuelva 1. Fallos de lectura cierran la guarda; PIDs desaparecidos se
+    ignoran. En idk23/idk24 solo se miraba el namespace del host y se dependia
+    de fuser -m para detectar esos montajes; se corrige esa descripcion abajo.
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Sun, 18 Oct 2026 12:00:00 -0500
 
@@ -12,8 +22,8 @@ truenas-proxmox-plugin (1:2.1.24~beta4+idk24) unstable; urgency=medium
     para TrueNAS HA, #132 orden de systemd del broker con sd_notify). En los dos
     conflictos de TrueNASPlugin.pm gana el fork: la edicion ya devolvia antes de
     exigir campos y la compuerta de emergencia ya fallaba cerrada
-    (_nvme_subsystem_busy, mountinfo de todos los procesos) en vez del fuser de
-    upstream, que trata un error como libre.
+    (_nvme_subsystem_busy, mountinfo del namespace del host y fuser -m) en vez
+    del fuser de upstream, que trata un error como libre.
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Sat, 17 Oct 2026 12:00:00 -0500
 

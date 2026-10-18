@@ -45,6 +45,7 @@ sub world {
     print $f $o{mount} . "\n" if $o{mount};
     close $f;
     make_path("$root/block/nvme0n1/holders/dm-0") if $o{holder};
+    make_path("$root/proc"); # keep the fake host independent of real /proc
     return $root;
 }
 sub gate {
@@ -52,6 +53,7 @@ sub gate {
     no strict 'refs';
     local ${"${PKG}::_NVME_SYSFS"}     = $root;
     local ${"${PKG}::_NVME_MOUNTINFO"} = "$root/mountinfo";
+    local ${"${PKG}::_NVME_PROC_ROOT"} = "$root/proc";
     local ${"${PKG}::_NVME_FUSER_RC"}  = sub { $fuser_rc };
     @paths = ('/dev/nvme0n1') unless @paths;
     return $check->($scfg, @paths);
@@ -73,6 +75,7 @@ is(gate(world(), 0), 1, '(a) fuser exiting 0 is in use');
     my $r = world();
     local ${"${PKG}::_NVME_SYSFS"}     = "$r/does-not-exist";
     local ${"${PKG}::_NVME_MOUNTINFO"} = "$r/mountinfo";
+    local ${"${PKG}::_NVME_PROC_ROOT"} = "$r/proc";
     local ${"${PKG}::_NVME_FUSER_RC"}  = sub { 1 };
     is($check->($scfg, '/dev/nvme0n1'), 1, '(4) an unreadable sysfs is IN USE, not "no devices"');
     my @r = $busy->($scfg);
@@ -85,6 +88,7 @@ is(gate(world(), 0), 1, '(a) fuser exiting 0 is in use');
     is(gate($r, 1), 1, '(e) a device with no readable dev number is IN USE');
     local ${"${PKG}::_NVME_SYSFS"}     = $r;
     local ${"${PKG}::_NVME_MOUNTINFO"} = "$r/nope";
+    local ${"${PKG}::_NVME_PROC_ROOT"} = "$r/proc";
     local ${"${PKG}::_NVME_FUSER_RC"}  = sub { 1 };
     is($check->($scfg, '/dev/nvme0c0n1'), 1, '(e2) an unreadable mountinfo is IN USE');
 }
@@ -100,6 +104,7 @@ is(gate(world(mount => '40 26 8:5 / /mnt/other rw - ext4 /dev/sdb1 rw'), 1), 0,
     my $r = world();
     local ${"${PKG}::_NVME_SYSFS"}     = $r;
     local ${"${PKG}::_NVME_MOUNTINFO"} = "$r/mountinfo";
+    local ${"${PKG}::_NVME_PROC_ROOT"} = "$r/proc";
     local ${"${PKG}::_NVME_FUSER_RC"}  = sub { 1 };
     my ($b, @p) = $busy->($scfg);
     is($b, 0, 'the subsystem gate: enumerated, nothing in use -> not busy');
