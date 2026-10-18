@@ -8669,10 +8669,11 @@ sub _nvme_find_device_by_subsystem {
 
 # Collect /dev/nvmeXnY paths for all block devices belonging to our subsystem NQN
 # Injectable roots so the in-use gate can be tested against a fake tree and
-# probed read-only on real hardware: sysfs root, mountinfo file, and a fuser
-# runner (returns fuser's exit status, undef when it could not be run).
+# probed read-only on real hardware: sysfs root, host mountinfo, proc root,
+# and a fuser runner (returns its exit status, undef when it could not run).
 our $_NVME_SYSFS     = '/sys';
 our $_NVME_MOUNTINFO = '/proc/self/mountinfo';
+our $_NVME_PROC_ROOT = q(/proc);
 our $_NVME_FUSER_RC;
 
 # With strict => 1 an unreadable /sys/block DIES instead of returning an empty
@@ -8821,7 +8822,8 @@ sub _nvme_warn_target_no_mdts {
 #
 # In use when: (a) fuser exits 0; (b) fuser exits > 1, dies, or is missing;
 # (c) the device, its partitions or the head of a multipath path device is the
-# source of a mount in mountinfo (matched by major:minor and by /dev name);
+# source of a mount in any mount namespace (matched by major:minor and by
+# /dev name);
 # (d) its sysfs holders/ directory (or a partition's) is not empty (dm, LVM,
 # md); (e) sysfs cannot be read or a device has no readable dev number.
 sub _nvme_check_devices_in_use {
@@ -8891,25 +8893,94 @@ sub _nvme_check_devices_in_use {
         }
     }
 
-    # Mounts, by major:minor and by source name.
+    # Mounts, by major:minor and by source name. Read the host's injected
+    # mountinfo first, then one process in each other mount namespace.
+    my $mounted = sub {
+        my ($fh, $path) = @_;
+        $! = 0;
+        while (my $line = <$fh>) {
+            my @f = split ' ', $line;
+            my $dash = 0;
+            $dash++ while $dash < @f && $f[$dash] ne '-';
+            my $mm  = $f[2] // '';
+            my $src = $f[$dash + 2] // '';
+            if ($majmin{$mm} || $devnames{$src}) {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $src ($mm) is mounted");
+                return 1;
+            }
+        }
+        if ($!) {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot finish reading $path ($!), treating as in use");
+            return 1;
+        }
+        return 0;
+    };
     my $mi;
     if (!open($mi, '<', $_NVME_MOUNTINFO)) {
         _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot read $_NVME_MOUNTINFO ($!), treating as in use");
         return 1;
     }
-    while (my $line = <$mi>) {
-        my @f = split ' ', $line;
-        my $dash = 0;
-        $dash++ while $dash < @f && $f[$dash] ne '-';
-        my $mm  = $f[2] // '';
-        my $src = $f[$dash + 2] // '';
-        if ($majmin{$mm} || $devnames{$src}) {
-            close($mi);
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $src ($mm) is mounted");
+    my $host_mounted = $mounted->($mi, $_NVME_MOUNTINFO);
+    my $host_closed = close($mi);
+    return 1 if $host_mounted;
+    if (!$host_closed) {
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot close $_NVME_MOUNTINFO ($!), treating as in use");
+        return 1;
+    }
+
+    my $proc = $_NVME_PROC_ROOT;
+    my $pdh;
+    if (!opendir($pdh, $proc)) {
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot list $proc ($!), treating as in use");
+        return 1;
+    }
+    $! = 0;
+    my @pids = grep { /^\d+$/ } readdir($pdh);
+    if ($!) {
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot finish listing $proc ($!), treating as in use");
+        closedir($pdh);
+        return 1;
+    }
+    if (!closedir($pdh)) {
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot close $proc ($!), treating as in use");
+        return 1;
+    }
+
+    my %seen_ns;
+    my $host_ns = readlink("$proc/self/ns/mnt");
+    if (!defined($host_ns) && !$!{ENOENT} && !$!{ESRCH}) {
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot read $proc/self/ns/mnt ($!), treating as in use");
+        return 1;
+    }
+    $seen_ns{$1} = 1 if defined($host_ns) && $host_ns =~ /^mnt:\[(\d+)\]$/;
+    for my $pid (@pids) {
+        my $ns = readlink("$proc/$pid/ns/mnt");
+        if (!defined $ns) {
+            next if $!{ENOENT} || $!{ESRCH};
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot read $proc/$pid/ns/mnt ($!), treating as in use");
             return 1;
         }
+        if ($ns !~ /^mnt:\[(\d+)\]$/) {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: unrecognised mount namespace '$ns', treating as in use");
+            return 1;
+        }
+        my $inode = $1;
+        next if $seen_ns{$inode};
+        my $path = "$proc/$pid/mountinfo";
+        if (!open($mi, '<', $path)) {
+            next if $!{ENOENT} || $!{ESRCH};
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot read $path ($!), treating as in use");
+            return 1;
+        }
+        my $in_use = $mounted->($mi, $path);
+        my $closed = close($mi);
+        return 1 if $in_use;
+        if (!$closed) {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot close $path ($!), treating as in use");
+            return 1;
+        }
+        $seen_ns{$inode} = 1;
     }
-    close($mi);
 
     # Processes that hold a device node open (QEMU, tools, anything).
     my $rc;
