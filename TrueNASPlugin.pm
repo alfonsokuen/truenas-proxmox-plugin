@@ -9188,8 +9188,8 @@ sub _nvme_device_for_uuid {
         # subsystem, and a running guest on another namespace would see EIO.
         _log($scfg, 0, 'warning',
             "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
-            . "(subsystem devices are in use) - not dropping the subsystem under running guests; "
-            . "the activation fails instead");
+            . "(subsystem is in use by other process(es), or that could not be verified) - not dropping "
+            . "the subsystem under running guests (upstream GitHub #131); the activation fails instead");
     } else {
         # Before the emergency reconnect, sweep orphan namespaces off our
         # subsystem. Under multi-node load the publication-mismatch that
