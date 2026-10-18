@@ -20,6 +20,10 @@
 # WHY NOT a blanket nvme match. That would also throttle the node's local NVMe,
 # which is where local-lvm lives. The NQN match is what keeps this off it.
 #
+# WHY DEVTYPE. The nvme*n* kernel glob also matches namespace partitions
+# (nvme6n2p1, etc.), where max_sectors_kb is not writable. Restrict the rule to
+# whole disks to avoid udev write errors.
+#
 # MEASURED (lab, 3-node cluster, kernel 6.8 and 7.0.2-pve):
 #
 #     head 1280 / paths 1280  ->  actual request size 1024 KB
@@ -65,5 +69,5 @@
 #
 # Adjust the NQN glob if the array's subsystem NQNs do not contain "truenas".
 
-ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", \
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
   ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
