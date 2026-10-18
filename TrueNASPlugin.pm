@@ -1469,47 +1469,13 @@ sub check_config {
         die "tn_dataset is required\n";
     }
 
-    # Format and cross-field warnings run whenever the relevant field is
-    # actually submitted — safe on both create and edit.
-    if (defined $opts->{tn_subsystem_nqn}
-        && $opts->{tn_subsystem_nqn} !~ /^nqn\.\d{4}-\d{2}\./) {
-        die "tn_subsystem_nqn must follow NVMe NQN format (e.g., nqn.2005-10.org.example:identifier)\n";
-    }
-    if (defined $opts->{tn_hostnqn}
-        && $opts->{tn_hostnqn} ne ''
-        && $opts->{tn_hostnqn} !~ /^nqn\./) {
-        die "tn_hostnqn must follow NVMe NQN format\n";
-    }
+    # Validate transport mode and transport-specific parameters
+    my $mode = $opts->{tn_transport_mode} // 'iscsi';
 
-    if (defined $opts->{tn_transport_mode}) {
-        my $mode = $opts->{tn_transport_mode};
-        if ($mode eq 'iscsi') {
-            if ($opts->{tn_subsystem_nqn}) {
-                syslog('warning',
-                    "[TrueNAS] Storage '$sectionId': tn_subsystem_nqn is ignored in iSCSI mode"
-                );
-            }
-            if ($opts->{tn_hostnqn}) {
-                syslog('warning',
-                    "[TrueNAS] Storage '$sectionId': tn_hostnqn is ignored in iSCSI mode"
-                );
-            }
-        } elsif ($mode eq 'nvme-tcp') {
-            if ($opts->{tn_target_iqn}) {
-                syslog('warning',
-                    "[TrueNAS] Storage '$sectionId': tn_target_iqn is ignored in nvme-tcp mode"
-                );
-            }
-            if ($opts->{tn_chap_user} || $opts->{tn_chap_password}) {
-                syslog('warning',
-                    "[TrueNAS] Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use tn_nvme_dhchap_secret instead)"
-                );
-            }
-            if ($opts->{tn_use_by_path}) {
-                syslog('warning',
-                    "[TrueNAS] Storage '$sectionId': tn_use_by_path is ignored in nvme-tcp mode (UUID paths used)"
-                );
-            }
+    if ($mode eq 'iscsi') {
+        # iSCSI mode requires target_iqn and discovery_portal
+        if (!$opts->{tn_target_iqn}) {
+            die "tn_target_iqn is required for iSCSI transport\n";
         }
         if (!$opts->{tn_discovery_portal}) {
             die "tn_discovery_portal is required for iSCSI transport\n";
