@@ -206,6 +206,38 @@ truenasplugin: truenas-nvme-multipath
     tn_zvol_blocksize 128K
     tn_sparse 1
 
+# -----------------------------------------------------------------------------
+# TrueNAS HA pair (dual controller) + NVMe/TCP
+# -----------------------------------------------------------------------------
+# Set tn_nvme_manage_ports=0 so the plugin does NOT try to create
+# nvmet.port records with physical-IP addr_traddr values. TrueNAS 25.10.x
+# HA accepts only the VIP as addr_traddr; a physical-IP port trips a
+# map_attrs KeyError in middleware's write_config() and aborts the whole
+# render, leaving namespaces unpublished in configfs.
+#
+# Admin must pre-provision on TrueNAS once (replace <VIP>, <NQN>):
+#   midclt call nvmet.subsys.create '{"name":"ha-nvme","allow_any_host":true}'
+#   midclt call nvmet.port.create   '{"addr_trtype":"TCP","addr_traddr":"<VIP>","addr_trsvcid":4420}'
+#   midclt call nvmet.port_subsys.create '{"port_id":<N>,"subsys_id":<M>}'
+#
+# tn_api_host points at the VIP (management plane); tn_discovery_portal
+# points at a controller's physical IP (data plane) so nvme-cli can walk
+# TN's xport_referral list and connect every path.
+truenasplugin: truenas-ha-nvme
+    tn_api_host 10.0.1.188
+    tn_api_key 1-habackedhost123456789abcdef123456789abcdef
+    tn_dataset tank/proxmox-ha
+    tn_transport_mode nvme-tcp
+    tn_discovery_portal 10.0.1.189:4420
+    tn_subsystem_nqn nqn.2011-06.com.truenas:uuid:00000000-0000-0000-0000-000000000000:ha-nvme
+    tn_nvme_manage_ports 0
+    tn_nvme_ctrl_loss_tmo -1
+    tn_nvme_reconnect_delay 5
+    content images,rootdir
+    shared 1
+    tn_zvol_blocksize 16K
+    tn_api_insecure 1
+
 # =============================================================================
 # SMALL OFFICE CONFIGURATION
 # =============================================================================
@@ -293,6 +325,9 @@ truenasplugin: truenas-soho
 # Resilience:
 # - tn_api_budget_s: wall-clock cap for one retry sequence (this fork: default 120 s; upstream leaves it unset)
 # - tn_status_probe_backoff_s: suppress re-probing a just-failed array (default 30s; 0 = always probe)
+# - tn_nvme_manage_ports: 0 for TrueNAS HA pair + NVMe/TCP, so the plugin
+#   leaves nvmet.port records to the admin (TN 25.10.x rejects physical-IP
+#   addr_traddr in HA with a map_attrs KeyError). See the HA pair example above.
 #
 # Monitoring:
 # - Monitor storage performance regularly

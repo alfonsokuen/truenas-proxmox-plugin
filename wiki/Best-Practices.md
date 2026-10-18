@@ -234,19 +234,73 @@ guests; they are not round-number guesses. See
 
 ### NVMe/TCP HA failover
 
-NVMe/TCP handles path loss via native multipath. Verify with:
+NVMe/TCP against a TrueNAS HA pair requires one storage-config change
+on the Proxmox side plus a one-time admin-run `midclt` recipe on the
+TrueNAS side. Without them, the plugin's default port-management path
+creates `nvmet.port` records whose `addr_traddr` is a physical
+controller IP, which TrueNAS 25.10.x's middleware rejects on HA with a
+`map_attrs` KeyError that aborts the whole render and leaves every
+namespace unpublished in configfs.
+
+**Storage config:** set `tn_nvme_manage_ports 0` on the HA pair's
+storage stanza. The plugin then skips every `nvmet.port.*` mutation
+and leaves port management to TrueNAS. `tn_discovery_portal` still
+names a physical controller IP (data plane), so `nvme-cli` has a real
+target to connect to and can walk TrueNAS's `xport_referral` list to
+reach the second controller. `tn_api_host` names the VIP (management
+plane) so API calls follow the master.
+
+```ini
+truenasplugin: truenas-ha-nvme
+    tn_api_host 10.0.1.188
+    tn_api_key 1-...
+    tn_dataset tank/proxmox-ha
+    tn_transport_mode nvme-tcp
+    tn_discovery_portal 10.0.1.189:4420
+    tn_subsystem_nqn nqn.2011-06.com.truenas:uuid:...:ha-nvme
+    tn_nvme_manage_ports 0
+    tn_nvme_ctrl_loss_tmo -1
+    tn_nvme_reconnect_delay 5
+    content images,rootdir
+    shared 1
+```
+
+**TrueNAS side, once per subsystem (admin on either controller):**
+
+```bash
+midclt call nvmet.subsys.create       '{"name":"ha-nvme","allow_any_host":true}'
+midclt call nvmet.port.create         '{"addr_trtype":"TCP","addr_traddr":"<VIP>","addr_trsvcid":4420}'
+midclt call nvmet.port_subsys.create  '{"port_id":<N>,"subsys_id":<M>}'
+```
+
+Only the VIP (`addr_traddr`) is acceptable to the HA middleware.
+TrueNAS then renders that one logical port on both controllers; each
+controller binds the record to its own physical IP and advertises its
+own ANA state (`optimized` on the master, `inaccessible` on the
+standby). The kernel's native NVMe multipath on each Proxmox host
+walks the referral list at connect time and brings up a path through
+each controller.
+
+**Failover behavior:** kernel multipath moves traffic between the
+paths based on ANA state transitions; failover completes in a few
+seconds and the guest sees no I/O error at kernel level. Verify both
+paths are up before testing a failover:
 
 ```
 nvme list-subsys
 ```
 
-Both paths must show as `live` before failover; after failover, the
-surviving path stays `live` and the guest sees no I/O error at kernel
-level.
+Both paths must show as `live`. If only one controller's path is
+live, confirm that the subsystem is bound to the VIP port
+(`midclt call nvmet.port.query` on TrueNAS) and that
+`tn_discovery_portal` points at a controller IP both PVE and TN agree
+is up (the referral list is only walked after the first connect
+succeeds).
 
-Kernel NGUID must match TrueNAS-reported NGUID; the plugin cross-checks
-this on the stale-recovery path to prevent writing to the wrong device
-if a compromised or misbehaving TrueNAS ever returns a duplicate NGUID.
+**NGUID cross-check:** kernel NGUID must match the TrueNAS-reported
+NGUID; the plugin cross-checks this on the stale-recovery path to
+prevent writing to the wrong device if a compromised or misbehaving
+TrueNAS ever returns a duplicate NGUID.
 
 ### Snapshot coexistence with TrueNAS auto-snapshots
 

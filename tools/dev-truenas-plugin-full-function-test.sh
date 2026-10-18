@@ -355,6 +355,17 @@ log_error() {
 # Check if we should stop after the current phase (for --phase single-phase execution)
 check_stop_phase() {
     local completed_phase="$1"
+    # If the phase was skipped (out of [START, STOP]), do not fire the exit.
+    # This matters because phases are coded in a non-numeric order (e.g. 18
+    # before 16/17), so a `--start 16 --stop 17` run reaches phase 18's call
+    # site before phases 16/17 have had a chance to execute. A skipped phase
+    # must not trigger the stop.
+    if [[ "$completed_phase" -lt "$START_PHASE" ]]; then
+        return
+    fi
+    if [[ -n "$STOP_PHASE" && "$completed_phase" -gt "$STOP_PHASE" ]]; then
+        return
+    fi
     if [[ -n "$STOP_PHASE" && "$completed_phase" -ge "$STOP_PHASE" ]]; then
         log_info "Phase $STOP_PHASE completed. Exiting as requested (--phase $STOP_PHASE)."
         exit 0
@@ -1901,9 +1912,15 @@ test_efi_vm_creation() {
     pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
     sleep $API_SETTLE_TIME
 
-    # Create EFI VM
+    # Create EFI VM. -ostype l26 matches the rest of this suite's VM creates
+    # and avoids a pair of "Use of uninitialized value in string ne" warnings
+    # out of PVE qemu-server 9.0.30's check_efi_vars() — that sub compares
+    # $conf->{ostype} to 'win10'/'win11' without first checking it is
+    # defined, so an EFI VM created without -ostype fires the warning on
+    # every start. The real bug is in qemu-server, but silencing our test
+    # output lets a reader see when a NEW warning appears.
     log_info "Creating VM with EFI BIOS"
-    if ! qm create "$vmid" -name "test-efi-${vmid}" -memory 512 -bios ovmf >/dev/null 2>&1; then
+    if ! qm create "$vmid" -name "test-efi-${vmid}" -memory 512 -bios ovmf -ostype l26 >/dev/null 2>&1; then
         log_error "Failed to create EFI VM"
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
@@ -2825,8 +2842,15 @@ test_online_backup() {
     track_timing "online_backup" "$backup_duration"
 
     # Extract backup filename for cleanup
+    # `grep` returns 1 when nothing matches. Under `set -e -o pipefail`
+    # that would kill the test even though the backup itself succeeded —
+    # which is what happens when the backup target is PBS (vzdump prints
+    # a PBS backup task id, not a `vzdump-qemu-NNNN-...vma` filename).
+    # Keep the regex (it catches the local-dir case) but tolerate "no
+    # match": we only use $backup_file to pvesm-free a local backup
+    # file, and an empty value just skips that cleanup.
     local backup_file
-    backup_file=$(echo "$backup_output" | grep -o "vzdump-qemu-${vmid}-[^']*\\.vma\\(\\.[^']*\\)\\?" | head -1)
+    backup_file=$(echo "$backup_output" | grep -o "vzdump-qemu-${vmid}-[^']*\\.vma\\(\\.[^']*\\)\\?" | head -1 || true)
 
     # Stop and cleanup VM
     qm stop "$vmid" >/dev/null 2>&1 || true
@@ -2911,8 +2935,15 @@ test_offline_backup() {
     track_timing "offline_backup" "$backup_duration"
 
     # Extract backup filename for cleanup
+    # `grep` returns 1 when nothing matches. Under `set -e -o pipefail`
+    # that would kill the test even though the backup itself succeeded —
+    # which is what happens when the backup target is PBS (vzdump prints
+    # a PBS backup task id, not a `vzdump-qemu-NNNN-...vma` filename).
+    # Keep the regex (it catches the local-dir case) but tolerate "no
+    # match": we only use $backup_file to pvesm-free a local backup
+    # file, and an empty value just skips that cleanup.
     local backup_file
-    backup_file=$(echo "$backup_output" | grep -o "vzdump-qemu-${vmid}-[^']*\\.vma\\(\\.[^']*\\)\\?" | head -1)
+    backup_file=$(echo "$backup_output" | grep -o "vzdump-qemu-${vmid}-[^']*\\.vma\\(\\.[^']*\\)\\?" | head -1 || true)
 
     # Cleanup VM
     pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
@@ -7551,7 +7582,7 @@ main() {
     local test_num=1
 
     # Phase 2: Disk Allocation
-    if [[ $START_PHASE -gt 2 ]]; then
+    if [[ $START_PHASE -gt 2 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 2 ) ]]; then
         log_info "Skipping Phase 2 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7570,7 +7601,7 @@ main() {
     check_stop_phase 2
 
     # Phase 3: TrueNAS Size Verification
-    if [[ $START_PHASE -gt 3 ]]; then
+    if [[ $START_PHASE -gt 3 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 3 ) ]]; then
         log_info "Skipping Phase 3 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7589,7 +7620,7 @@ main() {
     check_stop_phase 3
 
     # Phase 4: Disk Deletion
-    if [[ $START_PHASE -gt 4 ]]; then
+    if [[ $START_PHASE -gt 4 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 4 ) ]]; then
         log_info "Skipping Phase 4 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7608,7 +7639,7 @@ main() {
     check_stop_phase 4
 
     # Phase 5: Clone and Snapshot Tests
-    if [[ $START_PHASE -gt 5 ]]; then
+    if [[ $START_PHASE -gt 5 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 5 ) ]]; then
         log_info "Skipping Phase 5 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7649,7 +7680,7 @@ main() {
     check_stop_phase 5
 
     # Phase 6: Disk Resize
-    if [[ $START_PHASE -gt 6 ]]; then
+    if [[ $START_PHASE -gt 6 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 6 ) ]]; then
         log_info "Skipping Phase 6 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7665,7 +7696,7 @@ main() {
     check_stop_phase 6
 
     # Phase 7: Concurrent Operations
-    if [[ $START_PHASE -gt 7 ]]; then
+    if [[ $START_PHASE -gt 7 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 7 ) ]]; then
         log_info "Skipping Phase 7 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7681,7 +7712,7 @@ main() {
     check_stop_phase 7
 
     # Phase 8: Performance
-    if [[ $START_PHASE -gt 8 ]]; then
+    if [[ $START_PHASE -gt 8 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 8 ) ]]; then
         log_info "Skipping Phase 8 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7697,7 +7728,7 @@ main() {
     check_stop_phase 8
 
     # Phase 9: Multiple Disks
-    if [[ $START_PHASE -gt 9 ]]; then
+    if [[ $START_PHASE -gt 9 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 9 ) ]]; then
         log_info "Skipping Phase 9 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7713,7 +7744,7 @@ main() {
     check_stop_phase 9
 
     # Phase 10: EFI VM Creation
-    if [[ $START_PHASE -gt 10 ]]; then
+    if [[ $START_PHASE -gt 10 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 10 ) ]]; then
         log_info "Skipping Phase 10 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7730,7 +7761,7 @@ main() {
     check_stop_phase 10
 
     # Phase 11: Multi-Disk Advanced Operations
-    if [[ $START_PHASE -gt 11 ]]; then
+    if [[ $START_PHASE -gt 11 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 11 ) ]]; then
         log_info "Skipping Phase 11 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7755,7 +7786,7 @@ main() {
     # Cluster-based tests (only if cluster detected)
     if [[ $IS_CLUSTER -eq 1 ]]; then
         # Phase 12: Live Migration
-        if [[ $START_PHASE -gt 12 ]]; then
+        if [[ $START_PHASE -gt 12 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 12 ) ]]; then
             log_info "Skipping Phase 12 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7770,7 +7801,7 @@ main() {
         fi
 
         # Phase 13: Offline Migration
-        if [[ $START_PHASE -gt 13 ]]; then
+        if [[ $START_PHASE -gt 13 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 13 ) ]]; then
             log_info "Skipping Phase 13 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7785,7 +7816,7 @@ main() {
         fi
 
         # Phase 14: Cross-Node Clone (Online)
-        if [[ $START_PHASE -gt 14 ]]; then
+        if [[ $START_PHASE -gt 14 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 14 ) ]]; then
             log_info "Skipping Phase 14 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7801,7 +7832,7 @@ main() {
         fi
 
         # Phase 15: Cross-Node Clone (Offline)
-        if [[ $START_PHASE -gt 15 ]]; then
+        if [[ $START_PHASE -gt 15 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 15 ) ]]; then
             log_info "Skipping Phase 15 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7822,7 +7853,7 @@ main() {
     check_stop_phase 15
 
     # Phase 18: Rapid Creation/Deletion Stress Test
-    if [[ $START_PHASE -gt 18 ]]; then
+    if [[ $START_PHASE -gt 18 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 18 ) ]]; then
         log_info "Skipping Phase 18 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7838,7 +7869,7 @@ main() {
     check_stop_phase 18
 
     # Phase 19: Storage Quota/Space Exhaustion Test
-    if [[ $START_PHASE -gt 19 ]]; then
+    if [[ $START_PHASE -gt 19 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 19 ) ]]; then
         log_info "Skipping Phase 19 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7854,7 +7885,7 @@ main() {
     check_stop_phase 19
 
     # Phase 20: Invalid/Malformed API Requests Test
-    if [[ $START_PHASE -gt 20 ]]; then
+    if [[ $START_PHASE -gt 20 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 20 ) ]]; then
         log_info "Skipping Phase 20 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7870,7 +7901,7 @@ main() {
     check_stop_phase 20
 
     # Phase 21: Interrupted Operations Test
-    if [[ $START_PHASE -gt 21 ]]; then
+    if [[ $START_PHASE -gt 21 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 21 ) ]]; then
         log_info "Skipping Phase 21 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7886,7 +7917,7 @@ main() {
     check_stop_phase 21
 
     # Phase 22: Large Disk Operations Test
-    if [[ $START_PHASE -gt 22 ]]; then
+    if [[ $START_PHASE -gt 22 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 22 ) ]]; then
         log_info "Skipping Phase 22 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7904,7 +7935,7 @@ main() {
     # Backup tests (only if backup storage specified)
     if [[ -n "$BACKUP_STORE" ]]; then
         # Phase 16: Online Backup
-        if [[ $START_PHASE -gt 16 ]]; then
+        if [[ $START_PHASE -gt 16 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 16 ) ]]; then
             log_info "Skipping Phase 16 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7919,7 +7950,7 @@ main() {
         fi
 
         # Phase 17: Offline Backup
-        if [[ $START_PHASE -gt 17 ]]; then
+        if [[ $START_PHASE -gt 17 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 17 ) ]]; then
             log_info "Skipping Phase 17 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7939,7 +7970,7 @@ main() {
     check_stop_phase 17
 
     # Phase 23: Transport Mode Verification
-    if [[ $START_PHASE -gt 23 ]]; then
+    if [[ $START_PHASE -gt 23 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 23 ) ]]; then
         log_info "Skipping Phase 23 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7955,7 +7986,7 @@ main() {
     check_stop_phase 23
 
     # Phase 24: Snapshot Reversion
-    if [[ $START_PHASE -gt 24 ]]; then
+    if [[ $START_PHASE -gt 24 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 24 ) ]]; then
         log_info "Skipping Phase 24 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7971,7 +8002,7 @@ main() {
     check_stop_phase 24
 
     # Phase 25: Disk Hotswap
-    if [[ $START_PHASE -gt 25 ]]; then
+    if [[ $START_PHASE -gt 25 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 25 ) ]]; then
         log_info "Skipping Phase 25 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -7987,7 +8018,7 @@ main() {
     check_stop_phase 25
 
     # Phase 26: API Rate Limiting
-    if [[ $START_PHASE -gt 26 ]]; then
+    if [[ $START_PHASE -gt 26 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 26 ) ]]; then
         log_info "Skipping Phase 26 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8002,7 +8033,7 @@ main() {
     check_stop_phase 26
 
     # Phase 27: Multi-Pool Operations
-    if [[ $START_PHASE -gt 27 ]]; then
+    if [[ $START_PHASE -gt 27 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 27 ) ]]; then
         log_info "Skipping Phase 27 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8017,7 +8048,7 @@ main() {
     check_stop_phase 27
 
     # Phase 28: Performance Regression Tracking
-    if [[ $START_PHASE -gt 28 ]]; then
+    if [[ $START_PHASE -gt 28 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 28 ) ]]; then
         log_info "Skipping Phase 28 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8032,7 +8063,7 @@ main() {
     check_stop_phase 28
 
     # Phase 29: Dataset Property Inheritance
-    if [[ $START_PHASE -gt 29 ]]; then
+    if [[ $START_PHASE -gt 29 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 29 ) ]]; then
         log_info "Skipping Phase 29 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8048,7 +8079,7 @@ main() {
     check_stop_phase 29
 
     # Phase 30: NVMe Stale Connection Recovery
-    if [[ $START_PHASE -gt 30 ]]; then
+    if [[ $START_PHASE -gt 30 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 30 ) ]]; then
         log_info "Skipping Phase 30 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8064,7 +8095,7 @@ main() {
     check_stop_phase 30
 
     # Phase 31: Concurrent Alloc+Free Lock Contention
-    if [[ $START_PHASE -gt 31 ]]; then
+    if [[ $START_PHASE -gt 31 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 31 ) ]]; then
         log_info "Skipping Phase 31 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8079,7 +8110,7 @@ main() {
     check_stop_phase 31
 
     # Phase 32: Multi-Disk Sequential Timing
-    if [[ $START_PHASE -gt 32 ]]; then
+    if [[ $START_PHASE -gt 32 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 32 ) ]]; then
         log_info "Skipping Phase 32 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8094,7 +8125,7 @@ main() {
     check_stop_phase 32
 
     # Phase 33: Mixed Concurrent Operations
-    if [[ $START_PHASE -gt 33 ]]; then
+    if [[ $START_PHASE -gt 33 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 33 ) ]]; then
         log_info "Skipping Phase 33 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8109,7 +8140,7 @@ main() {
     check_stop_phase 33
 
     # Phase 34: Concurrent Clone Operations
-    if [[ $START_PHASE -gt 34 ]]; then
+    if [[ $START_PHASE -gt 34 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 34 ) ]]; then
         log_info "Skipping Phase 34 (--phase $START_PHASE)"
     else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8126,7 +8157,7 @@ main() {
     # Cluster-based concurrent tests (only if cluster detected)
     if [[ $IS_CLUSTER -eq 1 ]]; then
         # Phase 35: Cross-Node Concurrent Allocations
-        if [[ $START_PHASE -gt 35 ]]; then
+        if [[ $START_PHASE -gt 35 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 35 ) ]]; then
             log_info "Skipping Phase 35 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8140,7 +8171,7 @@ main() {
         fi
 
         # Phase 36: Concurrent Migration + Allocation
-        if [[ $START_PHASE -gt 36 ]]; then
+        if [[ $START_PHASE -gt 36 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 36 ) ]]; then
             log_info "Skipping Phase 36 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8161,7 +8192,7 @@ main() {
     # LXC container tests (only if rootdir content detected)
     if [[ $IS_ROOTDIR -eq 1 ]]; then
         # Phase 37: LXC Create/Start/Stop
-        if [[ $START_PHASE -gt 37 ]]; then
+        if [[ $START_PHASE -gt 37 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 37 ) ]]; then
             log_info "Skipping Phase 37 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8176,7 +8207,7 @@ main() {
         check_stop_phase 37
 
         # Phase 38: LXC Snapshot & Revert
-        if [[ $START_PHASE -gt 38 ]]; then
+        if [[ $START_PHASE -gt 38 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 38 ) ]]; then
             log_info "Skipping Phase 38 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8191,7 +8222,7 @@ main() {
         check_stop_phase 38
 
         # Phase 39: LXC Clone
-        if [[ $START_PHASE -gt 39 ]]; then
+        if [[ $START_PHASE -gt 39 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 39 ) ]]; then
             log_info "Skipping Phase 39 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8206,7 +8237,7 @@ main() {
         check_stop_phase 39
 
         # Phase 40: LXC Resize
-        if [[ $START_PHASE -gt 40 ]]; then
+        if [[ $START_PHASE -gt 40 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 40 ) ]]; then
             log_info "Skipping Phase 40 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8222,7 +8253,7 @@ main() {
 
         # Phase 41: LXC Live Migration (cluster only)
         if [[ $IS_CLUSTER -eq 1 ]]; then
-            if [[ $START_PHASE -gt 41 ]]; then
+            if [[ $START_PHASE -gt 41 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 41 ) ]]; then
                 log_info "Skipping Phase 41 (--phase $START_PHASE)"
             else
             echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8241,7 +8272,7 @@ main() {
         check_stop_phase 41
 
         # Phase 42: LXC Multi-Mountpoint
-        if [[ $START_PHASE -gt 42 ]]; then
+        if [[ $START_PHASE -gt 42 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 42 ) ]]; then
             log_info "Skipping Phase 42 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8256,7 +8287,7 @@ main() {
         check_stop_phase 42
 
         # Phase 43: LXC Rapid Create/Delete Stress
-        if [[ $START_PHASE -gt 43 ]]; then
+        if [[ $START_PHASE -gt 43 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 43 ) ]]; then
             log_info "Skipping Phase 43 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8271,7 +8302,7 @@ main() {
         check_stop_phase 43
 
         # Phase 44: LXC Concurrent Creation/Destruction
-        if [[ $START_PHASE -gt 44 ]]; then
+        if [[ $START_PHASE -gt 44 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 44 ) ]]; then
             log_info "Skipping Phase 44 (--phase $START_PHASE)"
         else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8288,7 +8319,7 @@ main() {
         # LXC backup tests (backup store only)
         if [[ -n "$BACKUP_STORE" ]]; then
             # Phase 45: LXC Online Backup
-            if [[ $START_PHASE -gt 45 ]]; then
+            if [[ $START_PHASE -gt 45 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 45 ) ]]; then
                 log_info "Skipping Phase 45 (--phase $START_PHASE)"
             else
             echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -8302,7 +8333,7 @@ main() {
             fi
 
             # Phase 46: LXC Offline Backup
-            if [[ $START_PHASE -gt 46 ]]; then
+            if [[ $START_PHASE -gt 46 || ( -n "$STOP_PHASE" && "$STOP_PHASE" -lt 46 ) ]]; then
                 log_info "Skipping Phase 46 (--phase $START_PHASE)"
             else
             echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"

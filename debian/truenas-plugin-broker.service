@@ -3,9 +3,22 @@ Description=TrueNAS Proxmox Plugin Session Broker
 Documentation=https://github.com/truenas/truenas-proxmox-plugin
 After=network-online.target
 Wants=network-online.target
+# GitHub #132: order the broker BEFORE the PVE services that call into
+# the plugin. Without this, at boot pvestatd/pvedaemon can start before
+# the broker's Unix socket is listening, fall back to direct-WS auth
+# against TrueNAS, and trip auth.login_with_api_key rate limits —
+# locking the storage out for a 10-minute cooldown and preventing
+# graphical.target from being reached.
+Before=pvestatd.service pvedaemon.service pveproxy.service
 
 [Service]
-Type=simple
+# Type=notify pairs with sd_notify_ready() in the broker, which sends
+# READY=1 only after the listen socket is bound. Downstream services
+# with After=truenas-plugin-broker.service then wait for the socket to
+# actually be listening before they start, not just for the process to
+# be alive.
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/sbin/truenas-plugin-broker --foreground
 Restart=on-failure
 RestartSec=2

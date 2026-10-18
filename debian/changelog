@@ -1,3 +1,15 @@
+truenas-proxmox-plugin (1:2.1.24~beta4+idk24) unstable; urgency=medium
+
+  * Base: integra upstream 2.1.24~beta1..beta4 (check_config en edicion + APIVER
+    16, #131 compuerta de la reconexion NVMe de emergencia, tn_nvme_manage_ports
+    para TrueNAS HA, #132 orden de systemd del broker con sd_notify). En los dos
+    conflictos de TrueNASPlugin.pm gana el fork: la edicion ya devolvia antes de
+    exigir campos y la compuerta de emergencia ya fallaba cerrada
+    (_nvme_subsystem_busy, mountinfo de todos los procesos) en vez del fuser de
+    upstream, que trata un error como libre.
+
+ -- Alfonso Kuen <alfonsokuen@gmail.com>  Sat, 17 Oct 2026 12:00:00 -0500
+
 truenas-proxmox-plugin (1:2.1.23+deb1+idk23) unstable; urgency=medium
 
   * Base: integra upstream 2.1.23+deb1 (estable; = beta11 promovida). Trae

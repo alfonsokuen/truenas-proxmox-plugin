@@ -23,6 +23,8 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
   - [Requires Shared Storage](#requires-shared-storage)
   - [vmstate Storage Considerations](#vmstate-storage-considerations)
 - [TrueNAS Specific Limitations](#truenas-specific-limitations)
+  - [nvmet-tcp missing .get_mdts → large-transfer I/O errors](#nvmet-tcp-missing-get_mdts--large-transfer-io-errors)
+  - [TrueNAS HA + NVMe/TCP needs tn_nvme_manage_ports 0](#truenas-ha--nvmetcp-needs-tn_nvme_manage_ports-0)
   - [API Rate Limits](#api-rate-limits)
   - [WebSocket Connection Stability](#websocket-connection-stability)
   - [Version Compatibility](#version-compatibility)
@@ -420,6 +422,135 @@ shared 1
 ```
 
 ## TrueNAS Specific Limitations
+
+### `nvmet-tcp` missing `.get_mdts` → large-transfer I/O errors
+
+**Tracking:** GitHub #45 (original report, 2026-06), GitHub #96
+(current tracking issue with upstream analysis).
+
+**Affected:** NVMe/TCP transport on TrueNAS 25.10.x and TN 26.0 BETA.x.
+Does not affect iSCSI.
+
+**Symptom:** vzdump streaming backups, `qemu-img convert -t none`
+disk moves, `pvesm export | pvesm import` transfers, and any other
+large direct-I/O workload against an NVMe/TCP namespace can fail
+with `err -5 - Input/output error` partway through. On the Proxmox
+node:
+
+```
+nvme0c0n2: I/O Cmd(0x2) @ LBA ..., 32768 blocks, I/O Error (sct 0x0 / sc 0x6)
+```
+
+Matching entries on TrueNAS:
+
+```
+nvmet_tcp: queue N: failed to map data
+nvmet_tcp_map_data+... [nvmet_tcp]
+nvmet_tcp_try_recv_pdu+... [nvmet_tcp]
+nvmet_tcp_io_work+... [nvmet_tcp]
+```
+
+Oversized requests from the client have, in some reports, also led
+to silent corruption on offline (stopped-VM) disk moves — see #96
+and #32 for examples.
+
+**Root cause:** The `nvmet-tcp` kernel module does not implement
+the `.get_mdts` (Maximum Data Transfer Size) callback, so the target
+advertises an unlimited transfer size. Linux's nvme block layer
+chooses a default `max_sectors_kb` of 32768 (16 MB per request).
+When a request arrives, `nvmet_tcp_map_data()` cannot allocate the
+scatter-gather map and returns Internal Error (sct 0x0 / sc 0x6).
+
+**Status:** Kernel patch exists upstream and has received Reviewed-by
+from the NVMe maintainer. Not yet in a released TrueNAS point
+version at the time of writing.
+
+**Workaround — cap `max_sectors_kb` on every PVE node:**
+
+```bash
+cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
+  ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
+EOF
+udevadm control --reload
+udevadm trigger --subsystem-match=block --action=change
+```
+
+Four clauses, each necessary:
+
+- `KERNEL=="nvme*n*"` — any NVMe block device.
+- `ENV{DEVTYPE}=="disk"` — namespace head only; without this, udev
+  tries to write `max_sectors_kb` on every partition (`nvme6n2p1`
+  etc.) during guest-disk partition-table scans and logs an error
+  per partition in `journalctl -p err`.
+- `ATTRS{subsysnqn}=="nqn.*truenas*"` — scopes the cap to TrueNAS
+  subsystems only; local NVMe SSDs behind `local-lvm` or `local-zfs`
+  keep their native (large) MDTS. Adjust the glob if your subsystem
+  NQNs don't contain "truenas".
+- `ATTR{queue/max_sectors_kb}="1024"` — 1024 KiB (2048 sectors) is
+  the value this project validated against TN 25.10.4 and TN 26.0
+  BETA.x; it stays well under the mapping limit while leaving
+  streaming workloads at near-line-rate. If you still see sporadic
+  errors with 1024, drop to 128 (used by the original #45 reporter).
+
+**Trap:** `ATTRS{transport}=="tcp"` as a scope filter **does not
+work** with native NVMe multipath. The `transport` attribute lives on
+the per-path controllers (`nvme0c0n1`), not the namespace head
+(`nvme0n1`) that carries the queue limits — the rule installs cleanly
+and does nothing. Use `ATTRS{subsysnqn}` instead.
+
+**Verify** the value actually changed:
+
+```bash
+cat /sys/block/<nvmeNnM>/queue/max_sectors_kb
+```
+
+A rule that doesn't match any device fails silently. Capping the
+namespace head alone is enough; the bio layer splits before
+forwarding to the paths, so per-path `max_sectors_kb` doesn't need to
+be touched. The value survives a full disconnect/reconnect of the
+subsystem.
+
+**Remove the rule** once the kernel fix lands in your TrueNAS
+version.
+
+### TrueNAS HA + NVMe/TCP needs `tn_nvme_manage_ports 0`
+
+**Affected:** NVMe/TCP against a TrueNAS HA pair (dual controller)
+on 25.10.x. iSCSI is not affected.
+
+**Symptom:** the subsystem connects, but no namespaces appear as
+block devices on the Proxmox host. `nvme list-subsys` shows the
+controller as live; `nvme list` shows nothing from that subsystem.
+On the TrueNAS side the middlewared log contains a stack ending in
+`KeyError` out of `map_attrs()` whenever the plugin tries to create
+an `nvmet.port` record.
+
+**Root cause:** the `nvmet` middleware's `map_attrs()` validates
+each `nvmet.port` record's `addr_traddr` against a hard-coded
+`choices` dict. On HA, that dict contains only the pair's VIP, so a
+record whose `addr_traddr` is a physical controller IP trips a
+`KeyError` inside `write_config()`. The exception aborts the entire
+configfs render, which includes every port AND every namespace in
+the subsystem. By default this plugin creates one `nvmet.port` per
+configured portal, and those portals naturally carry physical IPs —
+exactly the pattern that triggers the KeyError. On a single-head
+TrueNAS the dict accepts the controller IP and the default works.
+
+**Workaround:** set `tn_nvme_manage_ports 0` on the HA pair's
+storage stanza and pre-provision one VIP-based `nvmet.port` by
+hand. With `manage_ports=0` the plugin skips every `nvmet.port.*`
+mutation; the subsystem lookup, the namespace lifecycle, and the
+initiator-side connect still work as before.
+
+See
+[Best-Practices.md#nvmetcp-ha-failover](Best-Practices.md#nvmetcp-ha-failover)
+for the full setup, including the three `midclt` calls that
+bootstrap the TrueNAS side.
+
+**Status:** this is a TrueNAS middleware constraint, not a plugin
+bug. The workaround stays as long as the HA `map_attrs()` dict
+only accepts the VIP.
 
 ### API Rate Limits
 
@@ -830,6 +961,7 @@ zfs set quota=500G tank/proxmox
 | WebSocket instability | Improve network stability, verify TLS/certs, tune retry settings |
 | Clone performance | Faster network, smaller images, accept limitation |
 | Multipath read performance | Upgrade to 10GbE, accept ~100 MB/s, or use parallel workloads |
+| nvmet-tcp large-transfer I/O errors | Cap `max_sectors_kb=1024` via udev rule on PVE nodes until kernel patch ships |
 
 ## See Also
 - [Troubleshooting Guide](Troubleshooting.md) - Solutions to common issues

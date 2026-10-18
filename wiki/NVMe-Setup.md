@@ -9,6 +9,7 @@ This guide covers setting up NVMe over TCP (NVMe/TCP) storage with the TrueNAS P
   - [Enable NVMe-oF Target Service](#enable-nvme-of-target-service)
   - [Create NVMe Subsystem](#create-nvme-subsystem)
   - [Configure DH-CHAP Authentication (Optional)](#configure-dh-chap-authentication-optional)
+  - [HA Pair (Dual Controller) Deployment](#ha-pair-dual-controller-deployment)
 - [Proxmox Configuration](#proxmox-configuration)
   - [Install nvme-cli](#install-nvme-cli)
   - [Configure Storage](#configure-storage)
@@ -95,6 +96,51 @@ The plugin automatically creates subsystems when needed, but you can create them
 ### Configure DH-CHAP Authentication (Optional)
 
 See the [DH-CHAP Authentication Setup](#dh-chap-authentication-setup) section for detailed authentication configuration.
+
+### HA Pair (Dual Controller) Deployment
+
+TrueNAS HA pairs on 25.10.x require two deviations from the
+single-head setup above. Without them, the plugin's default
+port-management creates `nvmet.port` records whose `addr_traddr` is a
+physical controller IP; TrueNAS's HA middleware then trips a
+`KeyError` in `map_attrs()` that aborts the configfs render and
+leaves every namespace unpublished (controller appears connected,
+but `nvme list` sees nothing).
+
+**1. Pre-provision one VIP-based port record on TrueNAS.** Run once
+per subsystem from either controller:
+
+```bash
+# Replace <VIP> and <SUBSYS_NAME>. If the subsystem already exists,
+# skip the first call and reuse its id as subsys_id below.
+midclt call nvmet.subsys.create       '{"name":"<SUBSYS_NAME>","allow_any_host":true}'
+# -> returns {"id": M, ...}
+
+midclt call nvmet.port.create         '{"addr_trtype":"TCP","addr_traddr":"<VIP>","addr_trsvcid":4420}'
+# -> returns {"id": N, ...}
+
+midclt call nvmet.port_subsys.create  '{"port_id":N,"subsys_id":M}'
+```
+
+Only the VIP is accepted as `addr_traddr`. TrueNAS renders this one
+logical port record on both controllers; each binds its own physical
+IP and advertises its own ANA state.
+
+**2. Set `tn_nvme_manage_ports 0` on the storage.** The plugin then
+skips every `nvmet.port.*` mutation and leaves the port record you
+pre-provisioned alone. `tn_api_host` points at the VIP (management
+plane); `tn_discovery_portal` points at a physical controller IP
+(data plane) so `nvme-cli` has a real target for discovery and can
+walk the subsystem's `xport_referral` list to reach the second
+controller.
+
+See the HA stanza in [`storage.cfg.example`](../storage.cfg.example)
+and the [NVMe/TCP HA failover](Best-Practices.md#nvmetcp-ha-failover)
+section of Best-Practices for the full failover-tuning context.
+
+If the subsystem named by `tn_subsystem_nqn` does not exist and
+`tn_nvme_manage_ports` is `0`, the plugin refuses to auto-create it
+and prints the three `midclt` calls above.
 
 ## Proxmox Configuration
 
@@ -697,6 +743,37 @@ Check kernel logs:
 ```bash
 dmesg | grep -i nvme | tail -20
 ```
+
+### Large-transfer I/O errors (vzdump, `qemu-img convert`)
+
+**Symptom:** backups, disk moves, or imports over NVMe/TCP fail
+partway through with `err -5 - Input/output error`. PVE logs show
+`I/O Error (sct 0x0 / sc 0x6)` on commands of around 16 MB (32768
+blocks). TrueNAS `dmesg` shows `nvmet_tcp: queue N: failed to map
+data`.
+
+**Cause:** The TrueNAS kernel `nvmet-tcp` module is missing the
+`.get_mdts` callback, so clients request transfers larger than the
+target can map. Tracked as GitHub #45 and #96; kernel patch
+pending in a TrueNAS point release.
+
+**Workaround — cap `max_sectors_kb` on every PVE node, scoped to
+TrueNAS subsystems only:**
+
+```bash
+cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
+  ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
+EOF
+udevadm control --reload
+udevadm trigger --subsystem-match=block --action=change
+```
+
+Verify: `cat /sys/block/<nvmeNnM>/queue/max_sectors_kb` should
+print `1024`. See
+[Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors](Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors)
+for the full writeup. Remove the rule when the kernel fix lands in
+your TrueNAS version.
 
 ### Namespace Issues
 

@@ -311,10 +311,50 @@ fails before activation. Omit this line once you've replaced the
 TrueNAS cert with one your Proxmox hosts trust.
 
 **NVMe/TCP Requirements**:
-- TrueNAS SCALE 25.10.0 or later
+- TrueNAS 25.10.0 or later
 - Proxmox VE 9.x or later
 - Install `nvme-cli` on Proxmox: `apt-get install nvme-cli`
 - Enable **NVMe-oF Target** service in TrueNAS
+
+**TrueNAS HA pair (dual-controller):** NVMe/TCP against a TrueNAS HA
+pair needs **`tn_nvme_manage_ports 0`** plus a one-time admin-run
+`midclt` recipe to pre-provision a single VIP-based port record. The
+plugin's default port-management path creates physical-IP port records,
+which TrueNAS 25.10.x's middleware rejects on HA with a KeyError that
+leaves every namespace unpublished in configfs. See
+[wiki/Best-Practices.md#nvmetcp-ha-failover](wiki/Best-Practices.md#nvmetcp-ha-failover)
+and the [HA stanza in storage.cfg.example](storage.cfg.example).
+
+**⚠️ Known issue — large-transfer I/O errors (GitHub #45, #96):** TrueNAS's
+`nvmet-tcp` kernel module is missing the `.get_mdts` callback, so
+clients may send transfers larger than the target can map. Any
+command that issues large direct I/O (vzdump streaming backups,
+`qemu-img convert -t none` disk moves, `pvesm` imports) can fail with
+`err -5 - Input/output error` partway through, and in some cases
+produce silent corruption. Cap the per-request transfer size on
+every Proxmox node that mounts this storage:
+
+```bash
+cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
+  ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
+EOF
+udevadm control --reload
+udevadm trigger --subsystem-match=block --action=change
+```
+
+Scoped to TrueNAS subsystems (`subsysnqn` match), whole-disk only
+(`DEVTYPE==disk`, avoids partition-write errors); capping the
+namespace head is enough because the bio layer splits before
+forwarding. Verify with
+`cat /sys/block/<nvmeNnM>/queue/max_sectors_kb` — rules that don't
+match any device fail silently. If your TrueNAS subsystem NQNs don't
+contain "truenas", adjust the glob.
+
+Validated against TN 25.10.4 and TN 26.0 BETA.x. Remove when the
+kernel patch (reviewed upstream) ships in a TrueNAS point release.
+See [wiki/Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors](wiki/Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors)
+for the full writeup.
 
 **See [wiki/NVMe-Setup.md](wiki/NVMe-Setup.md) for complete NVMe/TCP setup guide.**
 

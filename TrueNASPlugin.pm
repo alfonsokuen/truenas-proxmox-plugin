@@ -8,9 +8,9 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.23+deb1+idk23';
+our $VERSION = '2.1.24~beta4+idk24';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 15;
+our $TESTED_APIVER = 16;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -1187,6 +1187,19 @@ sub properties {
                           "sooner, at the cost of more keep-alive traffic.",
             type => 'integer', optional => 1, minimum => 1, maximum => 3600,
         },
+        tn_nvme_manage_ports => {
+            description => "Whether the plugin creates nvmet port + port_subsys records " .
+                          "to match tn_discovery_portal/tn_portals (default: 1). " .
+                          "Set to 0 for a TrueNAS HA pair: on 25.10.x TN's nvmet middleware " .
+                          "rejects physical-IP addr_traddr values in map_attrs with a " .
+                          "KeyError, which aborts write_config() and leaves namespaces " .
+                          "unrendered in configfs. Admin must then pre-provision a VIP-based " .
+                          "nvmet.port and nvmet.port_subsys binding to the subsystem named by " .
+                          "tn_subsystem_nqn; the plugin still manages the subsystem lookup, " .
+                          "the namespace lifecycle, and the initiator-side connect, but will " .
+                          "no longer touch nvmet.port.* records.",
+            type => 'boolean', optional => 1, default => 1,
+        },
     };
 }
 sub options {
@@ -1283,6 +1296,7 @@ sub options {
         tn_nvme_ctrl_loss_tmo   => { optional => 1 },
         tn_nvme_reconnect_delay => { optional => 1 },
         tn_nvme_keep_alive_tmo  => { optional => 1 },
+        tn_nvme_manage_ports    => { optional => 1 },
     };
 }
 
@@ -1455,13 +1469,47 @@ sub check_config {
         die "tn_dataset is required\n";
     }
 
-    # Validate transport mode and transport-specific parameters
-    my $mode = $opts->{tn_transport_mode} // 'iscsi';
+    # Format and cross-field warnings run whenever the relevant field is
+    # actually submitted — safe on both create and edit.
+    if (defined $opts->{tn_subsystem_nqn}
+        && $opts->{tn_subsystem_nqn} !~ /^nqn\.\d{4}-\d{2}\./) {
+        die "tn_subsystem_nqn must follow NVMe NQN format (e.g., nqn.2005-10.org.example:identifier)\n";
+    }
+    if (defined $opts->{tn_hostnqn}
+        && $opts->{tn_hostnqn} ne ''
+        && $opts->{tn_hostnqn} !~ /^nqn\./) {
+        die "tn_hostnqn must follow NVMe NQN format\n";
+    }
 
-    if ($mode eq 'iscsi') {
-        # iSCSI mode requires target_iqn and discovery_portal
-        if (!$opts->{tn_target_iqn}) {
-            die "tn_target_iqn is required for iSCSI transport\n";
+    if (defined $opts->{tn_transport_mode}) {
+        my $mode = $opts->{tn_transport_mode};
+        if ($mode eq 'iscsi') {
+            if ($opts->{tn_subsystem_nqn}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': tn_subsystem_nqn is ignored in iSCSI mode"
+                );
+            }
+            if ($opts->{tn_hostnqn}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': tn_hostnqn is ignored in iSCSI mode"
+                );
+            }
+        } elsif ($mode eq 'nvme-tcp') {
+            if ($opts->{tn_target_iqn}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': tn_target_iqn is ignored in nvme-tcp mode"
+                );
+            }
+            if ($opts->{tn_chap_user} || $opts->{tn_chap_password}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use tn_nvme_dhchap_secret instead)"
+                );
+            }
+            if ($opts->{tn_use_by_path}) {
+                syslog('warning',
+                    "[TrueNAS] Storage '$sectionId': tn_use_by_path is ignored in nvme-tcp mode (UUID paths used)"
+                );
+            }
         }
         if (!$opts->{tn_discovery_portal}) {
             die "tn_discovery_portal is required for iSCSI transport\n";
@@ -9296,6 +9344,17 @@ sub _nvme_device_for_uuid {
 sub _nvme_sync_portals {
     my ($scfg, $subsys_id) = @_;
 
+    # tn_nvme_manage_ports=0 is the HA opt-out: admin pre-provisions one
+    # VIP-based nvmet.port + nvmet.port_subsys binding, and the plugin stays
+    # out of nvmet.port.* entirely. See tn_nvme_manage_ports in properties()
+    # for why TN 25.10.x HA requires this (map_attrs KeyError on physical-IP
+    # addr_traddr).
+    if (defined $scfg->{tn_nvme_manage_ports} && !$scfg->{tn_nvme_manage_ports}) {
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: skipping "
+            . "(tn_nvme_manage_ports=0; admin manages nvmet.port.*)");
+        return;
+    }
+
     my $sid = _cache_host_key($scfg);
     if (time() - ($_portal_sync_last_ok{$sid} // 0) < $CACHE_TTL) {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: skipping (recently synced "
@@ -9427,6 +9486,18 @@ sub _nvme_ensure_subsystem {
         _nvme_reconcile_host_whitelist($scfg, $subsys_id, $subsys->{allow_any_host});
 
         return $subsys_id;
+    }
+
+    # Under tn_nvme_manage_ports=0 the admin owns the TrueNAS-side nvmet
+    # state; refuse to auto-create a subsystem and spell out the three
+    # midclt calls needed to pre-provision one.
+    if (defined $scfg->{tn_nvme_manage_ports} && !$scfg->{tn_nvme_manage_ports}) {
+        die "nvme_ensure_subsystem: subsystem '$nqn' does not exist on TrueNAS "
+            . "and tn_nvme_manage_ports=0, so the plugin will not create it. "
+            . "On an HA pair, pre-provision via midclt:\n"
+            . "  nvmet.subsys.create {name: ..., subnqn: '$nqn', allow_any_host: true}\n"
+            . "  nvmet.port.create   {addr_trtype: TCP, addr_traddr: <VIP>, addr_trsvcid: 4420}\n"
+            . "  nvmet.port_subsys.create {port_id: <N>, subsys_id: <M>}\n";
     }
 
     # Create subsystem if it doesn't exist

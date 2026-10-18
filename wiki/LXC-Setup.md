@@ -2,8 +2,8 @@
 
 This guide covers running LXC containers on a `truenasplugin` storage.
 The plugin exposes each container's rootfs as a raw block LUN (over
-iSCSI, NVMe/TCP, or Fibre Channel); Proxmox's LXC layer formats that
-LUN with `ext4` and mounts it as the container's root filesystem.
+iSCSI or NVMe/TCP); Proxmox's LXC layer formats that LUN with `ext4`
+and mounts it as the container's root filesystem.
 
 Container support is opt-in via the storage's `content` field: it is
 not enabled by default.
@@ -25,8 +25,7 @@ not enabled by default.
 
 - A working `truenasplugin` storage entry (any transport: iSCSI, NVMe/TCP,
   Fibre Channel). Follow the transport-specific setup guide first:
-  main README (iSCSI), [wiki/NVMe-Setup.md](NVMe-Setup.md), or
-  [wiki/FC-Setup.md](FC-Setup.md).
+  main README (iSCSI) or [wiki/NVMe-Setup.md](NVMe-Setup.md).
 - The plugin package installed on every Proxmox node that will host
   containers.
 - LXC templates available in a **separate** storage. The plugin cannot
@@ -121,8 +120,8 @@ Under the hood the plugin creates a ZFS snapshot per zvol on TrueNAS,
 recorded in the CT's config file. Rollback stops the CT, does
 `zfs rollback` on each backing zvol, and restarts (if it was running).
 
-All of the plugin's transports (iSCSI, NVMe/TCP, FC) handle CT
-snapshots identically because the ZFS layer on TrueNAS does the work.
+Both plugin transports (iSCSI, NVMe/TCP) handle CT snapshots
+identically because the ZFS layer on TrueNAS does the work.
 
 ## Backup and Restore
 
