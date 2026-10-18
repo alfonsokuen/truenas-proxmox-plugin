@@ -19,6 +19,9 @@ Before=pvestatd.service pvedaemon.service pveproxy.service
 # be alive.
 Type=notify
 NotifyAccess=main
+# A lost READY=1 would otherwise hold the start for the 90 s default and then kill
+# a broker that is in fact serving. Fail fast and let Restart= retry.
+TimeoutStartSec=30
 ExecStart=/usr/sbin/truenas-plugin-broker --foreground
 Restart=on-failure
 RestartSec=2
