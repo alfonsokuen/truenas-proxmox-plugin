@@ -103,5 +103,17 @@ is(gate(world()), 0, 'two namespaces without an NVMe mount are free');
     $NS_LINK{"$root/proc/302/root"}   = '/';
     is(gate($root), 1, 'a chrooted PID does not hide the mounts another PID of its namespace sees');
 }
+{
+    # A root that cannot be read (here: no link at all) identifies no view, so
+    # two PIDs of one namespace must not be folded into one.
+    my $root = world();
+    make_path("$root/proc/401/ns", "$root/proc/402/ns");
+    write_file("$root/proc/401/mountinfo", "26 1 8:3 / / rw - ext4 /dev/sda3 rw
+");
+    write_file("$root/proc/402/mountinfo", $ct_mount);
+    $NS_LINK{"$root/proc/401/ns/mnt"} = 'mnt:[505]';
+    $NS_LINK{"$root/proc/402/ns/mnt"} = 'mnt:[505]';
+    is(gate($root), 1, 'PIDs whose root cannot be read are not deduplicated');
+}
 
 done_testing;

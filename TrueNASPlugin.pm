@@ -8953,8 +8953,13 @@ sub _nvme_check_devices_in_use {
         return 1;
     }
     # A view is (namespace, root): mountinfo omits mounts outside the process's
-    # root, so a chrooted PID does not stand for the rest of its namespace.
-    $seen_ns{"$1|" . (readlink("$proc/self/root") // '')} = 1 if defined($host_ns) && $host_ns =~ /^mnt:\[(\d+)\]$/;
+    # root, so a chrooted PID does not stand for the rest of its namespace. A
+    # root that cannot be read identifies nothing, so it is never deduplicated.
+    if (defined($host_ns) && $host_ns =~ /^mnt:\[(\d+)\]$/) {
+        my $host_inode = $1;
+        my $host_root  = readlink("$proc/self/root");
+        $seen_ns{"$host_inode|$host_root"} = 1 if defined $host_root;
+    }
     for my $pid (@pids) {
         my $ns = readlink("$proc/$pid/ns/mnt");
         if (!defined $ns) {
@@ -8966,8 +8971,10 @@ sub _nvme_check_devices_in_use {
             _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: unrecognised mount namespace '$ns', treating as in use");
             return 1;
         }
-        my $view = "$1|" . (readlink("$proc/$pid/root") // '');
-        next if $seen_ns{$view};
+        my $inode = $1;
+        my $root  = readlink("$proc/$pid/root");
+        my $view  = defined $root ? "$inode|$root" : undef;
+        next if defined $view && $seen_ns{$view};
         my $path = "$proc/$pid/mountinfo";
         if (!open($mi, '<', $path)) {
             next if $!{ENOENT} || $!{ESRCH};
@@ -8981,7 +8988,7 @@ sub _nvme_check_devices_in_use {
             _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot close $path ($!), treating as in use");
             return 1;
         }
-        $seen_ns{$view} = 1;
+        $seen_ns{$view} = 1 if defined $view;
     }
 
     # Processes that hold a device node open (QEMU, tools, anything).

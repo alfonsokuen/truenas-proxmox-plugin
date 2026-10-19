@@ -92,10 +92,17 @@ info "orchestrator: $(hostname)"
 echo
 
 ###############################################################################
-info "========== CLEANUP: residue from any previous run =========="
+info "========== PRECHECK: the VMID range must be free =========="
+# This run destroys the VMs it creates (see CLEANUP). It must therefore never
+# start on an ID that already belongs to a guest: abort instead of "cleaning".
 for ((i=0; i<VM_COUNT; i++)); do
     id=$((VMID_START + i))
-    ssh_do "qm stop ${id} 2>&1 | head -2 || true; qm destroy ${id} --purge 1 2>&1 | head -2 || true" >/dev/null 2>&1 || true
+    taken="$(ssh_do "ls /etc/pve/nodes/*/qemu-server/${id}.conf /etc/pve/nodes/*/lxc/${id}.conf 2>/dev/null | wc -l")"         || { echo "cannot check VMID ${id} on ${NODE}; refusing to continue" >&2; exit 2; }
+    [[ "${taken}" =~ ^[0-9]+$ ]] || { echo "unexpected answer checking VMID ${id}: '${taken}'" >&2; exit 2; }
+    if (( taken > 0 )); then
+        echo "VMID ${id} already exists in the cluster; pick another --vmid-start (nothing was changed)" >&2
+        exit 2
+    fi
 done
 echo
 

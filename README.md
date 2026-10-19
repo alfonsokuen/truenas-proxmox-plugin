@@ -114,7 +114,7 @@ This fork publishes its builds as release assets on
 names (a `.deb` whose version has a `~`, such as idk22's, is served as
 `…_2.1.23.beta8+idk22_all.deb`). From idk23 on the version is
 `2.1.23+deb1+idk23` - no `~` - so the asset keeps its name and the download
-needs no renaming:
+needs no renaming (idk24 onward is cut from upstream `2.1.24~beta4`, so its version carries a `~` again and `install-idk.sh` handles the renamed asset; the example below is idk23):
 
 ```bash
 V=2.1.23+deb1+idk23
