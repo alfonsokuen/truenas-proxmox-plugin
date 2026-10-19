@@ -43,17 +43,18 @@ set -euo pipefail
 # Bump on every change that is meant to reach a node. raw.githubusercontent
 # caches aggressively, so the only way to know which script is running is
 # for the script to say so.
-INSTALLER_VERSION='idk23.0'
+INSTALLER_VERSION='idk25.0'
 PKG_NAME='truenas-proxmox-plugin'
 # idk12..idk21 were cut from upstream 2.1.23~alpha1, idk22 from 2.1.23~beta8,
-# idk23 onward from the stable 2.1.23+deb1; the release tag carries the
-# upstream base it was cut from.
+# idk23 from the stable 2.1.23+deb1, idk24 onward from upstream 2.1.24~beta4; the
+# release tag carries the upstream base it was cut from.
 base_version_for() {
     local n="${1#idk}"
-    case "$n" in ''|*[!0-9]*) echo '2.1.23-deb1'; return ;; esac
+    case "$n" in ''|*[!0-9]*) echo '2.1.24-beta4'; return ;; esac
     if [ "$n" -le 21 ]; then echo '2.1.23-alpha1'
     elif [ "$n" -eq 22 ]; then echo '2.1.23-beta8'
-    else echo '2.1.23-deb1'; fi
+    elif [ "$n" -eq 23 ]; then echo '2.1.23-deb1'
+    else echo '2.1.24-beta4'; fi
 }
 GH_API_BASE="${IDK_GH_API_BASE:-https://api.github.com}"
 GH_REPO="${IDK_GH_REPO:-alfonsokuen/truenas-proxmox-plugin}"

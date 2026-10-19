@@ -157,7 +157,11 @@ jobs:
           set -euo pipefail
           deb_version="$(dpkg-parsechangelog -S Version)"
           deb_version="${deb_version#*:}"
-          expected_tag="v${deb_version/+/-}"
+          # Git refs cannot hold "~": upstream's 2.1.24~beta4 is tagged 2.1.24-beta4.
+          # Only a "+deb" revision (2.1.23+deb1+idk23) loses its first "+" to a "-".
+          tag_version="${deb_version//\~/-}"
+          [[ "${tag_version}" == *+deb* ]] && tag_version="${tag_version/+/-}"
+          expected_tag="v${tag_version}"
           actual_tag="${GITHUB_REF_NAME}"
 
           if [[ "${actual_tag}" != "${expected_tag}" ]]; then

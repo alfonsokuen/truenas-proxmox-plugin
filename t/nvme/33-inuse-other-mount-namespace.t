@@ -89,5 +89,19 @@ is(gate(world()), 0, 'two namespaces without an NVMe mount are free');
     make_path("$root/proc/404/ns/mnt"); # readlink fails with EINVAL, not ENOENT
     is(gate($root), 1, 'an existing PID whose namespace cannot be read fails closed');
 }
+{
+    # Same mount namespace, different root: mountinfo hides mounts outside the
+    # process root, so one PID's view says nothing about another PID's.
+    my $root = world();
+    make_path("$root/proc/301/ns", "$root/proc/302/ns");
+    write_file("$root/proc/301/mountinfo", "26 1 8:3 / / rw - ext4 /dev/sda3 rw
+");
+    write_file("$root/proc/302/mountinfo", $ct_mount);
+    $NS_LINK{"$root/proc/301/ns/mnt"} = 'mnt:[303]';
+    $NS_LINK{"$root/proc/302/ns/mnt"} = 'mnt:[303]';
+    $NS_LINK{"$root/proc/301/root"}   = '/srv/chroot';
+    $NS_LINK{"$root/proc/302/root"}   = '/';
+    is(gate($root), 1, 'a chrooted PID does not hide the mounts another PID of its namespace sees');
+}
 
 done_testing;

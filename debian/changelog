@@ -6,6 +6,14 @@ truenas-proxmox-plugin (1:2.1.24~beta4+idk25) unstable; urgency=medium
   * Unidad del broker: TimeoutStartSec=30, para que un READY=1 perdido falle
     rapido en vez de retener el arranque 90 s.
 
+  * Panel de revision (Fable + Astra): la guarda deduplica los namespaces por
+    (namespace, raiz) y recorre los PID en orden, porque mountinfo omite los
+    montajes fuera de la raiz del proceso y un PID en chroot no representa a los
+    demas de su namespace. install-idk.sh y publish-apt.sh resuelven idk24 en
+    adelante a la base 2.1.24-beta4 (antes pedirian un tag 2.1.23-deb1
+    inexistente) y el workflow acepta el tag v2.1.24-beta4+idk25 (git no admite
+    "~" en refs).
+
   * La guarda NVMe de dispositivos en uso lee el mountinfo del host y uno por
     cada namespace de montaje distinto en /proc. Un rootfs de CT montado solo
     en su namespace ahora impide desconectar el subsistema aunque fuser -m
