@@ -1,0 +1,39 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: IDKMANAGER truenas-proxmox-plugin fork
+Label: truenas-proxmox-plugin (IDK fork)
+Suite: trixie
+Codename: trixie
+Date: Mon, 19 Oct 2026 13:25:15 UTC
+Architectures: amd64
+Components: main
+Description: IDKMANAGER fork of the TrueNAS Proxmox VE storage plugin (trixie)
+MD5Sum:
+ eee1ce0a82f0ac59c6cc789006b3912f 959 main/binary-amd64/Packages
+ 0ad84ef8ebe5897c28f70b86a1461ff1 597 main/binary-amd64/Packages.gz
+ 8cc9439af27e2c45c1f26b9f2350c953 219 main/binary-amd64/Release
+SHA1:
+ f047487efc6b1b85941fd465de22e8b44748a138 959 main/binary-amd64/Packages
+ 90e608b7b756577e10610eafcc6521757ea8174d 597 main/binary-amd64/Packages.gz
+ 567c8dc5356ac923f1509810017a8c3754d8563a 219 main/binary-amd64/Release
+SHA256:
+ 600592ebc8eff716853ee3885139ccb67d49750346806c2b5f06d31f6272166d 959 main/binary-amd64/Packages
+ 8a79a8ef3e253596fe5b1c678229260d59f5bc9b91a9b7a29855b7d5a16d3b25 597 main/binary-amd64/Packages.gz
+ f95074073a8b399ed6f65a856b5b0f65df1616c1b3dc11a0b91ccef4b84b1537 219 main/binary-amd64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEEwMS/o0JzqAsektcSAbLDRu7H7PgFAmrWGjsACgkQAbLDRu7H
+7PhFuA//VsCKHt8CT513XVJf+oIG2nZ8LfyRV+/whvpU1zhAHctcqx8ew+nT0/d5
+xtyV3fXd56ujo+4bnO6357CM+CwS6uT4AaSKSo5BfY1xPuzdibbRwqYZ98fKfd0K
+eaJc6XfL3rh8RtTIwfJ2G8+ItBnS1CSPjsFOSWBJVQ8n4jnfKCh0onGRu3zpLoDL
+fLeeEqV7XTLRiIdO4AQCzBdQaBzpXxTgSkkNz5z98BUF2qWMZUVXWnNusQdxXtGK
+Ocss/MmUr6Rnbety036NlqkvcMWPYVoSmeQOnckJpCfh+8L6ZEDVBQQ51vVFk5X+
+Lj+DEpTKZsbUFNSAbDjqLp6mZn5u7wGUmiWMnV/sAACLToekj10JW2t2OezWMxKS
+6klS8D0f/eNTu66s4AKd2wgcx6P18cuLdQGVo/wUkKYymJYEUtNmxCTm+qSepPsC
+qV6zwhYPfOwTwgbHYM0ArAabAAkC7zEfLhLbDOT5nGOmAHW46/x8682Utd7SLWzj
+ubwOftLkAHGS7wEhF7mtg0oFkiKDz5mXsoFJ/c+fHLNWFabSsLw8+1QmTfJpDC0k
+kJJhttaVms3q1Lt4G5tr7s+NronlLMfW1tMujrqPhiaFZ+y/iiM58tsACT6JX2SA
+IfLtF5Q4M8tHTxddQeRoiOWWBbZJd9wfQraAlQTnLnqgdclte0c=
+=dO1b
+-----END PGP SIGNATURE-----

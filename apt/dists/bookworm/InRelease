@@ -1,0 +1,39 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: IDKMANAGER truenas-proxmox-plugin fork
+Label: truenas-proxmox-plugin (IDK fork)
+Suite: bookworm
+Codename: bookworm
+Date: Mon, 19 Oct 2026 13:25:15 UTC
+Architectures: amd64
+Components: main
+Description: IDKMANAGER fork of the TrueNAS Proxmox VE storage plugin (bookworm)
+MD5Sum:
+ eee1ce0a82f0ac59c6cc789006b3912f 959 main/binary-amd64/Packages
+ 0ad84ef8ebe5897c28f70b86a1461ff1 597 main/binary-amd64/Packages.gz
+ 9c1c51a5a0e7eaf34edc2c93024a8eb8 223 main/binary-amd64/Release
+SHA1:
+ f047487efc6b1b85941fd465de22e8b44748a138 959 main/binary-amd64/Packages
+ 90e608b7b756577e10610eafcc6521757ea8174d 597 main/binary-amd64/Packages.gz
+ 01b9201cca195ea48e9598ab42692c01b4ecb48a 223 main/binary-amd64/Release
+SHA256:
+ 600592ebc8eff716853ee3885139ccb67d49750346806c2b5f06d31f6272166d 959 main/binary-amd64/Packages
+ 8a79a8ef3e253596fe5b1c678229260d59f5bc9b91a9b7a29855b7d5a16d3b25 597 main/binary-amd64/Packages.gz
+ 8a6041f134cd6449501c450ad38350a298b6b82ffb1c12a2f3c0879ea192702f 223 main/binary-amd64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEEwMS/o0JzqAsektcSAbLDRu7H7PgFAmrWGjsACgkQAbLDRu7H
+7PgRGhAAuI/u4+1V/PQmQ1NqyvOOAKe7/y89nXeWqtbl1vs3cvr9P3kQFQITw4Y5
+xJJcnZDFddnESTFJoJ+wkIsHVe5DMTCVSECmSz1pTfwVVYGIMKS/jmYeqMuZkPEP
+Q1A0ePZmmWF4b0SvZmmp0Q8irwhWMNyII45QtbtAjCiOBJdl9pku6oRTx+QyEuGh
+3zzeJpbklTprYcEVmWR5vMlxBdshhWHBQS55Q+g7Drf1srvsNFr7+8O3oavCwBz8
+4o4eht5MXtoc9osCKnN0nkI/LMZgox+yFd177fomR1QqBRwPz3k2vbb3hO93PZcU
+54mAzlnezkXqFR01njs7ZM/N9DGgeRiVh3ZIsiA8MPxWlhgyTqPupkXGY0KB5o12
+VZIsyb15+EGYksam3pp6fLhZq21qQtGR3wGTDFPiSKRAdwjgMwBcDU61UTwYsPqF
+yGUf0to9VfY0GMctLJkTJSjOlrzA6SNGkX6coxVNoYAtzgusiT/8LmQtqitGo1ov
+2g5obd2ofzwDQ4x21V6Flfh5CnjuFQpE69Jl2uEsULzNwWGnbzj4K24GOHb0MO0f
+SWcGMSMFB5mryMcO12oEmYeAm8JGTLk4sjaDw07UIz/2P5mZFeNTekrEioNWCyt9
+ATdV6uwbju4eZqSjcc+akgugU5/8QrVUSvEmARO8v7/Eeh8ltyA=
+=cDSZ
+-----END PGP SIGNATURE-----
