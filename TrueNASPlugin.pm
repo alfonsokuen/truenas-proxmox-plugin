@@ -13,15 +13,19 @@ our $VERSION = '2.1.24~beta6+idk27';
 our $TESTED_APIVER = 16;
 use JSON::PP ();    # JSON::PP::true / JSON::PP::false stay this plugin's booleans
 # JSON::PP is pure Perl. Measured on a 352 KB answer (what dataset queries return):
-# decode 258 ms with JSON::PP against 4.8 ms with JSON::XS, encode 76 against
-# 3.5 ms, and every answer goes through four passes (plugin and broker). JSON::XS
-# 4.x shares the JSON::PP::Boolean class and keeps 64-bit integers, numeric
-# strings and UTF-8 as they were (t/nvme/39). TRUENAS_PLUGIN_JSON_PP=1 forces the
-# pure-Perl backend should an XS build ever misbehave on a node.
+# decode 258 ms with JSON::PP against 4.8 ms with JSON::XS, and every answer goes
+# through several decodes (plugin and broker). So DECODING uses JSON::XS when it is
+# installed. ENCODING stays with JSON::PP on purpose: JSON::XS 4.04 on Perl 5.40
+# encodes a number that was ever interpolated into a string (a log line) as a JSON
+# STRING, and TrueNAS validates types - a stringified volsize made alloc_image fail
+# with "Input should be a valid integer" (found by allocating a real volume;
+# t/nvme/39 pins it). What is sent to TrueNAS is therefore unchanged. XS shares the
+# JSON::PP::Boolean class and keeps 64-bit integers, numeric strings and UTF-8.
+# TRUENAS_PLUGIN_JSON_PP=1 forces the pure-Perl decoder should an XS build ever misbehave.
 BEGIN {
     my $xs = !$ENV{TRUENAS_PLUGIN_JSON_PP} && eval { require JSON::XS; JSON::XS->VERSION(4.0); 1 };
     no strict 'refs';
-    *encode_json = $xs ? \&JSON::XS::encode_json : \&JSON::PP::encode_json;
+    *encode_json = \&JSON::PP::encode_json;
     *decode_json = $xs ? \&JSON::XS::decode_json : \&JSON::PP::decode_json;
 }
 use URI::Escape qw(uri_escape);

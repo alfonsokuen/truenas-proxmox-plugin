@@ -1,12 +1,17 @@
 truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
 
-  * JSON: el plugin y el broker usan JSON::XS cuando esta instalado y caen a
-    JSON::PP si no (TRUENAS_PLUGIN_JSON_PP=1 fuerza el antiguo). Medido en un
-    nodo con una respuesta de 352 KB: decodificar 258 ms con JSON::PP frente a
-    4,8 ms con JSON::XS, codificar 76 ms frente a 3,5 ms, y cada respuesta de
-    TrueNAS pasa por cuatro pasadas (plugin y broker). La clase booleana, los
-    enteros de 64 bits, las cadenas numericas y UTF-8 no cambian. Recommends:
-    libjson-xs-perl. Test t/nvme/39; suite completa verde con los dos backends.
+  * JSON: el plugin y el broker DECODIFICAN con JSON::XS cuando esta instalado y
+    caen a JSON::PP si no (TRUENAS_PLUGIN_JSON_PP=1 fuerza el antiguo). Medido en
+    un nodo con una respuesta de 352 KB: decodificar 258 ms con JSON::PP frente a
+    4,8 ms con JSON::XS. CODIFICAR sigue con JSON::PP a proposito: JSON::XS 4.04
+    sobre Perl 5.40 codifica como CADENA un numero que alguna vez se uso dentro de
+    un texto (un log), y TrueNAS valida tipos: con XS al codificar, alloc_image
+    fallaba con "volsize: Input should be a valid integer". Lo detecto la prueba
+    con un volumen desechable real; ningun test unitario lo vio porque el TrueNAS
+    falso no valida tipos. Lo enviado a TrueNAS es identico al de hoy. La clase
+    booleana, los enteros de 64 bits, las cadenas numericas y UTF-8 no cambian.
+    Recommends: libjson-xs-perl. Tests t/nvme/39 (incluye el caso del numero
+    usado como texto) y tools/disposable-volume-lifecycle.pl.
   * status() y el preflight de alloc piden a pool.dataset.get_instance solo
     las propiedades de capacidad que consumen y excluyen los hijos del pool.
     _tn_dataset_get mantiene la llamada original para los demás lectores y

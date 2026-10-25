@@ -32,8 +32,24 @@ ok(defined &{"${PKG}::encode_json"} && defined &{"${PKG}::decode_json"}, 'the pl
 SKIP: {
     skip 'JSON::XS 4.0+ is not installed here', 2 unless $HAVE_XS;
     skip 'TRUENAS_PLUGIN_JSON_PP is set: the pure-Perl backend is forced on purpose', 2 if $ENV{TRUENAS_PLUGIN_JSON_PP};
-    is($enc, \&JSON::XS::encode_json, 'JSON::XS is installed: the plugin encodes with it');
-    is($dec, \&JSON::XS::decode_json, 'JSON::XS is installed: the plugin decodes with it');
+    is($dec, \&JSON::XS::decode_json, 'JSON::XS is installed: the plugin DECODES with it (that is where the time goes)');
+    is($enc, \&JSON::PP::encode_json, 'but ENCODES with JSON::PP: what is sent to TrueNAS must not change');
+}
+
+# Why encoding stays with JSON::PP. JSON::XS 4.04 on Perl 5.40 encodes a number that
+# was ever interpolated into a string (a log line, a message) as a JSON STRING:
+# "1073741824" instead of 1073741824. TrueNAS validates types, so a stringified
+# volsize is rejected ("Input should be a valid integer") and no disk can be created.
+# Found by allocating a real volume on a node with libjson-xs-perl installed; every
+# unit test passed because the fake upstream never validated types.
+{
+    my $size = 1048576 * 1024;
+    my $text = "allocating $size bytes";          # the number is now also a string
+    like($enc->({ volsize => $size }), qr/"volsize":1073741824[,}]/,
+        'a number that was also used as a string is still sent as a NUMBER');
+    my $count = int(2.0);
+    my $line = "disks: $count";
+    like($enc->([ $count ]), qr/^\[2\]$/, 'int() + interpolation is still a number');
 }
 
 # The escape hatch and the fallback, in a clean process so the choice is made at load time.

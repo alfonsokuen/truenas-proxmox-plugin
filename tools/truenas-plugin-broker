@@ -37,13 +37,15 @@ use POSIX qw(setsid strftime WNOHANG);
 use Digest::SHA qw(sha1 sha1_hex);
 use MIME::Base64 qw(encode_base64);
 use JSON::PP ();
-# Same backend choice as the plugin (see the comment in TrueNASPlugin.pm): the
-# broker decodes every TrueNAS answer and encodes it again for the plugin, and
-# JSON::PP spends ~260 ms decoding a 350 KB answer where JSON::XS spends ~5 ms.
+# Same choice as the plugin (see the comment in TrueNASPlugin.pm): the broker decodes
+# every TrueNAS answer, and JSON::PP spends ~260 ms decoding a 350 KB answer where
+# JSON::XS spends ~5 ms. Only DECODING uses XS: JSON::XS 4.04 on Perl 5.40 encodes a
+# number that was ever used as a string as a JSON string, and the requests this
+# broker builds (ids, parameters relayed to TrueNAS) must keep their types.
 BEGIN {
     my $xs = !$ENV{TRUENAS_PLUGIN_JSON_PP} && eval { require JSON::XS; JSON::XS->VERSION(4.0); 1 };
     no strict 'refs';
-    *encode_json = $xs ? \&JSON::XS::encode_json : \&JSON::PP::encode_json;
+    *encode_json = \&JSON::PP::encode_json;
     *decode_json = $xs ? \&JSON::XS::decode_json : \&JSON::PP::decode_json;
 }
 # IPPROTO_TCP is not in Socket's default export list; the keepalive tuning
