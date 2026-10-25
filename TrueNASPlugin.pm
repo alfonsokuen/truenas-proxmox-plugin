@@ -342,10 +342,16 @@ sub _is_connection_error {
 # "no response" the request may already have been executed upstream, so
 # retrying a mutation can apply it twice (the hole documented in
 # volume_snapshot). status() only reads, and only uses this to back off.
+#
+# "request expired in queue" is the broker refusing, WITHOUT executing, a request
+# whose client had all but given up. It is not retried (the budget that expired
+# is the same one a retry would have), but status() must still back off on it:
+# with the array down the last attempt of a poll is refused this way instead of
+# timing out, and without the marker every pvestatd poll paid the whole deadline.
 sub _is_broker_transport_error {
     my ($error) = @_;
     return 0 if !defined $error;
-    return $error =~ /broker: no response from upstream|broker: EOF before complete response|broker socket missing/i ? 1 : 0;
+    return $error =~ /broker: no response from upstream|broker: EOF before complete response|broker socket missing|broker: request expired in queue/i ? 1 : 0;
 }
 
 # TrueNAS validates the `disk` / `device_path` field on iscsi.extent.create

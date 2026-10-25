@@ -86,7 +86,12 @@ if ($MAX_BUDGET !~ /^\d+(?:\.\d+)?$/ || $MAX_BUDGET < 5) {
     warn "TRUENAS_BROKER_MAX_BUDGET is not a number >= 5; using 90\n";
     $MAX_BUDGET = 90;
 }
-my $MIN_CLIENT_BUDGET = 0.5;
+# Smallest upstream budget worth spending. The refusal below is for a client that
+# is all but gone (under about 0.3 s left, since the budget is half of what is
+# left), not for a short-but-usable one: a 1 s deadline reaches this broker every
+# time a call arrives at the end of tn_op_budget_s, and a LAN round trip is tens
+# of milliseconds.
+my $MIN_CLIENT_BUDGET = 0.15;
 # The liveness probe on a pooled connection gets a much shorter budget: its
 # whole purpose is to find out quickly whether the socket is still real, and a
 # probe that waits the full timeout defeats the point of probing.

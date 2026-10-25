@@ -63,6 +63,7 @@ my $fail_with;
 my @TRANSPORT = (
     'broker: no response from upstream',
     'broker: EOF before complete response',
+    'broker: request expired in queue',
     "[TrueNAS] broker socket missing at /run/truenas-plugin/broker.sock.\n  The truenas-plugin-broker service is required\n",
 );
 

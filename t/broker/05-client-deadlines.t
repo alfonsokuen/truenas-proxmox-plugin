@@ -192,26 +192,26 @@ is(ref($legacy_reply) eq 'HASH' ? $legacy_reply->{result} : undef,
 
 # A short client budget must not silently revert to the daemon's 30 seconds.
 my $started = time();
-my $mute = send_request(method => 'test.mute', timeout => 1, sent_mono => mono());
-my $mute_reply = read_reply($mute, 1.5);
+my $mute = send_request(method => 'test.mute', timeout => 3, sent_mono => mono());
+my $mute_reply = read_reply($mute, 3);
 ok(ref($mute_reply) eq 'HASH' && exists $mute_reply->{error},
    'silent upstream releases its worker for a one-second budget');
-cmp_ok(time() - $started, '<', 1.5, 'silent request finishes within 1.5 seconds');
+cmp_ok(time() - $started, '<', 2.3, 'silent request finishes at its own bound (~1.5 s), not at the 30 s default');
 
 # A TCP listener which never completes TLS must not retain a worker for 15 s.
 $started = time();
-my $tls = send_request(method => 'test.connect', scheme => 'wss', api_key => 'tls-key', timeout => 1,
+my $tls = send_request(method => 'test.connect', scheme => 'wss', api_key => 'tls-key', timeout => 3,
                        sent_mono => mono());
-my $tls_reply = read_reply($tls, 1.5);
+my $tls_reply = read_reply($tls, 3);
 ok(ref($tls_reply) eq 'HASH' && exists $tls_reply->{error},
    'silent TLS connect respects the request deadline');
-cmp_ok(time() - $started, '<', 1.5, 'connect finishes within 1.5 seconds');
+cmp_ok(time() - $started, '<', 2.3, 'connect finishes at the request bound (~1.5 s), not at 15 s');
 
 # A budget below the floor is not stretched to the floor: the client has given up
 # before the broker could answer, and executing a mutation nobody will hear about
 # is how a retry duplicates it. It is rejected without reaching the upstream.
 my $before = event_count('mutate');
-my $tiny = send_request(method => 'test.mutate', timeout => 0.3, sent_mono => mono());
+my $tiny = send_request(method => 'test.mutate', timeout => 0.2, sent_mono => mono());
 my $tiny_reply = read_reply($tiny, 2);
 is(ref($tiny_reply) eq 'HASH' ? $tiny_reply->{error} : undef,
    'broker: request expired in queue', 'a budget below the floor is rejected, not stretched');
@@ -232,5 +232,23 @@ my $wall = send_request(method => 'test.mutate', timeout => 5, sent_at => time()
 my $wall_reply = read_reply($wall, 3);
 is(ref($wall_reply) eq 'HASH' ? $wall_reply->{result} : undef, 'ok', 'the wall-clock stamp is ignored');
 is(event_count('mutate'), $before + 1, '  ...and the request is executed once');
+
+# A one-second budget is USABLE: a responsive upstream answers inside half of it.
+# (Rejecting it would turn every call that reaches the end of tn_op_budget_s into
+# a failure that never even tried.)
+$before = event_count('mutate');
+my $one = send_request(method => 'test.mutate', timeout => 1, sent_mono => mono());
+my $one_reply = read_reply($one, 2);
+is(ref($one_reply) eq 'HASH' ? $one_reply->{result} : undef, 'ok', 'a one-second budget with a responsive upstream succeeds');
+is(event_count('mutate'), $before + 1, '  ...and executes exactly once');
+
+# The refusal is for a client that is all but gone, and says so in the log with
+# the budget it had left, so it can be told apart from plain latency.
+{
+    open(my $log_fh, '<', "$dir/broker.log") or die $!;
+    my $log = do { local $/; <$log_fh> };
+    close $log_fh;
+    like($log, qr/request expired in queue.*remaining=0[.][12]/, 'the refusal logs the budget that was left');
+}
 
 done_testing();
