@@ -314,6 +314,23 @@ sub _is_connection_error {
     return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|ssl.*error|connection.*failed|WS read|WS write|WS len|WS payload/i;
 }
 
+# The three errors our own broker and broker client raise when the upstream
+# TrueNAS is slow or the broker is not there: "no response from upstream"
+# (tools/truenas-plugin-broker), "EOF before complete response" and
+# "broker socket missing" (_broker_call, _ws_get_persistent). None of them
+# carries a network-stack phrase, so _is_connection_error never matched them
+# and status() paid a full deadline, with a warning, on every pvestatd poll.
+#
+# Deliberately NOT part of _is_connection_error or _is_retryable_error. After
+# "no response" the request may already have been executed upstream, so
+# retrying a mutation can apply it twice (the hole documented in
+# volume_snapshot). status() only reads, and only uses this to back off.
+sub _is_broker_transport_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return $error =~ /broker: no response from upstream|broker: EOF before complete response|broker socket missing/i ? 1 : 0;
+}
+
 # TrueNAS validates the `disk` / `device_path` field on iscsi.extent.create
 # and nvmet.namespace.create by stat'ing the underlying /dev/zvol symlink.
 # Right after pool.snapshot.clone or pool.dataset.create returns success on
@@ -12161,7 +12178,7 @@ sub status {
         _invalidate_status_capacity_cache($storeid, $scfg);
 
         # Distinguish between connectivity issues and actual errors
-        if (_is_connection_error($err)) {
+        if (_is_connection_error($err) || _is_broker_transport_error($err)) {
             # Network/connectivity issue - mark as inactive (temporary)
             _log($scfg, 0, 'info', "[TrueNAS] status: storage '$storeid' marked inactive (connectivity issue): $err");
             $active = 0;
