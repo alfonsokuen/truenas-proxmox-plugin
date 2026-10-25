@@ -34,13 +34,13 @@ use FindBin qw($Bin);
 use lib "$Bin/lib";
 use Test::More;
 
-# Lazy-load plugin. On a non-PVE machine, skip.
-my $plugin_loaded = eval {
-    require PVE::Storage::Custom::TrueNASPlugin;
-    1;
-};
-if (!$plugin_loaded) {
-    plan skip_all => "PVE::Storage::Custom::TrueNASPlugin not loadable: $@";
+# Load the plugin from this tree, never the installed copy, so the test
+# exercises the code under review. PVE stubs from t/nvme/lib are only a
+# fallback (pushed, not unshifted): a real PVE install keeps winning.
+BEGIN { push @INC, "$FindBin::Bin/../nvme/lib" }
+my $PLUGIN = "$FindBin::Bin/../../TrueNASPlugin.pm";
+unless (eval { require $PLUGIN; 1 }) {
+    plan skip_all => "cannot load TrueNASPlugin.pm from the tree (needs PVE perl modules): $@";
 }
 
 # ============================================================
@@ -55,8 +55,6 @@ my @connection_errors = (
     'WS write failed: at /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm line 865.',
     'WS payload truncated',
     'WS len exceeded',
-    'WebSocket closed unexpectedly',
-    'WebSocket.*closed mid-frame',
     # POSIX socket errors:
     'Broken pipe',
     'broken pipe',
@@ -101,6 +99,11 @@ my @non_connection_errors = (
     '404 Not Found',
     'ENOENT: dataset does not exist',
     'Pool not found',
+    # The tree dropped the WebSocket.*closed alternative on purpose (it
+    # false-matched middlewared Python reprs); the WS framing patterns cover
+    # the real failures, so these bare strings are no longer connection errors.
+    'WebSocket closed unexpectedly',
+    'WebSocket.*closed mid-frame',
     '',
 );
 
@@ -121,6 +124,11 @@ for my $err (@connection_errors) {
 # _is_retryable_error: non-retryable classes
 # ============================================================
 my @non_retryable = (
+    # The tree dropped the WebSocket.*closed alternative on purpose (it
+    # false-matched middlewared Python reprs); the WS framing patterns cover
+    # the real failures, so these bare strings are no longer connection errors.
+    'WebSocket closed unexpectedly',
+    'WebSocket.*closed mid-frame',
     # Rate limit must NOT retry (D3 fix; retrying feeds the limiter).
     'CallError: [EBUSY] Rate Limit Exceeded',
     "JSON-RPC error: {\"data\":{\"errname\":\"EBUSY\",\"reason\":\"[EBUSY] Rate Limit Exceeded\"}}",
