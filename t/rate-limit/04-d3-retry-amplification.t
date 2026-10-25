@@ -25,8 +25,10 @@ use FindBin qw($Bin);
 use lib "$Bin/lib";
 use Test::More;
 use Time::HiRes qw(sleep);
-use RateLimit::Harness qw(env_require env_get drain_limiter new_audit_conn count_logins
+use RateLimit::Harness qw(skip_all_unless_env env_require env_get drain_limiter new_audit_conn count_logins
                           now_iso qm_create_with_disk qm_destroy test_scfg say_diag);
+
+skip_all_unless_env();
 
 plan tests => 4;
 

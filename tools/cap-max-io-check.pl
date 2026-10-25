@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# Test funcional de _nvme_cap_max_io / _nvme_warn_target_no_mdts (+idk9).
+# Manual check (not a TAP test; moved from t/nvme/cap-max-io.t). Funcional de _nvme_cap_max_io / _nvme_warn_target_no_mdts (+idk9).
 # Llama a las funciones REALES contra el sysfs REAL del nodo. Solo baja y
 # restaura max_sectors_kb, que es reversible y siempre hacia un valor mas
 # conservador durante la prueba.

@@ -1223,11 +1223,11 @@ cd tools/
 cd tools/
 ./truenas-plugin-test-suite.sh
 
-# Test specific storage
-./truenas-plugin-test-suite.sh production-storage
+# Test specific storage (dedicated TEST storage on a lab node only, never production)
+./truenas-plugin-test-suite.sh scratch-storage
 
-# Automated testing (no prompts)
-./truenas-plugin-test-suite.sh production-storage -y
+# Automated testing (no prompts; same restriction applies)
+./truenas-plugin-test-suite.sh scratch-storage -y
 
 # View most recent test log
 ls -lt /tmp/truenas-plugin-test-suite-*.log | head -1

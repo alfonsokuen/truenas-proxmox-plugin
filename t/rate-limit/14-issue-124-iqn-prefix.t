@@ -32,12 +32,13 @@ use FindBin qw($Bin);
 use lib "$Bin/lib";
 use Test::More;
 
-my $plugin_loaded = eval {
-    require PVE::Storage::Custom::TrueNASPlugin;
-    1;
-};
-if (!$plugin_loaded) {
-    plan skip_all => "PVE::Storage::Custom::TrueNASPlugin not loadable: $@";
+# Load the plugin from this tree, never the installed copy, so the test
+# exercises the code under review. PVE stubs from t/nvme/lib are only a
+# fallback (pushed, not unshifted): a real PVE install keeps winning.
+BEGIN { push @INC, "$FindBin::Bin/../nvme/lib" }
+my $PLUGIN = "$FindBin::Bin/../../TrueNASPlugin.pm";
+unless (eval { require $PLUGIN; 1 }) {
+    plan skip_all => "cannot load TrueNASPlugin.pm from the tree (needs PVE perl modules): $@";
 }
 
 my $pkg = 'PVE::Storage::Custom::TrueNASPlugin';

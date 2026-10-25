@@ -36,7 +36,9 @@ use lib "$Bin/lib";
 use Test::More;
 use Digest::SHA qw(sha1_hex);
 use JSON::PP;
-use RateLimit::Harness qw(env_require env_get new_audit_conn test_scfg say_diag);
+use RateLimit::Harness qw(skip_all_unless_env env_require env_get new_audit_conn test_scfg say_diag);
+
+skip_all_unless_env();
 
 my $sid  = env_require('STORAGE_ID');
 my $vmid = env_get('TEST_VMID_BASE', 99000) + 40;
