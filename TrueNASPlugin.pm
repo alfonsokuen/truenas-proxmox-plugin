@@ -12204,7 +12204,13 @@ sub status {
                     retry_max => 2,
                     extra => {
                         retrieve_children => JSON::PP::false,
-                        properties => [qw(used available quota written)],
+                        # NOT `written`: the array's complete answer carries no
+                        # top-level `written`, so status() below falls back to
+                        # `used` (which counts the zvol children). Asking for
+                        # it explicitly returns the parent dataset's OWN written
+                        # (130944 bytes on tn-prod, measured), which status()
+                        # prefers, and the pool would be reported as empty.
+                        properties => [qw(used available quota)],
                     },
                 });
                 _set_cache($host_key, $status_method, $ds);

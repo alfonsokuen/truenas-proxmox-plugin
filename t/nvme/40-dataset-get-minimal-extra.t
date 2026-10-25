@@ -38,7 +38,9 @@ my $full = {
     id => 'tank/pve', name => 'tank/pve', pool => 'tank', type => 'FILESYSTEM',
     mountpoint => '/mnt/tank/pve', children => [ { id => 'tank/pve/child' } ],
     user_properties => [], used => { parsed => 1000, rawvalue => '1000' },
-    written => { parsed => 1000, rawvalue => '1000' },
+    # No top-level `written`: that is what the real 25.10 array answers (measured
+    # on tn-prod). status() therefore reports `used`, and the minimal request
+    # must not change that by asking for `written`.
     available => { parsed => 9000, rawvalue => '9000' }, quota => { parsed => 0, rawvalue => '0' },
 };
 my $minimal = { %$full };
@@ -48,8 +50,20 @@ $answer = $full;
 my @full_status = $status->($PKG, 'store1', $scfg, {});
 my ($status_call) = grep { $_->{method} eq 'pool.dataset.get_instance' } @calls;
 is_deeply($status_call->{params}[1], { extra => {
-    retrieve_children => JSON::PP::false, properties => [qw(used available quota written)],
+    retrieve_children => JSON::PP::false, properties => [qw(used available quota)],
 }}, 'status requests exactly its capacity properties');
+ok(!(grep { $_ eq 'written' } @{ $status_call->{params}[1]{extra}{properties} }),
+   'status does NOT request `written`: the array would return the parent dataset own written and status() prefers it');
+
+# What asking for `written` would have done, on the real array's numbers: the
+# parent's own written is tiny, status() prefers it, and the pool looks empty.
+{
+    my $with_written = { %$full, written => { parsed => 130944, rawvalue => '130944' } };
+    $answer = $with_written;
+    my @bad = $status->($PKG, 'store1', { %$scfg, tn_host => 'array-status-written' }, {});
+    isnt($bad[2], $full_status[2], 'control: a `written` in the answer DOES change status() (why it is not requested)');
+    $answer = $full;
+}
 $answer = $minimal;
 @calls = ();
 my @minimal_status = $status->($PKG, 'store1', { %$scfg, tn_host => 'array-status-minimal' }, {});
