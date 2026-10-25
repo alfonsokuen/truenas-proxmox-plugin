@@ -25,6 +25,15 @@ truenas-proxmox-plugin (1:2.1.24~beta6+idk26) unstable; urgency=medium
   * Se elimina el helper _tn_snapshots, sin llamadores, como en upstream.
   * install-idk.sh y publish-apt.sh: idk26 en adelante resuelve a la base
     2.1.24-beta6; idk24 e idk25 siguen en beta4.
+  * status(): un TrueNAS lento ahora activa el backoff (marker
+    tn_status_probe_backoff_s). Los errores del propio broker "no response
+    from upstream", "EOF before complete response" y "broker socket missing"
+    no los reconocia _is_connection_error, asi que pvestatd pagaba el plazo
+    completo, con warning, en cada poll. Nuevo clasificador
+    _is_broker_transport_error, usado SOLO en status(); no entra en
+    _is_connection_error ni en _is_retryable_error, porque reintentar una
+    mutacion tras "no response" puede duplicarla. Test t/nvme/36-broker-
+    transport-errors.t (rojo -> verde).
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Sat, 24 Oct 2026 12:00:00 -0500
 
