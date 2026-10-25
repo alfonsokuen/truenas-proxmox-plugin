@@ -54,8 +54,13 @@ jobs:
       # the PVE stand-ins in t/nvme/lib, and t/installer drives the shell
       # installers with stubs. The t/rate-limit tests are integration tests
       # (they need a real TrueNAS array / Proxmox host), so CI does not run them.
+      # The compile check comes first on purpose: every t/nvme test does
+      # skip_all when the plugin does not load, so without it a syntax error
+      # in TrueNASPlugin.pm would turn the whole suite into skips and pass.
       - name: Run unit tests
-        run: prove -I t/nvme/lib -r t/nvme t/installer
+        run: |
+          perl -I t/nvme/lib -c TrueNASPlugin.pm
+          prove -I t/nvme/lib -r t/nvme t/installer
 
       - name: Build package and run lintian
         run: tools/build-deb.sh

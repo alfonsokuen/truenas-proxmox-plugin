@@ -43,7 +43,7 @@ set -euo pipefail
 # Bump on every change that is meant to reach a node. raw.githubusercontent
 # caches aggressively, so the only way to know which script is running is
 # for the script to say so.
-INSTALLER_VERSION='idk26.0'
+INSTALLER_VERSION='idk27.0'
 PKG_NAME='truenas-proxmox-plugin'
 # idk12..idk21 were cut from upstream 2.1.23~alpha1, idk22 from 2.1.23~beta8,
 # idk23 from the stable 2.1.23+deb1, idk24/idk25 from upstream 2.1.24~beta4, idk26 onward from 2.1.24~beta6; the

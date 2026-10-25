@@ -20,10 +20,10 @@ unless (eval { require $PLUGIN; 1 }) {
 my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 my $f = $PKG->can('volume_snapshot') or BAIL_OUT('missing volume_snapshot');
 
-my (@calls, $create_error, $query_answer, $query_dies);
+my (@calls, @logs, $create_error, $query_answer, $query_dies);
 {
     no strict 'refs'; no warnings 'redefine';
-    *{"${PKG}::_log"} = sub { 1 };
+    *{"${PKG}::_log"} = sub { push @logs, $_[3] // ''; 1 };
     *{"${PKG}::parse_volname"} = sub { (undef, 'vm-100-disk-0') };
     *{"${PKG}::cluster_lock_storage"} = sub { my ($c, $s, $t, $to, $code) = @_; $code->() };
     *{"${PKG}::_handle_api_result_with_job_support"} = sub { { success => 1 } };
@@ -41,7 +41,7 @@ my (@calls, $create_error, $query_answer, $query_dies);
     };
 }
 my $scfg = { tn_dataset => 'tank/pve' };
-sub run { @calls = (); my $ok = eval { $f->($PKG, $scfg, 'tn', 'vm-100-disk-0', 's1'); 1 }; return ($ok, $@) }
+sub run { @calls = (); @logs = (); my $ok = eval { $f->($PKG, $scfg, 'tn', 'vm-100-disk-0', 's1'); 1 }; return ($ok, $@) }
 
 # 1. success: no replay protection needed, and no postcondition query
 ($create_error, $query_dies, $query_answer) = (undef, 0, undef);
@@ -74,4 +74,26 @@ like($err4, qr/WS read failed/, '  ...with the original error, not the query one
 ($create_error, $query_dies, $query_answer) = ("[EINVAL] bad name\n", 0, [ { id => 'tank/pve/vm-100-disk-0@s1' } ]);
 my ($ok5) = run();
 ok(!$ok5, 'EINVAL from the server is a failure even if a same-named snapshot exists');
+
+# 6. "already exists" with retries off can only mean the snapshot was there BEFORE
+#    this call (a ghost of an earlier failure, or another creator). Reporting
+#    success would hand PVE a snapshot that holds old data as if it were new.
+for my $exists_err ("[EEXIST] snapshot already exists\n", "ZFSPathAlreadyExistsException: tank/pve/vm-100-disk-0\@s1\n", "EZFS_EXISTS\n") {
+    ($create_error, $query_dies, $query_answer) = ($exists_err, 0, [ { id => 'tank/pve/vm-100-disk-0@s1' } ]);
+    my ($ok6, $err6) = run();
+    ok(!$ok6, 'already exists is a failure, never "created": ' . substr($exists_err, 0, 30));
+    like($err6, qr/exist/i, '  ...with the server error');
+    is((grep { $_->{method} eq 'pool.snapshot.query' } @calls), 0, '  ...and without a postcondition query');
+}
+
+# 7. a postcondition answer must be about THIS snapshot
+($create_error, $query_dies, $query_answer) = ("WS read failed: Broken pipe\n", 0, [ { id => 'tank/pve/vm-100-disk-0@other' } ]);
+my ($ok7, $err7) = run();
+ok(!$ok7, 'a list whose id is not the requested snapshot does not count as created');
+like($err7, qr/WS read failed/, '  ...original error kept');
+
+# 8. an unanswerable postcondition query is said out loud, not swallowed
+($create_error, $query_dies, $query_answer) = ("WS read failed: Broken pipe\n", 1, undef);
+run();
+ok((grep { /postcondition query failed/i && /query failed/ } @logs), 'the failure of the postcondition query is logged');
 done_testing;

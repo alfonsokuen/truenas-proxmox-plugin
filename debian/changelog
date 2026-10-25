@@ -1,3 +1,40 @@
+truenas-proxmox-plugin (1:2.1.24~beta6+idk27) unstable; urgency=medium
+
+  * volume_snapshot: pool.snapshot.create se envia UNA vez (retry_max 0). Si
+    falla por un error de transporte, se pregunta a la pool si el snapshot con
+    ese id exacto existe y, solo entonces, se da por creado (mismo criterio
+    que create_base). Antes se reintentaba: tras una respuesta perdida el
+    reintento contestaba "already exists", PVE daba la operacion por fallida y
+    quedaba un snapshot fantasma. Un veredicto definitivo del servidor
+    (EINVAL, permisos, no encontrado, y tambien "already exists") nunca se
+    convierte en exito: con los reintentos apagados, "already exists" solo
+    puede significar que el snapshot ya estaba, y darlo por creado entregaria
+    a PVE datos viejos. Si la consulta de comprobacion falla, se registra y se
+    propaga el error original. Test t/nvme/35.
+  * status(): un TrueNAS lento ahora activa el backoff (marker
+    tn_status_probe_backoff_s). Los errores del propio broker "no response
+    from upstream", "EOF before complete response" y "broker socket missing"
+    no los reconocia _is_connection_error, asi que pvestatd pagaba el plazo
+    completo, con warning, en cada poll. Nuevo clasificador
+    _is_broker_transport_error, usado SOLO en status(); no entra en
+    _is_connection_error ni en _is_retryable_error, porque reintentar una
+    mutacion tras "no response" puede duplicarla. Test t/nvme/37.
+  * Pruebas: los tests de integracion de t/rate-limit saltan (skip_all) con
+    el motivo cuando falta TN_HOST, TN_API_KEY o STORAGE_ID; 10, 13 y 14 cargan
+    el plugin del arbol y no el instalado; cap-max-io.t pasa a
+    tools/cap-max-io-check.pl (no es un test TAP). Los stubs de t/nvme/lib
+    incluyen file_set_contents, file_get_contents, file_read_firstline y
+    get_format. Suite completa en un nodo: 0 ficheros fallidos (antes 14).
+  * CI: build-package.yml ejecuta "perl -c" del plugin y "prove -I t/nvme/lib
+    -r t/nvme t/installer" antes de construir el paquete. Comprobado en un
+    Debian limpio sin PVE: 1204 tests, salida 0.
+  * Documentacion: wiki/Testing.md y wiki/Tools.md ya no recomiendan ejecutar
+    la suite destructiva (crea y borra VMs) contra almacenamiento de
+    produccion ni programarla en cron; solo contra un storage de pruebas en un
+    nodo de laboratorio.
+
+ -- Alfonso Kuen <alfonsokuen@gmail.com>  Sun, 25 Oct 2026 12:00:00 -0500
+
 truenas-proxmox-plugin (1:2.1.24~beta6+idk26) unstable; urgency=medium
 
   * Base: integra upstream 2.1.24~beta5 y beta6. beta6 (#135, snapshot info
@@ -25,15 +62,6 @@ truenas-proxmox-plugin (1:2.1.24~beta6+idk26) unstable; urgency=medium
   * Se elimina el helper _tn_snapshots, sin llamadores, como en upstream.
   * install-idk.sh y publish-apt.sh: idk26 en adelante resuelve a la base
     2.1.24-beta6; idk24 e idk25 siguen en beta4.
-  * status(): un TrueNAS lento ahora activa el backoff (marker
-    tn_status_probe_backoff_s). Los errores del propio broker "no response
-    from upstream", "EOF before complete response" y "broker socket missing"
-    no los reconocia _is_connection_error, asi que pvestatd pagaba el plazo
-    completo, con warning, en cada poll. Nuevo clasificador
-    _is_broker_transport_error, usado SOLO en status(); no entra en
-    _is_connection_error ni en _is_retryable_error, porque reintentar una
-    mutacion tras "no response" puede duplicarla. Test t/nvme/36-broker-
-    transport-errors.t (rojo -> verde).
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Sat, 24 Oct 2026 12:00:00 -0500
 

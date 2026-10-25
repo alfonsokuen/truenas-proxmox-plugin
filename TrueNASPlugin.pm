@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.24~beta6+idk26';
+our $VERSION = '2.1.24~beta6+idk27';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 16;
 use JSON::PP qw(encode_json decode_json);
@@ -666,6 +666,11 @@ sub _is_definitive_server_verdict {
     return 1 if $error =~ /\bEINVAL\b|Invalid params|validation.*error|invalid.*parameter/i;
     return 1 if _is_auth_error($error) || _is_not_found_error($error);
     return 1 if $error =~ /\bEBUSY\b|dataset is busy|FOREIGN KEY constraint failed|IntegrityError/i;
+    # "Already exists" is a verdict too, and the dangerous one for a caller that
+    # sent a create once: with retries off it can only mean the object was there
+    # BEFORE this call (a ghost of an earlier failure, or another creator), so
+    # finding it afterwards proves nothing about this call.
+    return 1 if $error =~ /already exists|EEXIST|EZFS_EXISTS|ZFSPathAlreadyExistsException/i;
     return 0;
 }
 
@@ -3871,13 +3876,24 @@ sub volume_snapshot {
                 _api_call($scfg, 'pool.snapshot.query',
                     [ [ [ 'id', '=', $snap_full ] ], { select => [ 'id' ] } ]);
             };
-            if (!$@ && ref($exists) eq 'ARRAY' && @$exists) {
+            my $query_err = $@;
+            # The answer must be about THIS snapshot: an unfiltered or
+            # malformed list is not evidence that it exists.
+            my $present = !$query_err && ref($exists) eq 'ARRAY'
+                && grep { ref($_) eq 'HASH' && defined($_->{id}) && $_->{id} eq $snap_full } @$exists;
+            if ($present) {
                 _log($scfg, 0, 'warning',
                     "[TrueNAS] volume_snapshot: $snap_full is present despite the error "
                   . "reported by pool.snapshot.create; treating it as created. "
                   . "original error: $create_err");
                 $result = undef;    # no job to wait for
             } else {
+                if ($query_err) {
+                    chomp(my $q = $query_err);
+                    _log($scfg, 0, 'warning',
+                        "[TrueNAS] volume_snapshot: postcondition query failed for $snap_full "
+                      . "after the create error, so it is reported as failed: $q");
+                }
                 die $create_err;
             }
         }
