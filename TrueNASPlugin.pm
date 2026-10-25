@@ -2468,14 +2468,18 @@ sub _broker_rpc {
     # Capped the same way as the timeout we declare to the broker: on the
     # last attempt of a retry sequence there may be only seconds of budget
     # left, and waiting the full window would blow past it.
-    my $deadline = time() + $timeout;
+    # Time::HiRes::time(), not time(): core time() is whole seconds, so a second
+    # pass of the loops below (the answer arrives in pieces) would recompute
+    # `$deadline - time()` across a second boundary and give up to a second early,
+    # while the broker still plans on the full declared timeout (t/broker/07).
+    my $deadline = Time::HiRes::time() + $timeout;
     my $sel = IO::Select->new($sock);
 
     my $result;
     eval {
         my $written = 0;
         while ($written < length($payload)) {
-            my $remaining = $deadline - time();
+            my $remaining = $deadline - Time::HiRes::time();
             die "broker: write timeout after ${timeout}s" if $remaining <= 0;
             my @ready = $sel->can_write($remaining);
             die "broker: write timeout after ${timeout}s" unless @ready;
@@ -2486,7 +2490,7 @@ sub _broker_rpc {
 
         my $buf = '';
         while (1) {
-            my $remaining = $deadline - time();
+            my $remaining = $deadline - Time::HiRes::time();
             die "broker: read timeout after ${timeout}s" if $remaining <= 0;
             my @ready = $sel->can_read($remaining);
             die "broker: read timeout after ${timeout}s" unless @ready;

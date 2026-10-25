@@ -27,8 +27,15 @@ truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
     vencidas en la cola antes de ejecutarlas en TrueNAS. No se usa hora civil:
     un salto de NTP podria expirar una peticion fresca o mantener viva una
     vencida. Un plugin antiguo sin sent_mono solo permite medir desde accept().
-    Durante una actualizacion con versiones mezcladas la proteccion es parcial,
-    nunca peor que antes.
+    Los plugins publicados (idk25 a idk27) no envian ningun sello, asi que con un
+    plugin viejo y este broker (o al reves) la proteccion de cola es la de
+    antes: parcial, nunca peor. Un sello inventado por quien ya tiene acceso
+    root al socket local no se considera una amenaza.
+  * Plugin: _broker_rpc cuenta su espera con Time::HiRes::time(). Con time()
+    entero, una segunda pasada del bucle (la respuesta llega en trozos)
+    recalculaba el plazo cruzando un cambio de segundo y se rendia hasta 1 s
+    antes de lo declarado, mas que el margen del broker en plazos de 1 a 2 s.
+    Reproducido: esperaba 0,80 s de 1,5 s; ahora 1,50 s. Test t/broker/07.
   * Pruebas: t/broker/05-client-deadlines.t cubre upstream mudo, connect TLS
     sin respuesta y una mutacion vencida tras ocupar todos los workers;
     t/broker/06-plugin-envelope-timestamp.t comprueba que el envelope lleva el sello
