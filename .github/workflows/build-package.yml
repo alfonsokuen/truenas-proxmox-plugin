@@ -48,6 +48,7 @@ jobs:
             perl \
             libio-socket-ssl-perl \
             liburi-perl \
+            libjson-xs-perl \
             curl
 
       # Only the offline suites run here: t/nvme loads TrueNASPlugin.pm against

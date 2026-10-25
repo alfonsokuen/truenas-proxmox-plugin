@@ -37,6 +37,18 @@ truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
     recalculaba el plazo cruzando un cambio de segundo y se rendia hasta 1 s
     antes de lo declarado, mas que el margen del broker en plazos de 1 a 2 s.
     Reproducido: esperaba 0,80 s de 1,5 s; ahora 1,50 s. Test t/broker/07.
+  * status(): "broker: request expired in queue" cuenta como error de transporte
+    del broker (activa el backoff de tn_status_probe_backoff_s) pero NO como
+    reintentable ni de conexion. Con el array caido el ultimo intento de un
+    sondeo termina con ese rechazo en vez de un timeout, y sin el marcador
+    cada poll de pvestatd pagaba ~8 s por storage. Simulado con los valores
+    de produccion (5/10/1/20).
+  * CI: instala libjson-xs-perl para que t/nvme/39 ejercite JSON::XS.
+  * Conocido, para una pasada propia: $_api_deadline se fija con time() entero
+    (sobreestima hasta 1 s el presupuesto restante); alloc_image no consulta
+    si pool.dataset.create se completo cuando se pierde la respuesta; el
+    respaldo SO_RCVTIMEO del broker es fijo (35 s). Instalar este paquete sin
+    tareas de storage en curso: try-restart del broker corta lo que va en vuelo.
   * Pruebas: t/broker/05-client-deadlines.t cubre upstream mudo, connect TLS
     sin respuesta y una mutacion vencida tras ocupar todos los workers;
     t/broker/06-plugin-envelope-timestamp.t comprueba que el envelope lleva el sello
