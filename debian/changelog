@@ -1,3 +1,23 @@
+truenas-proxmox-plugin (1:2.1.24~beta6+idk26) unstable; urgency=medium
+
+  * Base: integra upstream 2.1.24~beta5 y beta6. beta6 (#135, snapshot info
+    filtrado en el servidor) y la mayor parte de beta5 (#134, hueco de la
+    reconexion i==25) ya estaban cubiertos en este fork: volume_snapshot_info
+    filtra por dataset y pide solo `creation` desde idk23, y todas las
+    reconexiones de _nvme_device_for_uuid (i==25, 75, 125, 150) pasan por la
+    guarda de sysfs/mountinfo (_nvme_subsystem_busy), que falla cerrado. Se
+    conserva la politica del fork: el ultimo recurso (i==125) NO fuerza la
+    reconexion con dispositivos en uso, a diferencia de upstream.
+  * Se descarta la sonda de fuser endurecida de upstream (#134 punto 2): la
+    guarda de este fork no depende de fuser.
+  * Se incorpora la suite tools/lifecycle-tests/ de upstream (reinicio, caida
+    del broker, flap de red, salto de reloj, etc.). No se instala en el .deb.
+  * Se elimina el helper _tn_snapshots, sin llamadores, como en upstream.
+  * install-idk.sh y publish-apt.sh: idk26 en adelante resuelve a la base
+    2.1.24-beta6; idk24 e idk25 siguen en beta4.
+
+ -- Alfonso Kuen <alfonsokuen@gmail.com>  Sat, 24 Oct 2026 12:00:00 -0500
+
 truenas-proxmox-plugin (1:2.1.24~beta4+idk25) unstable; urgency=medium
 
   * Limita la regla udev de max_sectors_kb a discos NVMe completos para evitar

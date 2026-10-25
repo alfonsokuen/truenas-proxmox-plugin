@@ -3,12 +3,12 @@ use v5.36;
 use strict;
 use warnings;
 
-# Plugin Version. Base upstream real: 2.1.24~beta4 -- el "2.1.24" que este
+# Plugin Version. Base upstream real: 2.1.24~beta6 -- el "2.1.24" que este
 # fork declaro hasta idk11 NUNCA existio en upstream y ordenaba por ENCIMA de
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.24~beta4+idk25';
+our $VERSION = '2.1.24~beta6+idk26';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 16;
 use JSON::PP qw(encode_json decode_json);
@@ -3409,10 +3409,6 @@ sub _tn_extents($scfg) {
 
     # Cache and return
     return _set_cache($storage_id, 'extents', $res);
-}
-
-sub _tn_snapshots($scfg) {
-    return _api_call($scfg, 'pool.snapshot.query', []);
 }
 
 # ---------- Narrow-query helpers ----------

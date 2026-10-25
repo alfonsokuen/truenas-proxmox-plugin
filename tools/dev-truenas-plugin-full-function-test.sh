@@ -7303,9 +7303,18 @@ test_lxc_online_backup() {
     log_success "Backup completed in ${backup_duration}s"
     track_timing "lxc_backup" "$backup_duration"
 
-    # Resolve backup volid from storage listing (bare filename from vzdump output is not valid for pct restore)
+    # Resolve backup volid from storage listing (bare filename from vzdump
+    # output is not valid for pct restore). Match on `pvesm list` Type==backup
+    # instead of grepping the local-dir vzdump-lxc-* filename shape — PBS
+    # names its backups `pbs:backup/ct/<vmid>/<ISO-ts>`, with no
+    # `vzdump-lxc-` prefix, so the old grep returned nothing and (under
+    # `set -o pipefail`) killed the whole test even though the backup
+    # itself was fine. The awk form skips the header, keeps backup rows,
+    # takes the volid column, and lets `tail -1` get the latest. Empty
+    # on no match → the existing empty-check below reports failure
+    # cleanly instead of the test terminating silently.
     local backup_file
-    backup_file=$(pvesm list "$BACKUP_STORE" --vmid "$vmid" 2>/dev/null | grep "vzdump-lxc-${vmid}-" | tail -1 | awk '{print $1}')
+    backup_file=$(pvesm list "$BACKUP_STORE" --vmid "$vmid" 2>/dev/null | awk 'NR>1 && $3=="backup" {print $1}' | tail -1)
 
     if [[ -z "$backup_file" ]]; then
         log_error "Could not find backup volid in $BACKUP_STORE for VMID $vmid"
@@ -7410,9 +7419,18 @@ test_lxc_offline_backup() {
     log_success "Offline backup completed in ${backup_duration}s"
     track_timing "lxc_backup_offline" "$backup_duration"
 
-    # Resolve backup volid from storage listing (bare filename from vzdump output is not valid for pct restore)
+    # Resolve backup volid from storage listing (bare filename from vzdump
+    # output is not valid for pct restore). Match on `pvesm list` Type==backup
+    # instead of grepping the local-dir vzdump-lxc-* filename shape — PBS
+    # names its backups `pbs:backup/ct/<vmid>/<ISO-ts>`, with no
+    # `vzdump-lxc-` prefix, so the old grep returned nothing and (under
+    # `set -o pipefail`) killed the whole test even though the backup
+    # itself was fine. The awk form skips the header, keeps backup rows,
+    # takes the volid column, and lets `tail -1` get the latest. Empty
+    # on no match → the existing empty-check below reports failure
+    # cleanly instead of the test terminating silently.
     local backup_file
-    backup_file=$(pvesm list "$BACKUP_STORE" --vmid "$vmid" 2>/dev/null | grep "vzdump-lxc-${vmid}-" | tail -1 | awk '{print $1}')
+    backup_file=$(pvesm list "$BACKUP_STORE" --vmid "$vmid" 2>/dev/null | awk 'NR>1 && $3=="backup" {print $1}' | tail -1)
     if [[ -z "$backup_file" ]]; then
         log_error "Could not find backup volid in $BACKUP_STORE for VMID $vmid"
         destroy_lxc "$vmid"
