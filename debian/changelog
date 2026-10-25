@@ -30,8 +30,10 @@ truenas-proxmox-plugin (1:2.1.24~beta6+idk27) unstable; urgency=medium
     Debian limpio sin PVE: 1204 tests, salida 0.
   * Documentacion: wiki/Testing.md y wiki/Tools.md ya no recomiendan ejecutar
     la suite destructiva (crea y borra VMs) contra almacenamiento de
-    produccion ni programarla en cron; solo contra un storage de pruebas en un
-    nodo de laboratorio.
+    produccion ni programarla en un nodo con cargas de produccion; solo contra un
+    storage de pruebas en un nodo de laboratorio. La prueba integrada del
+    instalador se describe como lo que es: crea y borra VMs de prueba (IDs
+    990+) en el storage elegido.
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Sun, 25 Oct 2026 12:00:00 -0500
 

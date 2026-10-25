@@ -771,7 +771,7 @@ With debug enabled, configure log rotation:
 
 ### Overview
 
-The integrated plugin test functionality is built into the interactive installer (`install.sh`) and provides quick validation of core plugin operations. It's designed for production use and performs real operations on test VMs to verify all major plugin functions work correctly.
+The integrated plugin test functionality is built into the interactive installer (`install.sh`) and provides quick validation of core plugin operations. It is meant to run on a live node: it picks unused VM IDs (990+), asks you to type ACCEPT, and removes its test VMs afterwards. It still creates, clones and destroys VMs and disks on the storage you select, so run it in a maintenance window and read the confirmation prompt before accepting.
 
 **Access Method**: Run `bash install.sh`, select "Diagnostics" from the main menu, then choose "Run plugin function test"
 
@@ -785,7 +785,7 @@ The integrated plugin test functionality is built into the interactive installer
 - **Health-Check Style Display** - Spinner animations with inline status updates
 - **Automatic Cleanup** - Test VMs are removed after completion or on failure
 - **Dynamic VM IDs** - Automatically selects available VM IDs (990+)
-- **Safe Execution** - Non-destructive to production VMs
+- **Isolated Execution** - Only touches the test VMs it creates (IDs 990+); it never modifies existing guests, but it does write to the selected storage
 
 ### Usage
 
