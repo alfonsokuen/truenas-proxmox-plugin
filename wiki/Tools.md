@@ -552,7 +552,7 @@ alloc_001,"Allocate 10GB disk via API",disk_allocation,PASS,2341,10737418240,107
 - CI/CD pipeline for plugin repository
 
 **❌ Do NOT Use For**:
-- Production environment validation (use Production Test Suite instead)
+- Production environment validation (use the integrated plugin function test instead)
 - Running on live systems with active VMs
 - Routine health checks (use Health Check tool instead)
 
@@ -616,7 +616,7 @@ jobs:
 
 ### See Also
 
-- [Production Test Suite](#production-test-suite) - For production validation
+- [Production Test Suite](#production-test-suite) - Pointer to the integrated test (lab/scratch only)
 - [Debug Logging System](#debug-logging-system) - For detailed diagnostics
 - [Health Check Tool](#health-check-tool) - For quick health validation
 
@@ -1005,7 +1005,7 @@ Cluster detected - additional tests available:
 
 **Recommendation**:
 - Use **Integrated Test** for quick validation after installation/updates
-- Use **Production Test Suite** for scheduled testing or detailed diagnostics
+- Use the **Production Test Suite** section only for its pointer to the integrated test; it is lab/scratch storage only, never scheduled on a production node
 - Use **Development Test Suite** only in isolated development environments
 
 ### Best Practices
@@ -1180,7 +1180,7 @@ The plugin function test feature (integrated in the installer) validates all maj
 
 ### Quick Reference
 
-**Location**: `tools/truenas-plugin-test-suite.sh`
+**Location**: the standalone script no longer exists; the equivalent is `tools/dev-truenas-plugin-full-function-test.sh` (destructive: dedicated scratch storage on a lab node only)
 
 **Basic Usage**:
 ```bash
@@ -1188,10 +1188,10 @@ The plugin function test feature (integrated in the installer) validates all maj
 cd tools/
 
 # Run test suite
-./truenas-plugin-test-suite.sh your-storage-name
+./dev-truenas-plugin-full-function-test.sh scratch-storage 9001
 
-# Run with auto-confirmation
-./truenas-plugin-test-suite.sh your-storage-name -y
+# Run only one phase
+./dev-truenas-plugin-full-function-test.sh scratch-storage 9001 --phase 2
 ```
 
 **What It Tests**:
@@ -1212,26 +1212,20 @@ cd tools/
 
 **Output**:
 - Real-time console output with color-coded results
-- Detailed log file in `/tmp/truenas-plugin-test-suite-*.log`
+- Detailed log file `test-results-<timestamp>.log` in the current directory
 - Performance metrics for all operations
 - Comprehensive summary report
 
 ### Common Commands
 
 ```bash
-# Test default storage 'tnscale'
 cd tools/
-./truenas-plugin-test-suite.sh
 
 # Test specific storage (dedicated TEST storage on a lab node only, never production)
-./truenas-plugin-test-suite.sh scratch-storage
+./dev-truenas-plugin-full-function-test.sh scratch-storage 9001
 
-# Automated testing (no prompts; same restriction applies)
-./truenas-plugin-test-suite.sh scratch-storage -y
-
-# View most recent test log
-ls -lt /tmp/truenas-plugin-test-suite-*.log | head -1
-tail -f /tmp/truenas-plugin-test-suite-$(date +%Y%m%d)-*.log
+# View most recent test log (written to the current directory)
+ls -t test-results-*.log | head -1
 ```
 
 ### Exit Codes
