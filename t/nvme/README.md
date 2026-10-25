@@ -21,6 +21,9 @@ Run the whole directory:
 
     prove -v -I t/nvme/lib t/nvme/*.t
 
+CI (`.github/workflows/build-package.yml`) runs exactly
+`prove -I t/nvme/lib -r t/nvme t/installer` before building the package.
+
 On a real Proxmox host, `libpve-storage-perl` already provides the real
 `PVE::Tools`, `PVE::JSONSchema`, and `PVE::Storage::Plugin` on the default
 `@INC`; drop `-I t/nvme/lib` there to exercise the tests against the real
