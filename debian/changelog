@@ -1,3 +1,16 @@
+truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
+
+  * Broker: respeta todos los presupuestos positivos, incluidos los de 2 s o
+    menos, con suelo de 0,5 s. Acota el connect TCP/TLS al tiempo restante de
+    la peticion.
+  * Broker: el plugin envia la hora de envio en el envelope; el broker rechaza
+    y cuenta las peticiones vencidas en cola antes de ejecutarlas en TrueNAS.
+  * Pruebas: t/broker/05-client-deadlines.t cubre upstream mudo, connect TLS
+    sin respuesta y una mutacion vencida tras ocupar todos los workers;
+    t/broker/06-plugin-envelope-timestamp.t comprueba la precision del envelope.
+
+ -- Alfonso Kuen <alfonsokuen@gmail.com>  Mon, 26 Oct 2026 12:00:00 -0500
+
 truenas-proxmox-plugin (1:2.1.24~beta6+idk27) unstable; urgency=medium
 
   * volume_snapshot: pool.snapshot.create se envia UNA vez (retry_max 0). Si

@@ -2423,6 +2423,7 @@ sub _broker_rpc {
     # stable api_* wire field names. The daemon is shared with
     # broker-service which still uses the old key names; keeping the wire
     # form constant means a single broker binary serves both branches.
+    my $timeout = _min_timeout($scfg->{tn_broker_timeout} // 30);
     my $req = {
         scfg => {
             api_host     => $scfg->{tn_api_host},
@@ -2442,7 +2443,9 @@ sub _broker_rpc {
         # Never ask for more than the retry budget has left. Asking for the
         # full window on the last attempt is how one call overshoots its
         # budget by a whole broker timeout.
-        timeout => _min_timeout($scfg->{tn_broker_timeout} // 30),
+        timeout => $timeout,
+        # The broker uses this to include time spent in its worker backlog.
+        sent_at => Time::HiRes::time(),
     };
     my $payload = encode_json($req) . "\n";
 
@@ -2456,7 +2459,6 @@ sub _broker_rpc {
     # Capped the same way as the timeout we declare to the broker: on the
     # last attempt of a retry sequence there may be only seconds of budget
     # left, and waiting the full window would blow past it.
-    my $timeout = _min_timeout($scfg->{tn_broker_timeout} // 30);
     my $deadline = time() + $timeout;
     my $sel = IO::Select->new($sock);
 
