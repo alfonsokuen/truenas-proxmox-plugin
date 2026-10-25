@@ -525,16 +525,20 @@ Comment out tests you don't want to run:
 
 ## Continuous Integration
 
+> **WARNING**: The test suite creates and destroys VMs and their disks. Run it
+> **only** against a dedicated **test** storage on a **lab** node or cluster,
+> never against a production storage or a node that hosts production guests.
+
 ### Automated Testing
 
-Run test suite in CI/CD pipelines:
+Run test suite in CI/CD pipelines against a dedicated scratch storage:
 
 ```bash
 #!/bin/bash
 # CI test script
 
-# Run test suite with auto-confirm
-if ./tools/dev-truenas-plugin-full-function-test.sh production-storage -y; then
+# Run test suite with auto-confirm against the dedicated test storage
+if ./tools/dev-truenas-plugin-full-function-test.sh scratch-storage -y; then
     echo "Tests passed"
     exit 0
 else
@@ -547,12 +551,10 @@ fi
 
 ### Scheduled Testing
 
-Add to cron for periodic validation:
-
-```bash
-# Daily test at 2 AM
-0 2 * * * /root/tools/dev-truenas-plugin-full-function-test.sh production-storage -y >> /var/log/truenas-plugin-test.log 2>&1
-```
+The suite is destructive, so do not schedule it (cron or otherwise) on a node
+that carries production workloads. If you want periodic validation, schedule it
+only on a lab node whose configured storage is a dedicated test storage
+(for example `scratch-storage`) and which has no production guests.
 
 ## Troubleshooting Test Suite
 
