@@ -65,7 +65,11 @@ sub run_copy {
     local $ENV{PLUGIN} = $PLUGIN; local $ENV{DEVPATH} = '/dev/null';
     my $sf = "$dir/taint.pl";
     open(my $o, '>', $sf) or die; print $o $script; close $o;
-    my $res = `$^X -T -I$FindBin::Bin/../.. $sf 2>&1`;
+    # The child gets the parent's @INC: PERL5LIB is ignored under -T, and
+    # without the t/nvme/lib stand-ins it cannot even compile the plugin on a
+    # host that has no PVE modules.
+    my $inc = join(' ', map { "-I$_" } grep { defined && length } @INC);
+    my $res = `$^X -T -I$FindBin::Bin/../.. $inc $sf 2>&1`;
     like($res, qr/in-tainted out-clean/, '_real_dev_path returns an untainted path under perl -T');
 }
 

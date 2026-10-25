@@ -10,7 +10,14 @@ use strict;
 use warnings;
 use Exporter 'import';
 
-our @EXPORT_OK = qw(get_standard_option);
+our @EXPORT_OK = qw(get_standard_option get_format);
+
+# The format validators ('pve-storage-server', ...) are registered by the real
+# module only; the stand-in has none, and t/nvme/26 skips its format checks
+# when this returns undef ("format validators not registered here").
+sub get_format {
+    return undef;
+}
 
 sub get_standard_option {
     my ($name, $override) = @_;
