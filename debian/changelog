@@ -1,3 +1,13 @@
+truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
+
+  * status() y el preflight de alloc piden a pool.dataset.get_instance solo
+    las propiedades de capacidad que consumen y excluyen los hijos del pool.
+    _tn_dataset_get mantiene la llamada original para los demás lectores y
+    reintenta sin `extra` si el array rechaza su validación, recordándolo por
+    host durante el proceso. Test t/nvme/40.
+
+ -- Alfonso Kuen <alfonsokuen@gmail.com>  Mon, 26 Oct 2026 12:00:00 -0500
+
 truenas-proxmox-plugin (1:2.1.24~beta6+idk27) unstable; urgency=medium
 
   * volume_snapshot: pool.snapshot.create se envia UNA vez (retry_max 0). Si

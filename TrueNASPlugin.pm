@@ -92,6 +92,11 @@ my %_target_visible_last_ok;
 # window rather than being remembered as down.
 my %_status_api_down;
 
+# Hosts that reject pool.dataset.get_instance's `extra` argument. Remember the
+# schema capability for this process so capacity polls do not pay a failed call
+# on every request.
+my %_dataset_get_extra_unsupported;
+
 # Lightweight status-cache counters for tuning/verification
 my %_status_capacity_cache_stats = (
     hit => 0,
@@ -3580,7 +3585,24 @@ sub _tn_dataset_get($scfg, $full, $opts = undef) {
         $api_opts //= { retry_opts => {} };
         $api_opts->{retry_opts}{retry_delay} = $opts->{retry_delay};
     }
-    return _api_call($scfg, 'pool.dataset.get_instance', [ $full ], $api_opts);
+    my $host_key = _cache_host_key($scfg);
+    my $extra = $opts && exists($opts->{extra}) && !$_dataset_get_extra_unsupported{$host_key}
+        ? $opts->{extra} : undef;
+    my $params = defined($extra) ? [ $full, { extra => $extra } ] : [ $full ];
+    my $result = eval {
+        _api_call($scfg, 'pool.dataset.get_instance', $params, $api_opts);
+    };
+    my $err = $@;
+    if ($err && defined($extra) && $err =~ /\bEINVAL\b|Invalid params|validation/i) {
+        # Remember the rejection only once the plain call works: an EINVAL that
+        # is about the dataset itself (bad name, say) would otherwise switch the
+        # optimisation off for this host for the life of the process.
+        my $plain = _api_call($scfg, 'pool.dataset.get_instance', [ $full ], $api_opts);
+        $_dataset_get_extra_unsupported{$host_key} = 1;
+        return $plain;
+    }
+    die $err if $err;
+    return $result;
 }
 sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     my $payload = { volsize => int($new_bytes) }; # grow-only
@@ -6196,7 +6218,10 @@ sub _preflight_check_alloc {
         my $required = $bytes * 1.2;
 
         eval {
-            my $ds_info = _tn_dataset_get($scfg, $scfg->{tn_dataset});
+            my $ds_info = _tn_dataset_get($scfg, $scfg->{tn_dataset}, { extra => {
+                retrieve_children => JSON::PP::false,
+                properties => [qw(available)],
+            }});
             if ($ds_info) {
                 my $available = _normalize_value($ds_info->{available}) || 0;
 
@@ -12173,7 +12198,13 @@ sub status {
                 # tests. Two retries add up to 3 x 60 s = 180 s worst case, but
                 # normal path is 1 attempt and the STATUS_CAPACITY_TTL_S cache
                 # keeps pvestatd from re-hitting this every poll.
-                $ds = _tn_dataset_get($scfg, $scfg->{tn_dataset}, { retry_max => 2 });
+                $ds = _tn_dataset_get($scfg, $scfg->{tn_dataset}, {
+                    retry_max => 2,
+                    extra => {
+                        retrieve_children => JSON::PP::false,
+                        properties => [qw(used available quota written)],
+                    },
+                });
                 _set_cache($host_key, $status_method, $ds);
                 _write_status_stamp($scfg, $status_method, $ds);
 
