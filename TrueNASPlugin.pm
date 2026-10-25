@@ -639,6 +639,19 @@ sub _is_retryable_error {
     return 0; # Default: don't retry unknown errors
 }
 
+# True when the error is the server's own verdict on the request (validation,
+# permission, not-found, an explicit refusal), as opposed to a transport failure
+# whose outcome is unknown. A caller that wants to ask "did it happen anyway?"
+# must only do so for the unknown kind.
+sub _is_definitive_server_verdict {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return 1 if $error =~ /\bEINVAL\b|Invalid params|validation.*error|invalid.*parameter/i;
+    return 1 if _is_auth_error($error) || _is_not_found_error($error);
+    return 1 if $error =~ /\bEBUSY\b|dataset is busy|FOREIGN KEY constraint failed|IntegrityError/i;
+    return 0;
+}
+
 # Absolute wall-clock deadline for the API call currently in flight, set by
 # _retry_with_backoff and read by the transport so a later attempt asks for
 # the time that is actually left rather than a fresh full window. undef means
@@ -3820,9 +3833,37 @@ sub volume_snapshot {
 
         # Create ZFS snapshot for the disk
         my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
-        my $result = _api_call_mutate(
-            $scfg, 'pool.snapshot.create', [ $payload ],
-        );
+        # pool.snapshot.create is not idempotent: replayed after a lost response
+        # it answers "already exists", PVE is told the snapshot failed and it
+        # sits on the array as a ghost (a stray @vzdump then breaks the next
+        # backup). So it is sent once, and when that fails the pool is asked
+        # whether the postcondition holds, as create_base does. The original
+        # error is kept: the query's own eval must not clobber it, and a query
+        # that cannot be answered is never read as success.
+        my $result = eval {
+            _api_call_mutate(
+                $scfg, 'pool.snapshot.create', [ $payload ],
+                { retry_opts => { retry_max => 0 } },
+            );
+        };
+        if (my $create_err = $@) {
+            if (_is_definitive_server_verdict($create_err)) {
+                die $create_err;
+            }
+            my $exists = eval {
+                _api_call($scfg, 'pool.snapshot.query',
+                    [ [ [ 'id', '=', $snap_full ] ], { select => [ 'id' ] } ]);
+            };
+            if (!$@ && ref($exists) eq 'ARRAY' && @$exists) {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] volume_snapshot: $snap_full is present despite the error "
+                  . "reported by pool.snapshot.create; treating it as created. "
+                  . "original error: $create_err");
+                $result = undef;    # no job to wait for
+            } else {
+                die $create_err;
+            }
+        }
 
         # Handle potential async job for snapshot creation
         my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot creation for $snap_full");
