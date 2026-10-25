@@ -1,10 +1,26 @@
 truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
 
+  * JSON: el plugin y el broker usan JSON::XS cuando esta instalado y caen a
+    JSON::PP si no (TRUENAS_PLUGIN_JSON_PP=1 fuerza el antiguo). Medido en un
+    nodo con una respuesta de 352 KB: decodificar 258 ms con JSON::PP frente a
+    4,8 ms con JSON::XS, codificar 76 ms frente a 3,5 ms, y cada respuesta de
+    TrueNAS pasa por cuatro pasadas (plugin y broker). La clase booleana, los
+    enteros de 64 bits, las cadenas numericas y UTF-8 no cambian. Recommends:
+    libjson-xs-perl. Test t/nvme/39; suite completa verde con los dos backends.
   * status() y el preflight de alloc piden a pool.dataset.get_instance solo
     las propiedades de capacidad que consumen y excluyen los hijos del pool.
     _tn_dataset_get mantiene la llamada original para los demás lectores y
     reintenta sin `extra` si el array rechaza su validación, recordándolo por
-    host durante el proceso. Test t/nvme/40.
+    host durante el proceso. Medido contra el array real: 198790 bytes y ~444 ms por llamada de status
+    (70 hijos) frente a 592 bytes y ~39 ms. Test t/nvme/40.
+  * Broker: respeta todos los presupuestos positivos, incluidos los de 2 s o
+    menos, con suelo de 0,5 s. Acota el connect TCP/TLS al tiempo restante de
+    la peticion.
+  * Broker: el plugin envia la hora de envio en el envelope; el broker rechaza
+    y cuenta las peticiones vencidas en cola antes de ejecutarlas en TrueNAS.
+  * Pruebas: t/broker/05-client-deadlines.t cubre upstream mudo, connect TLS
+    sin respuesta y una mutacion vencida tras ocupar todos los workers;
+    t/broker/06-plugin-envelope-timestamp.t comprueba la precision del envelope.
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Mon, 26 Oct 2026 12:00:00 -0500
 

@@ -23,6 +23,7 @@ unless (eval { require $PLUGIN; 1 }) {
 }
 my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 my $retryable = $PKG->can('_is_retryable_error') or BAIL_OUT('no _is_retryable_error');
+my $connection = $PKG->can('_is_connection_error') or BAIL_OUT('no _is_connection_error');
 my $message   = $PKG->can('_rpc_error_message')  or BAIL_OUT('no _rpc_error_message');
 {
     no strict 'refs';
@@ -49,6 +50,10 @@ like($short, qr/^JSON-RPC error \[EFAULT\]: \[EFAULT\] Failed to clone snapshot:
     'message is [errname]: reason, without the traceback');
 ok(length($short) < 300, 'message is short (' . length($short) . ' chars)');
 ok(!$retryable->($short), 'the short message is not retryable either');
+ok(!$retryable->('broker: request expired in queue'),
+   'expired queued requests are never retried');
+ok(!$connection->('broker: request expired in queue'),
+   'expired queued requests are not connection errors');
 
 # hashref input (the direct WebSocket path) and passthrough of plain strings
 use JSON::PP;

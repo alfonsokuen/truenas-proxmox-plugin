@@ -16,7 +16,8 @@
 #   client -> broker:
 #     {"scfg":{"api_host":"...","api_key":"...","api_scheme":"wss",
 #              "api_insecure":0,"prefer_ipv4":1,"api_port":443},
-#      "method":"system.version","params":[]}
+#      "method":"system.version","params":[],
+#      "timeout":30,"sent_at":1761510000.0}
 #   broker -> client:
 #     {"result":...}            on success
 #     {"error":"..."}           on failure (string contains TN error body)
@@ -85,6 +86,7 @@ if ($MAX_BUDGET !~ /^\d+(?:\.\d+)?$/ || $MAX_BUDGET < 5) {
     warn "TRUENAS_BROKER_MAX_BUDGET is not a number >= 5; using 90\n";
     $MAX_BUDGET = 90;
 }
+my $MIN_CLIENT_BUDGET = 0.5;
 # The liveness probe on a pooled connection gets a much shorter budget: its
 # whole purpose is to find out quickly whether the socket is still real, and a
 # probe that waits the full timeout defeats the point of probing.
@@ -129,7 +131,11 @@ my $LIVENESS_CACHE_SECS = 60;
 # Bump this if a node has many pvedaemon workers; keep it small enough
 # that startup burst + reconnect churn stays inside TN's 20/60s ceiling
 # with headroom for other operational traffic.
-my $PREFORK_N = 4;
+my $PREFORK_N = $ENV{TRUENAS_BROKER_WORKERS} // 4;
+if ($PREFORK_N !~ /^[1-4]$/) {
+    warn "TRUENAS_BROKER_WORKERS must be between 1 and 4; using 4\n";
+    $PREFORK_N = 4;
+}
 
 my $foreground = grep { $_ eq '--foreground' || $_ eq '-f' } @ARGV;
 my $debug      = grep { $_ eq '--debug' || $_ eq '-d' } @ARGV;
@@ -256,17 +262,20 @@ sub ws_open {
     # on a dual-stack TN even though the plugin had resolved A already.
     my $peer   = (($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host);
 
+    my $connect_timeout = $deadline - time();
+    die "upstream connect deadline expired" if $connect_timeout <= 0;
+    $connect_timeout = 15 if $connect_timeout > 15;
     my $sock;
     if ($scheme eq 'wss') {
         $sock = IO::Socket::SSL->new(
             PeerHost => $peer, PeerPort => $port,
             SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
             SSL_hostname    => $host,
-            Timeout => 15,
+            Timeout => $connect_timeout,
         ) or die "TLS connect to $host:$port failed: $SSL_ERROR";
     } else {
         $sock = IO::Socket::INET->new(
-            PeerHost => $peer, PeerPort => $port, Proto => 'tcp', Timeout => 15,
+            PeerHost => $peer, PeerPort => $port, Proto => 'tcp', Timeout => $connect_timeout,
         ) or die "TCP connect to $host:$port failed: $!";
     }
 
@@ -721,9 +730,11 @@ sub read_line_blocking {
     }
 }
 
+my $QUEUE_EXPIRED_COUNT = 0; # per worker; each expiry is also logged
 sub handle_request {
-    my ($client) = @_;
-    my $line = read_line_blocking($client, time() + $CLIENT_READ_TIMEOUT);
+    my ($client, $accepted_at) = @_;
+    $accepted_at //= time();
+    my $line = read_line_blocking($client, $accepted_at + $CLIENT_READ_TIMEOUT);
     return unless defined $line;
     my $req = eval { decode_json($line) };
     if ($@ || !$req) {
@@ -787,12 +798,27 @@ sub handle_request {
     # Clamping it to the daemon default meant an operator who raised the plugin
     # side for a slow array got no change and no log line, and had to discover
     # that a second knob existed in the unit file. Bounded above so a bad value
-    # cannot pin the single thread for an unreasonable time.
+    # cannot pin a worker for an unreasonable time.
     my $budget = $UPSTREAM_TIMEOUT;
     my $client_timeout = $req->{timeout};
     if (defined($client_timeout) && !ref($client_timeout)
-        && $client_timeout =~ /^\d+(?:\.\d+)?$/ && $client_timeout > 2) {
-        $budget = $client_timeout - 2;
+        && $client_timeout =~ /^\d+(?:\.\d+)?$/ && $client_timeout > 0) {
+        # The plugin records this when it sends the envelope. accept() alone
+        # cannot reveal time spent in the kernel backlog while all workers run.
+        my $started_at = $req->{sent_at};
+        $started_at = $accepted_at unless defined($started_at) && !ref($started_at)
+            && $started_at =~ /^\d+(?:\.\d+)?$/ && $started_at > 0;
+        my $remaining = $client_timeout - (time() - $started_at);
+        if ($remaining <= 0) {
+            ++$QUEUE_EXPIRED_COUNT;
+            lwarn("request expired in queue (worker=$$ count=$QUEUE_EXPIRED_COUNT method=$method)");
+            my $msg = encode_json({ error => 'broker: request expired in queue' });
+            write_all($client, "$msg\n", time() + $CLIENT_READ_TIMEOUT);
+            return;
+        }
+        $budget = $remaining;
+        $budget -= 2 if $budget - 2 >= $MIN_CLIENT_BUDGET;
+        $budget = $MIN_CLIENT_BUDGET if $budget < $MIN_CLIENT_BUDGET;
         $budget = $MAX_BUDGET if $budget > $MAX_BUDGET;
     }
     my $deadline = time() + $budget;
@@ -923,7 +949,8 @@ sub worker_loop {
             if ($fh == $srv) {
                 my $c = $srv->accept();
                 next unless $c;
-                eval { handle_request($c); };
+                my $accepted_at = time();
+                eval { handle_request($c, $accepted_at); };
                 if ($@) { lerr("handle_request died: $@"); }
                 eval { $c->close(); };
             }
