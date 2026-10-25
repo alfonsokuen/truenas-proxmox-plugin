@@ -22,7 +22,7 @@ sub _load_plugin {
 }
 
 our @EXPORT_OK = qw(
-    env_require env_get
+    env_require env_get skip_all_unless_env
     now_iso epoch_iso
     drain_limiter
     new_audit_conn count_logins
@@ -45,6 +45,19 @@ sub env_require {
 sub env_get {
     my ($name, $default) = @_;
     return defined $ENV{$name} && length $ENV{$name} ? $ENV{$name} : $default;
+}
+
+# Skip the whole test file (TAP "1..0 # SKIP") when an integration env var
+# is missing, naming the first one. Call it before `plan tests => N`.
+# Test::More is loaded lazily so this module still parses without it.
+sub skip_all_unless_env {
+    my @names = @_ ? @_ : qw(TN_HOST TN_API_KEY STORAGE_ID);
+    for my $name (@names) {
+        next if defined $ENV{$name} && length $ENV{$name};
+        require Test::More;
+        Test::More::plan(skip_all => "integration test needs env var $name (see t/rate-limit/README.md)");
+    }
+    return 1;
 }
 
 # ---------------- time helpers ----------------

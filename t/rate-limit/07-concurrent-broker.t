@@ -20,8 +20,10 @@ use lib "$Bin/lib";
 use Test::More;
 use Time::HiRes qw(sleep time);
 use POSIX qw(:sys_wait_h);
-use RateLimit::Harness qw(env_require drain_limiter new_audit_conn count_logins
+use RateLimit::Harness qw(skip_all_unless_env env_require drain_limiter new_audit_conn count_logins
                           now_iso test_scfg say_diag);
+
+skip_all_unless_env();
 
 plan tests => 3;
 
