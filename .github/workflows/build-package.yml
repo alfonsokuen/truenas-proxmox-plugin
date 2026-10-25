@@ -41,6 +41,22 @@ jobs:
             dh-make-perl \
             lintian
 
+      - name: Install unit test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            perl \
+            libio-socket-ssl-perl \
+            liburi-perl \
+            curl
+
+      # Only the offline suites run here: t/nvme loads TrueNASPlugin.pm against
+      # the PVE stand-ins in t/nvme/lib, and t/installer drives the shell
+      # installers with stubs. The t/rate-limit tests are integration tests
+      # (they need a real TrueNAS array / Proxmox host), so CI does not run them.
+      - name: Run unit tests
+        run: prove -I t/nvme/lib -r t/nvme t/installer
+
       - name: Build package and run lintian
         run: tools/build-deb.sh
 
