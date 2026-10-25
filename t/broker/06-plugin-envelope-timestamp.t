@@ -1,6 +1,7 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
+use Time::HiRes ();
 use Test::More;
 use FindBin;
 use lib "$FindBin::Bin/../nvme/lib";
@@ -32,6 +33,9 @@ is($result, 'ok', 'plugin accepts a broker response');
 my $line = <$server>;
 my $envelope = decode_json($line);
 is($envelope->{timeout}, 1, 'client timeout is sent unchanged');
-like("$envelope->{sent_at}", qr/^\d+\.\d+$/,
-    'send timestamp has subsecond precision for short budgets');
+ok(!exists $envelope->{sent_at}, 'no wall-clock stamp is sent: a clock step must not decide whether a request expired');
+my $now_mono = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC());
+ok(defined $envelope->{sent_mono} && "$envelope->{sent_mono}" =~ /^[0-9]+[.][0-9]+$/,
+    'a monotonic send stamp with subsecond precision is sent');
+ok(abs($now_mono - $envelope->{sent_mono}) < 5, 'the stamp is on the same monotonic clock as the broker reads');
 done_testing();

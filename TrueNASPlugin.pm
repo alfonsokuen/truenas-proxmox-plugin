@@ -2449,8 +2449,12 @@ sub _broker_rpc {
         # full window on the last attempt is how one call overshoots its
         # budget by a whole broker timeout.
         timeout => $timeout,
-        # The broker uses this to include time spent in its worker backlog.
-        sent_at => Time::HiRes::time(),
+        # The broker uses this to include time spent in its worker backlog. It is
+        # CLOCK_MONOTONIC, which both processes read from the same kernel clock:
+        # a wall-clock stamp would let an NTP step expire a fresh request or keep
+        # an expired one alive (and a mutation that runs after its client gave up
+        # is a mutation that gets retried).
+        sent_mono => Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()),
     };
     my $payload = encode_json($req) . "\n";
 

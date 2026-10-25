@@ -17,7 +17,7 @@
 #     {"scfg":{"api_host":"...","api_key":"...","api_scheme":"wss",
 #              "api_insecure":0,"prefer_ipv4":1,"api_port":443},
 #      "method":"system.version","params":[],
-#      "timeout":30,"sent_at":1761510000.0}
+#      "timeout":30,"sent_mono":123456.789}
 #   broker -> client:
 #     {"result":...}            on success
 #     {"error":"..."}           on failure (string contains TN error body)
@@ -805,20 +805,34 @@ sub handle_request {
         && $client_timeout =~ /^\d+(?:\.\d+)?$/ && $client_timeout > 0) {
         # The plugin records this when it sends the envelope. accept() alone
         # cannot reveal time spent in the kernel backlog while all workers run.
-        my $started_at = $req->{sent_at};
-        $started_at = $accepted_at unless defined($started_at) && !ref($started_at)
-            && $started_at =~ /^\d+(?:\.\d+)?$/ && $started_at > 0;
-        my $remaining = $client_timeout - (time() - $started_at);
-        if ($remaining <= 0) {
+        # sent_mono is CLOCK_MONOTONIC, the same kernel clock in both processes,
+        # so a clock step cannot expire a fresh request or revive an old one.
+        # Without it (older plugin) only the time since accept() is known.
+        my $sent_mono = $req->{sent_mono};
+        my $elapsed;
+        if (defined($sent_mono) && !ref($sent_mono) && $sent_mono =~ /^\d+(?:\.\d+)?$/ && $sent_mono > 0) {
+            $elapsed = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) - $sent_mono;
+        } else {
+            $elapsed = time() - $accepted_at;
+        }
+        $elapsed = 0 if $elapsed < 0;
+        my $remaining = $client_timeout - $elapsed;
+        # Keep room to ANSWER before the client gives up: a result delivered after
+        # its deadline is a mutation that ran and was reported as failed, which
+        # the plugin may then retry. From 4 s up the margin is the usual 2 s;
+        # below that it is half of what is left.
+        my $margin = $remaining >= 4 ? 2 : $remaining / 2;
+        $budget = $remaining - $margin;
+        # Below the floor the request is not stretched to it: the client has all
+        # but given up, so it is refused WITHOUT being executed.
+        if ($budget < $MIN_CLIENT_BUDGET) {
             ++$QUEUE_EXPIRED_COUNT;
-            lwarn("request expired in queue (worker=$$ count=$QUEUE_EXPIRED_COUNT method=$method)");
+            lwarn(sprintf("request expired in queue (worker=%d count=%d method=%s remaining=%.2fs)",
+                $$, $QUEUE_EXPIRED_COUNT, $method, $remaining));
             my $msg = encode_json({ error => 'broker: request expired in queue' });
             write_all($client, "$msg\n", time() + $CLIENT_READ_TIMEOUT);
             return;
         }
-        $budget = $remaining;
-        $budget -= 2 if $budget - 2 >= $MIN_CLIENT_BUDGET;
-        $budget = $MIN_CLIENT_BUDGET if $budget < $MIN_CLIENT_BUDGET;
         $budget = $MAX_BUDGET if $budget > $MAX_BUDGET;
     }
     my $deadline = time() + $budget;

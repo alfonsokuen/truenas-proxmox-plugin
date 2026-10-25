@@ -13,14 +13,26 @@ truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
     reintenta sin `extra` si el array rechaza su validación, recordándolo por
     host durante el proceso. Medido contra el array real: 198790 bytes y ~444 ms por llamada de status
     (70 hijos) frente a 592 bytes y ~39 ms. Test t/nvme/40.
-  * Broker: respeta todos los presupuestos positivos, incluidos los de 2 s o
-    menos, con suelo de 0,5 s. Acota el connect TCP/TLS al tiempo restante de
-    la peticion.
-  * Broker: el plugin envia la hora de envio en el envelope; el broker rechaza
-    y cuenta las peticiones vencidas en cola antes de ejecutarlas en TrueNAS.
+  * Broker: respeta cualquier timeout positivo del cliente, tambien los de 2 s
+    o menos (antes los ignoraba y usaba 30 s, ocupando un worker). Reserva
+    margen para RESPONDER antes de que el cliente se rinda (2 s a partir de
+    4 s de plazo; por debajo, la mitad), porque un resultado entregado tarde es
+    una mutacion que se ejecuto y se informo como fallida, y el plugin puede
+    reintentarla. Si el presupuesto restante es menor que el suelo de 0,5 s, la
+    peticion se rechaza SIN ejecutarla ("broker: request expired in queue") en
+    lugar de ampliarse. Acota el connect TCP/TLS al tiempo restante (la
+    resolucion de nombres previa no esta acotada: tn_api_host suele ser una IP).
+  * Broker: el plugin envia sent_mono (CLOCK_MONOTONIC, el mismo reloj del
+    kernel para los dos procesos) y el broker rechaza y cuenta las peticiones
+    vencidas en la cola antes de ejecutarlas en TrueNAS. No se usa hora civil:
+    un salto de NTP podria expirar una peticion fresca o mantener viva una
+    vencida. Un plugin antiguo sin sent_mono solo permite medir desde accept().
+    Durante una actualizacion con versiones mezcladas la proteccion es parcial,
+    nunca peor que antes.
   * Pruebas: t/broker/05-client-deadlines.t cubre upstream mudo, connect TLS
     sin respuesta y una mutacion vencida tras ocupar todos los workers;
-    t/broker/06-plugin-envelope-timestamp.t comprueba la precision del envelope.
+    t/broker/06-plugin-envelope-timestamp.t comprueba que el envelope lleva el sello
+    monotonico y ninguno de hora civil.
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Mon, 26 Oct 2026 12:00:00 -0500
 

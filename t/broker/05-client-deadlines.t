@@ -120,6 +120,8 @@ my $ready_by = time() + 10;
 sleep 0.02 until -S $sock_path || time() >= $ready_by;
 plan skip_all => 'broker socket did not appear' unless -S $sock_path;
 
+sub mono { return Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) }
+
 sub send_request {
     my (%arg) = @_;
     my $s = IO::Socket::UNIX->new(Peer => $sock_path, Type => SOCK_STREAM)
@@ -131,7 +133,8 @@ sub send_request {
         method => $arg{method}, params => [],
     };
     $req->{timeout} = $arg{timeout} if exists $arg{timeout};
-    $req->{sent_at} = $arg{sent_at} if exists $arg{sent_at};
+    $req->{sent_mono} = $arg{sent_mono} if exists $arg{sent_mono};
+    $req->{sent_at} = $arg{sent_at} if exists $arg{sent_at};   # wall clock: must be ignored
     $s->syswrite(encode_json($req) . "\n");
     return $s;
 }
@@ -167,7 +170,7 @@ my @holding = map { send_request(method => 'test.hold', timeout => 30) } 1 .. 2;
 my $held_by = time() + 10;
 sleep 0.02 until event_count('hold') == 2 || time() >= $held_by;
 is(event_count('hold'), 2, 'both workers are occupied');
-my $queued = send_request(method => 'test.mutate', timeout => 0.5, sent_at => time());
+my $queued = send_request(method => 'test.mutate', timeout => 0.5, sent_mono => mono());
 sleep 0.8;
 open(my $release_fh, '>', $release) or die $!;
 close $release_fh;
@@ -182,14 +185,14 @@ is(event_count('mutate'), 0, 'expired mutation never reaches upstream');
     close $log_fh;
     like($log, qr/request expired in queue.*count=1/, 'queue expiry is counted in the broker log');
 }
-my $legacy = send_request(method => 'test.mutate', sent_at => time() - 3600);
+my $legacy = send_request(method => 'test.mutate', sent_mono => mono() - 3600);
 my $legacy_reply = read_reply($legacy, 3);
 is(ref($legacy_reply) eq 'HASH' ? $legacy_reply->{result} : undef,
    'ok', 'requests without a timeout ignore the timestamp');
 
 # A short client budget must not silently revert to the daemon's 30 seconds.
 my $started = time();
-my $mute = send_request(method => 'test.mute', timeout => 1, sent_at => $started);
+my $mute = send_request(method => 'test.mute', timeout => 1, sent_mono => mono());
 my $mute_reply = read_reply($mute, 1.5);
 ok(ref($mute_reply) eq 'HASH' && exists $mute_reply->{error},
    'silent upstream releases its worker for a one-second budget');
@@ -198,10 +201,36 @@ cmp_ok(time() - $started, '<', 1.5, 'silent request finishes within 1.5 seconds'
 # A TCP listener which never completes TLS must not retain a worker for 15 s.
 $started = time();
 my $tls = send_request(method => 'test.connect', scheme => 'wss', api_key => 'tls-key', timeout => 1,
-                       sent_at => $started);
+                       sent_mono => mono());
 my $tls_reply = read_reply($tls, 1.5);
 ok(ref($tls_reply) eq 'HASH' && exists $tls_reply->{error},
    'silent TLS connect respects the request deadline');
 cmp_ok(time() - $started, '<', 1.5, 'connect finishes within 1.5 seconds');
+
+# A budget below the floor is not stretched to the floor: the client has given up
+# before the broker could answer, and executing a mutation nobody will hear about
+# is how a retry duplicates it. It is rejected without reaching the upstream.
+my $before = event_count('mutate');
+my $tiny = send_request(method => 'test.mutate', timeout => 0.3, sent_mono => mono());
+my $tiny_reply = read_reply($tiny, 2);
+is(ref($tiny_reply) eq 'HASH' ? $tiny_reply->{error} : undef,
+   'broker: request expired in queue', 'a budget below the floor is rejected, not stretched');
+is(event_count('mutate'), $before, '  ...and the mutation never reaches the upstream');
+
+# The broker keeps a margin to answer: a 2 s budget on a silent upstream is given
+# up at about 1 s, not at 2 s when the client is already gone.
+$started = time();
+my $margin = send_request(method => 'test.mute', timeout => 2, sent_mono => mono());
+my $margin_reply = read_reply($margin, 2.5);
+ok(ref($margin_reply) eq 'HASH' && exists $margin_reply->{error}, 'a 2 s budget on a silent upstream ends with an error');
+cmp_ok(time() - $started, '<', 1.6, '  ...before the client deadline, leaving room to answer');
+
+# Only the monotonic stamp counts. A wall-clock stamp an hour in the past (a clock
+# step, or an old build) must neither expire the request nor shorten its budget.
+$before = event_count('mutate');
+my $wall = send_request(method => 'test.mutate', timeout => 5, sent_at => time() - 3600, sent_mono => mono());
+my $wall_reply = read_reply($wall, 3);
+is(ref($wall_reply) eq 'HASH' ? $wall_reply->{result} : undef, 'ok', 'the wall-clock stamp is ignored');
+is(event_count('mutate'), $before + 1, '  ...and the request is executed once');
 
 done_testing();
