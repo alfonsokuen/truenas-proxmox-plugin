@@ -998,7 +998,7 @@ Cluster detected - additional tests available:
 | **Output** | Health-check style (30-char labels) | Detailed console + log | Pastel colors + JSON/CSV |
 | **Cleanup** | Automatic | Automatic | Automatic |
 | **Cluster Tests** | Planned (not yet) | Planned (not yet) | Yes (migration/clone) |
-| **Production Safe** | Yes | Yes | No (dev only) |
+| **Production Safe** | Yes | No (lab/scratch storage only) | No (dev only) |
 | **API Method** | pvesh | pvesh | pvesh |
 | **Logging** | Silent (no log file) | Detailed log file | JSON + CSV logs |
 | **Interrupt Handling** | Graceful with cleanup | Standard | Standard |
