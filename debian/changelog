@@ -15,11 +15,13 @@ truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
     (70 hijos) frente a 592 bytes y ~39 ms. Test t/nvme/40.
   * Broker: respeta cualquier timeout positivo del cliente, tambien los de 2 s
     o menos (antes los ignoraba y usaba 30 s, ocupando un worker). Reserva
-    margen para RESPONDER antes de que el cliente se rinda (2 s a partir de
-    4 s de plazo; por debajo, la mitad), porque un resultado entregado tarde es
+    margen para RESPONDER antes de que el cliente se rinda (0,25 s hasta 1 s de
+    plazo, rampa lineal hasta los 2 s habituales a partir de 4 s; continuo y
+    monotono: a mitad de lo que queda cortaba respuestas validas de 0,6 s en un
+    plazo de 1 s), porque un resultado entregado tarde es
     una mutacion que se ejecuto y se informo como fallida, y el plugin puede
     reintentarla. Si el presupuesto resultante es menor de 0,15 s (al cliente le
-    quedan menos de ~0,3 s), la peticion se rechaza SIN ejecutarla ("broker:
+    quedan menos de ~0,4 s), la peticion se rechaza SIN ejecutarla ("broker:
     request expired in queue") en lugar de ampliarse; un plazo de 1 s, que
     llega a cada llamada al final de tn_op_budget_s, sigue siendo util. Acota el connect TCP/TLS al tiempo restante (la
     resolucion de nombres previa no esta acotada: tn_api_host suele ser una IP).

@@ -824,9 +824,14 @@ sub handle_request {
         my $remaining = $client_timeout - $elapsed;
         # Keep room to ANSWER before the client gives up: a result delivered after
         # its deadline is a mutation that ran and was reported as failed, which
-        # the plugin may then retry. From 4 s up the margin is the usual 2 s;
-        # below that it is half of what is left.
-        my $margin = $remaining >= 4 ? 2 : $remaining / 2;
+        # the plugin may then retry. Continuous and monotonic in the deadline: 0.25 s up to 1 s (writing a
+        # reply on a local socket takes microseconds), rising linearly to the
+        # usual 2 s at 4 s. Halving what is left, as an earlier draft did, cut a
+        # valid 0.6 s answer on a 1 s deadline - an upstream that did the work
+        # and was reported as silent.
+        my $margin = $remaining >= 4 ? 2
+                   : $remaining <= 1 ? 0.25
+                   : 0.25 + ($remaining - 1) * 1.75 / 3;
         $budget = $remaining - $margin;
         # Below the floor the request is not stretched to it: the client has all
         # but given up, so it is refused WITHOUT being executed.

@@ -90,6 +90,10 @@ if (!$upstream_pid) {
                 sleep 0.02 until -e $release;
             } elsif ($method eq 'test.mutate') {
                 record_event('mutate');
+            } elsif ($method eq 'test.slow') {
+                # An upstream that answers, but not at once: 0.6 s.
+                record_event('slow');
+                sleep 0.6;
             } elsif ($method eq 'test.mute') {
                 next;
             }
@@ -242,13 +246,22 @@ my $one_reply = read_reply($one, 2);
 is(ref($one_reply) eq 'HASH' ? $one_reply->{result} : undef, 'ok', 'a one-second budget with a responsive upstream succeeds');
 is(event_count('mutate'), $before + 1, '  ...and executes exactly once');
 
+# The margin to answer is small for short budgets. An upstream that takes 0.6 s on
+# a 1 s deadline still has to be DELIVERED: halving the budget (0.5 s) would cut a
+# valid answer, run the mutation and report "no response" - which the deployed
+# broker (30 s budget below 2 s) never did.
+my $slow = send_request(method => 'test.slow', timeout => 1, sent_mono => mono());
+my $slow_reply = read_reply($slow, 2);
+is(ref($slow_reply) eq 'HASH' ? $slow_reply->{result} : undef, 'ok',
+   'an answer that takes 0.6 s on a 1 s deadline is delivered');
+
 # The refusal is for a client that is all but gone, and says so in the log with
 # the budget it had left, so it can be told apart from plain latency.
 {
     open(my $log_fh, '<', "$dir/broker.log") or die $!;
     my $log = do { local $/; <$log_fh> };
     close $log_fh;
-    like($log, qr/request expired in queue.*remaining=0[.][12]/, 'the refusal logs the budget that was left');
+    like($log, qr/request expired in queue.*remaining=0[.][0-2]/, 'the refusal logs the budget that was left');
 }
 
 done_testing();
