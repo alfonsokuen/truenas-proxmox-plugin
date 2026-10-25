@@ -17,7 +17,7 @@
 #
 # Assertions tagged EXPECT-FAIL(unfixed) must FAIL without the classifier.
 #
-# Run with:  prove -v t/nvme/36-broker-transport-errors.t
+# Run with:  prove -v t/nvme/37-broker-transport-errors.t
 
 use strict;
 use warnings;
