@@ -91,22 +91,34 @@ lt_init() {
 }
 
 # ------------------------------------------------------------------ VM provisioning
+# FREE | OWN | FOREIGN for one VMID, cluster-wide. OWN = a QEMU VM named
+# lt-<id>, i.e. residue of a previous run of this suite (--keep-vms). A CT or any
+# other guest on the ID is FOREIGN. The id is checked numeric before it reaches
+# the remote shell; ls only feeds a variable so a missing file is not an error.
+lt_vmid_state() {
+    local id="$1"
+    [[ "${id}" =~ ^[0-9]+$ ]] || return 1
+    lt_ssh "id=${id};         q=\$(ls /etc/pve/nodes/*/qemu-server/\${id}.conf 2>/dev/null | head -1);         c=\$(ls /etc/pve/nodes/*/lxc/\${id}.conf 2>/dev/null | head -1);         if [ -n \"\$c\" ]; then echo FOREIGN;         elif [ -z \"\$q\" ]; then echo FREE;         elif [ \"\$(grep -h '^name:' \"\$q\" | head -1)\" = \"name: lt-\${id}\" ]; then echo OWN;         else echo FOREIGN; fi"
+}
+
 lt_provision_vms() {
     info "provisioning ${LT_VM_COUNT} VMs with onboot=1 on ${LT_STORAGE} (VMIDs ${LT_VMID_START}..$((LT_VMID_START + LT_VM_COUNT - 1)))"
-    # Never "clean" an ID that belongs to a guest of ours or of anyone else:
-    # the only residue allowed to be destroyed is a previous run's own VM,
-    # recognised by its name (lt-<id>), which --keep-vms leaves behind.
+    # Never "clean" an ID that belongs to a guest of ours or of anyone else.
+    # Phase 1 only looks (nothing is changed if any ID is foreign); phase 2
+    # destroys what phase 1 recognised as a previous run's own VM.
+    local -a own_residue=()
     for ((i=0; i<LT_VM_COUNT; i++)); do
         local id=$((LT_VMID_START + i))
-        local taken
-        taken="$(lt_ssh "ls /etc/pve/nodes/*/qemu-server/${id}.conf /etc/pve/nodes/*/lxc/${id}.conf 2>/dev/null")"             || { fail "cannot check VMID ${id} on ${LT_NODE}; refusing to continue"; exit 2; }
-        [[ -z "${taken}" ]] && continue
-        local owner
-        owner="$(lt_ssh "grep -h '^name:' ${taken} 2>/dev/null | head -1")"
-        if [[ "${owner}" != "name: lt-${id}" ]]; then
-            fail "VMID ${id} already belongs to a guest not created by this suite; pick another --vmid-start (nothing was changed)"
-            exit 2
-        fi
+        local state
+        state="$(lt_vmid_state "${id}")" || { fail "cannot check VMID ${id} on ${LT_NODE}; refusing to continue"; exit 2; }
+        case "${state}" in
+            FREE) ;;
+            OWN)  own_residue+=("${id}") ;;
+            *)    fail "VMID ${id} already belongs to a guest not created by this suite; pick another --vmid-start (nothing was changed)"
+                  exit 2 ;;
+        esac
+    done
+    for id in "${own_residue[@]}"; do
         lt_ssh "qm stop ${id} 2>&1 | head -1 || true; qm destroy ${id} --purge 1 2>&1 | head -2 || true" >/dev/null 2>&1 || true
     done
     sleep 2

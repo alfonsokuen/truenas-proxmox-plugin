@@ -4080,8 +4080,7 @@ sub volume_snapshot_info {
     # a failed query, never "this volume has no snapshots" (rollback and
     # rollback_is_possible decide on this hash).
     die "[TrueNAS] pool.snapshot.query did not return a list of snapshots; "
-      . "refusing to treat that as 'no snapshots'
-"
+      . "refusing to treat that as 'no snapshots'\n"
         if !defined($list) || ref($list) ne 'ARRAY';
 
     my $snaps = {};
