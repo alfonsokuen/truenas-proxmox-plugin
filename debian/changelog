@@ -12,6 +12,16 @@ truenas-proxmox-plugin (1:2.1.24~beta6+idk26) unstable; urgency=medium
     guarda de este fork no depende de fuser.
   * Se incorpora la suite tools/lifecycle-tests/ de upstream (reinicio, caida
     del broker, flap de red, salto de reloj, etc.). No se instala en el .deb.
+  * i==25 de _nvme_device_for_uuid: cuando la guarda se niega a reconectar
+    (subsistema en uso o sin poder verificarse) ahora lo registra, con la
+    etiqueta de iteracion, dev_paths e in_use. Antes el salto era mudo. Test
+    t/nvme/34 (rojo -> verde).
+  * volume_snapshot_info falla si pool.snapshot.query no devuelve una lista,
+    en vez de leerlo como "el volumen no tiene snapshots" (de eso decide el
+    rollback). Ya fallaba asi _tn_snapshot_query_datasets.
+  * tools/lifecycle-tests: lt_provision_vms ya no destruye un VMID ajeno; solo
+    limpia el residuo de una ejecucion anterior de la propia suite (nombre
+    lt-<id>) y aborta con rc=2 si el ID pertenece a otro guest.
   * Se elimina el helper _tn_snapshots, sin llamadores, como en upstream.
   * install-idk.sh y publish-apt.sh: idk26 en adelante resuelve a la base
     2.1.24-beta6; idk24 e idk25 siguen en beta4.

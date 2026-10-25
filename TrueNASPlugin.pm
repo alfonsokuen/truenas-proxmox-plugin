@@ -4074,7 +4074,15 @@ sub volume_snapshot_info {
     # must not smuggle a neighbour's snapshot in.
     my $list = _api_call($scfg, 'pool.snapshot.query',
         [ [ [ 'dataset', '=', $full ] ],
-          { extra => { properties => ['creation'] } } ]) // [];
+          { extra => { properties => ['creation'] } } ]);
+
+    # Same rule as _tn_snapshot_query_datasets: an answer that is not a list is
+    # a failed query, never "this volume has no snapshots" (rollback and
+    # rollback_is_possible decide on this hash).
+    die "[TrueNAS] pool.snapshot.query did not return a list of snapshots; "
+      . "refusing to treat that as 'no snapshots'
+"
+        if !defined($list) || ref($list) ne 'ARRAY';
 
     my $snaps = {};
     for my $s (@$list) {
@@ -9130,6 +9138,17 @@ sub _nvme_device_for_uuid {
             } else {
                 _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: reconnect completed, resuming device discovery");
             }
+        } elsif ($i == 25 && !$reconnect_attempted && $allow_reconnect && !$ever_saw_devices
+                 && _nvme_is_connected($scfg)) {
+            # Reached only when the branch above refused: the subsystem is in
+            # use or its state could not be verified. Say so, with the
+            # iteration label, so a field report pins the branch (GitHub #134).
+            my ($busy, @dev_paths) = _nvme_subsystem_busy($scfg);
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] nvme_device_for_uuid: i==25 reconnect SKIPPED "
+                . "(stale-connection, target UUID not visible): dev_paths="
+                . scalar(@dev_paths) . ", in_use=" . ($busy ? 1 : 0)
+                . " - not dropping the subsystem under running guests");
         } elsif ($i == 30) {
             # Another settle with trigger
             eval { run_command(['udevadm', 'trigger'], outfunc => sub {}, errfunc => sub {}) };

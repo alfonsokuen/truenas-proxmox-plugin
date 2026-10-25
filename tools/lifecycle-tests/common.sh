@@ -93,9 +93,20 @@ lt_init() {
 # ------------------------------------------------------------------ VM provisioning
 lt_provision_vms() {
     info "provisioning ${LT_VM_COUNT} VMs with onboot=1 on ${LT_STORAGE} (VMIDs ${LT_VMID_START}..$((LT_VMID_START + LT_VM_COUNT - 1)))"
-    # Clean any residue first.
+    # Never "clean" an ID that belongs to a guest of ours or of anyone else:
+    # the only residue allowed to be destroyed is a previous run's own VM,
+    # recognised by its name (lt-<id>), which --keep-vms leaves behind.
     for ((i=0; i<LT_VM_COUNT; i++)); do
         local id=$((LT_VMID_START + i))
+        local taken
+        taken="$(lt_ssh "ls /etc/pve/nodes/*/qemu-server/${id}.conf /etc/pve/nodes/*/lxc/${id}.conf 2>/dev/null")"             || { fail "cannot check VMID ${id} on ${LT_NODE}; refusing to continue"; exit 2; }
+        [[ -z "${taken}" ]] && continue
+        local owner
+        owner="$(lt_ssh "grep -h '^name:' ${taken} 2>/dev/null | head -1")"
+        if [[ "${owner}" != "name: lt-${id}" ]]; then
+            fail "VMID ${id} already belongs to a guest not created by this suite; pick another --vmid-start (nothing was changed)"
+            exit 2
+        fi
         lt_ssh "qm stop ${id} 2>&1 | head -1 || true; qm destroy ${id} --purge 1 2>&1 | head -2 || true" >/dev/null 2>&1 || true
     done
     sleep 2
