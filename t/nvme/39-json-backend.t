@@ -1,0 +1,75 @@
+#!/usr/bin/perl
+# The plugin parses and builds JSON on every call to TrueNAS, and so does the
+# broker (four passes per answer). JSON::PP is pure Perl: measured on pve2 with
+# a 352 KB answer, decode takes 258 ms with JSON::PP and 4.8 ms with JSON::XS,
+# encode 76 ms against 3.5 ms. Dataset queries return answers of that size.
+#
+# So the plugin uses JSON::XS when it is installed and falls back to JSON::PP
+# when it is not (or when TRUENAS_PLUGIN_JSON_PP is set, as an escape hatch).
+# What must NOT change is what the code does with the result: booleans built as
+# JSON::PP::true/false still encode as true/false, the decoded booleans have the
+# same class as before, and 64-bit integers, numeric strings and UTF-8 survive.
+#
+# Run with:  prove -v -I t/nvme/lib t/nvme/39-json-backend.t
+use strict;
+use warnings;
+use Test::More;
+use FindBin;
+use JSON::PP ();
+
+my $PLUGIN = "$FindBin::Bin/../../TrueNASPlugin.pm";
+unless (eval { require $PLUGIN; 1 }) {
+    plan skip_all => "cannot load TrueNASPlugin.pm (needs PVE perl modules): $@";
+}
+my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
+my $HAVE_XS = eval { require JSON::XS; JSON::XS->VERSION(4.0); 1 } ? 1 : 0;
+
+no strict 'refs';
+my $enc = \&{"${PKG}::encode_json"};
+my $dec = \&{"${PKG}::decode_json"};
+ok(defined &{"${PKG}::encode_json"} && defined &{"${PKG}::decode_json"}, 'the plugin has encode_json and decode_json');
+
+SKIP: {
+    skip 'JSON::XS 4.0+ is not installed here', 2 unless $HAVE_XS;
+    skip 'TRUENAS_PLUGIN_JSON_PP is set: the pure-Perl backend is forced on purpose', 2 if $ENV{TRUENAS_PLUGIN_JSON_PP};
+    is($enc, \&JSON::XS::encode_json, 'JSON::XS is installed: the plugin encodes with it');
+    is($dec, \&JSON::XS::decode_json, 'JSON::XS is installed: the plugin decodes with it');
+}
+
+# The escape hatch and the fallback, in a clean process so the choice is made at load time.
+{
+    my $inc = join(' ', map { "-I'$_'" } grep { defined && length } @INC);
+    my $probe = q{require $ARGV[0]; my $p = "PVE::Storage::Custom::TrueNASPlugin"; no strict "refs"; print((\&{"${p}::encode_json"} == \&JSON::PP::encode_json) ? "PP" : "OTHER");};
+    my $out = `TRUENAS_PLUGIN_JSON_PP=1 $^X $inc -MJSON::PP -e '$probe' '$PLUGIN' 2>&1`;
+    is($out, 'PP', 'TRUENAS_PLUGIN_JSON_PP=1 forces the pure-Perl backend');
+}
+
+# Same answers whatever the backend: compare the plugin's functions against JSON::PP.
+my $corpus = {
+    t => JSON::PP::true, f => JSON::PP::false, nothing => undef,
+    int => 1024, neg => -5, float => 1.5,
+    big => 9223372036854775000,                  # a zvol size in bytes, above 2**53
+    numstr => '1024', zero_str => '0', empty => '',
+    utf8 => "caf\x{e9} \x{4e2d}\x{6587}",
+    nested => { list => [ 1, 'a', JSON::PP::true, { deep => [ undef, '2' ] } ] },
+};
+my $json = JSON::PP->new->canonical->utf8->encode($corpus);
+
+my $back = $dec->($json);
+is_deeply([ map { ref(\$back->{$_}) } qw(int) ], ['SCALAR'], 'decoded ints are plain scalars');
+is($back->{big}, '9223372036854775000', 'a 64-bit integer survives a decode untouched');
+is($back->{numstr}, '1024', 'a numeric string stays a string');
+ok(ref($back->{t}) eq ref(JSON::PP::decode_json('{"x":true}')->{x}), 'decoded booleans have the same class as JSON::PP produces');
+ok($back->{t} && !$back->{f}, 'decoded booleans keep their truth value');
+ok(!defined $back->{nothing}, 'null decodes to undef');
+is($back->{utf8}, $corpus->{utf8}, 'UTF-8 survives a decode');
+
+my $again = JSON::PP->new->canonical->utf8->decode($enc->($corpus));
+is_deeply($again, JSON::PP::decode_json($json), 'what the plugin encodes, JSON::PP decodes to the same structure');
+like($enc->({ a => JSON::PP::true, b => JSON::PP::false }), qr/"a":true/, 'JSON::PP::true is encoded as true');
+like($enc->({ a => JSON::PP::true, b => JSON::PP::false }), qr/"b":false/, 'JSON::PP::false is encoded as false');
+like($enc->({ s => '1024', i => 1024 }), qr/"s":"1024"/, 'a numeric string is encoded as a string');
+like($enc->({ s => '1024', i => 1024 }), qr/"i":1024/, 'an integer is encoded as a number');
+like($enc->({ v => 9223372036854775000 }), qr/"v":9223372036854775000/, 'a 64-bit integer is encoded exactly');
+
+done_testing;

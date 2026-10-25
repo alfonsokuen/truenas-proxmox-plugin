@@ -11,7 +11,19 @@ use warnings;
 our $VERSION = '2.1.24~beta6+idk27';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 16;
-use JSON::PP qw(encode_json decode_json);
+use JSON::PP ();    # JSON::PP::true / JSON::PP::false stay this plugin's booleans
+# JSON::PP is pure Perl. Measured on a 352 KB answer (what dataset queries return):
+# decode 258 ms with JSON::PP against 4.8 ms with JSON::XS, encode 76 against
+# 3.5 ms, and every answer goes through four passes (plugin and broker). JSON::XS
+# 4.x shares the JSON::PP::Boolean class and keeps 64-bit integers, numeric
+# strings and UTF-8 as they were (t/nvme/39). TRUENAS_PLUGIN_JSON_PP=1 forces the
+# pure-Perl backend should an XS build ever misbehave on a node.
+BEGIN {
+    my $xs = !$ENV{TRUENAS_PLUGIN_JSON_PP} && eval { require JSON::XS; JSON::XS->VERSION(4.0); 1 };
+    no strict 'refs';
+    *encode_json = $xs ? \&JSON::XS::encode_json : \&JSON::PP::encode_json;
+    *decode_json = $xs ? \&JSON::XS::decode_json : \&JSON::PP::decode_json;
+}
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
 use Digest::SHA qw(sha1 sha1_hex);

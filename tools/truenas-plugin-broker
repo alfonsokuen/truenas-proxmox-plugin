@@ -35,7 +35,16 @@ use Errno qw(EAGAIN EWOULDBLOCK EINTR);
 use POSIX qw(setsid strftime WNOHANG);
 use Digest::SHA qw(sha1 sha1_hex);
 use MIME::Base64 qw(encode_base64);
-use JSON::PP;
+use JSON::PP ();
+# Same backend choice as the plugin (see the comment in TrueNASPlugin.pm): the
+# broker decodes every TrueNAS answer and encodes it again for the plugin, and
+# JSON::PP spends ~260 ms decoding a 350 KB answer where JSON::XS spends ~5 ms.
+BEGIN {
+    my $xs = !$ENV{TRUENAS_PLUGIN_JSON_PP} && eval { require JSON::XS; JSON::XS->VERSION(4.0); 1 };
+    no strict 'refs';
+    *encode_json = $xs ? \&JSON::XS::encode_json : \&JSON::PP::encode_json;
+    *decode_json = $xs ? \&JSON::XS::decode_json : \&JSON::PP::decode_json;
+}
 # IPPROTO_TCP is not in Socket's default export list; the keepalive tuning
 # below needs it by name.
 use Socket qw(inet_ntoa getaddrinfo getnameinfo AF_INET SOCK_STREAM NI_NUMERICHOST NIx_NOSERV IPPROTO_TCP);
