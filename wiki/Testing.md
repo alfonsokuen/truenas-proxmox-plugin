@@ -6,13 +6,17 @@ Comprehensive guide for testing the TrueNAS Proxmox VE Storage Plugin using the 
 
 The TrueNAS Plugin Test Suite is an automated testing tool that validates all major plugin functionality through the Proxmox API. It simulates real-world usage patterns including VM creation, snapshot operations, cloning, resizing, and cleanup.
 
+> **WARNING**: The test suite creates and destroys VMs and their disks. Run it
+> **only** against a dedicated **test** storage (scratch storage) on a **lab** node or
+> cluster, never against a production storage or a node that hosts production guests.
+
 ### Key Features
 
 - **API-Based Testing** - Uses Proxmox API (`pvesh`) to simulate GUI interactions
 - **Comprehensive Coverage** - Tests all major plugin features
 - **Performance Metrics** - Reports timing for all operations
 - **Compatible** - Works with Proxmox VE 8.x and 9.x
-- **Safe** - Uses isolated test VMs, automatic cleanup
+- **Automatic cleanup** - Removes the test VMs it creates (destructive: see the warning below)
 - **Detailed Logging** - Creates timestamped log files for troubleshooting
 
 ## Test Suite Location
@@ -64,14 +68,14 @@ dependencies are present:
 # Make executable
 chmod +x tools/dev-truenas-plugin-full-function-test.sh
 
-# Run with default storage 'tnscale' starting at VMID 9001
-./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001
+# Run against a dedicated test storage starting at VMID 9001
+./tools/dev-truenas-plugin-full-function-test.sh scratch-storage 9001
 
 # Run with custom storage name and VMID
-./tools/dev-truenas-plugin-full-function-test.sh your-storage-name 5000
+./tools/dev-truenas-plugin-full-function-test.sh scratch-storage 5000
 
 # Run with backup tests enabled
-./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
+./tools/dev-truenas-plugin-full-function-test.sh scratch-storage 9001 --backup-store pbs
 ```
 
 ### Command Syntax
@@ -90,14 +94,14 @@ chmod +x tools/dev-truenas-plugin-full-function-test.sh
 
 **Examples**:
 ```bash
-# Test storage named 'truenas-storage' starting at VMID 5000
-./tools/dev-truenas-plugin-full-function-test.sh truenas-storage 5000
+# Test storage named 'scratch-storage' starting at VMID 5000
+./tools/dev-truenas-plugin-full-function-test.sh scratch-storage 5000
 
 # Run with backup tests using PBS storage
-./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
+./tools/dev-truenas-plugin-full-function-test.sh scratch-storage 9001 --backup-store pbs
 
 # Run only phase 2
-./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --phase 2
+./tools/dev-truenas-plugin-full-function-test.sh scratch-storage 9001 --phase 2
 ```
 
 ## What Gets Tested
