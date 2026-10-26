@@ -1,14 +1,16 @@
 #!/usr/bin/perl
-# The plugin parses and builds JSON on every call to TrueNAS, and so does the
-# broker (four passes per answer). JSON::PP is pure Perl: measured on pve2 with
-# a 352 KB answer, decode takes 258 ms with JSON::PP and 4.8 ms with JSON::XS,
-# encode 76 ms against 3.5 ms. Dataset queries return answers of that size.
+# The plugin parses JSON on every answer from TrueNAS, and so does the broker (several
+# passes per answer). JSON::PP is pure Perl: measured on pve2 with a 352 KB answer,
+# decode takes 258 ms with JSON::PP and 4.8 ms with JSON::XS. Dataset queries return
+# answers of that size.
 #
-# So the plugin uses JSON::XS when it is installed and falls back to JSON::PP
-# when it is not (or when TRUENAS_PLUGIN_JSON_PP is set, as an escape hatch).
-# What must NOT change is what the code does with the result: booleans built as
-# JSON::PP::true/false still encode as true/false, the decoded booleans have the
-# same class as before, and 64-bit integers, numeric strings and UTF-8 survive.
+# So the plugin DECODES with JSON::XS when it is installed and falls back to JSON::PP
+# when it is not (or when TRUENAS_PLUGIN_JSON_PP is set, as an escape hatch). It still
+# ENCODES with JSON::PP: JSON::XS 4.04 on Perl 5.40 sends a number that was ever used
+# in a string as a JSON string, which TrueNAS rejects (see the volsize case below).
+# What must NOT change is what is sent: booleans built as JSON::PP::true/false still
+# encode as true/false, numbers stay numbers, and 64-bit integers, numeric strings and
+# UTF-8 survive; the decoded booleans have the same class as before.
 #
 # Run with:  prove -v -I t/nvme/lib t/nvme/39-json-backend.t
 use strict;

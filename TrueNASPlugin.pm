@@ -8,7 +8,7 @@ use warnings;
 # todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
 # el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
 # de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.24~beta6+idk27';
+our $VERSION = '2.1.24~beta6+idk28';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 16;
 use JSON::PP ();    # JSON::PP::true / JSON::PP::false stay this plugin's booleans

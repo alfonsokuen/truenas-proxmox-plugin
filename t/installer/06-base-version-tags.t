@@ -37,6 +37,7 @@ my %want = (
     idk25 => '2.1.24-beta4',
     idk26 => '2.1.24-beta6',
     idk27 => '2.1.24-beta6',
+    idk28 => '2.1.24-beta6',
     idk99 => '2.1.24-beta6',
     ''    => '2.1.24-beta6',     # unparseable falls to the current base, as before
 );
@@ -56,7 +57,7 @@ open(my $fh, '<', $FILES[0]) or die "cannot read $FILES[0]: $!";
 my ($iv) = grep { /^INSTALLER_VERSION=/ } <$fh>;
 close $fh;
 like($iv // '', qr/^INSTALLER_VERSION='idk\d+\.\d+'$/, 'INSTALLER_VERSION matches idkN.M');
-like($iv // '', qr/'idk27\./, 'INSTALLER_VERSION is the idk27 line');
+like($iv // '', qr/'idk28\./, 'INSTALLER_VERSION is the idk28 line');
 
 # deb_version -> release tag, as .github/workflows/build-package.yml computes it.
 sub tag_for { my $v = shift; $v =~ s/~/-/g; $v =~ s/\+/-/ if $v =~ /\+deb/; return "v$v"; }
@@ -67,5 +68,7 @@ is(tag_for('2.1.24~beta6+idk26'), 'v2.1.24-beta6+idk26', 'workflow tag rule: idk
 is('v' . base_for($FILES[0], 'idk26') . '+idk26', tag_for('2.1.24~beta6+idk26'), 'scripts and workflow agree on the idk26 tag');
 is(tag_for('2.1.24~beta6+idk27'), 'v2.1.24-beta6+idk27', 'workflow tag rule: idk27 has no tilde and keeps +idk27');
 is('v' . base_for($FILES[0], 'idk27') . '+idk27', tag_for('2.1.24~beta6+idk27'), 'scripts and workflow agree on the idk27 tag');
+is(tag_for('2.1.24~beta6+idk28'), 'v2.1.24-beta6+idk28', 'workflow tag rule: idk28 has no tilde and keeps +idk28');
+is('v' . base_for($FILES[0], 'idk28') . '+idk28', tag_for('2.1.24~beta6+idk28'), 'scripts and workflow agree on the idk28 tag');
 
 done_testing;
