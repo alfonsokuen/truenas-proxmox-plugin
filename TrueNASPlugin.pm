@@ -13317,12 +13317,16 @@ sub activate_volume {
         # worse than no device. Kept outside the locate eval above so the error
         # does not read as "device not found". No cap configured ->
         # _nvme_cap_max_io returns (0,0,0) and nothing changes. A died call is
-        # a failure too. atajo: total==0 with a cap set (no writable queue
-        # found) is not treated as failure; revisit if that shows up in the field.
+        # a failure too, and so is a cap that is set but found no writable
+        # max_sectors_kb for the device at all (total 0): nothing was capped,
+        # so nothing is known to be safe.
+        my $cap_wanted = $scfg->{tn_nvme_max_io_kb} // NVME_DEFAULT_MAX_IO_KB;
         my ($cap_changed, $cap_failed, $cap_total) = eval { _nvme_cap_max_io($scfg, 'activate', $dev) };
         my $cap_died = $@;
-        if ($cap_died || $cap_failed) {
-            my $why = $cap_died ? "the cap call failed: $cap_died" : "$cap_failed of $cap_total queue(s) could not be capped (see the warning above)";
+        if ($cap_died || $cap_failed || ($cap_wanted && !$cap_total)) {
+            my $why = $cap_died ? "the cap call failed: $cap_died"
+                    : $cap_failed ? "$cap_failed of $cap_total queue(s) could not be capped (see the warning above)"
+                    : "no writable queue/max_sectors_kb was found for it";
             chomp $why;
             _log($scfg, 0, 'err', "[TrueNAS] activate_volume: refusing to expose $dev: $why");
             die "[TrueNAS] refusing to activate '$volname': the request size cap (tn_nvme_max_io_kb, issue #96) "

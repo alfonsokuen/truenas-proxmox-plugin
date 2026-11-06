@@ -77,6 +77,15 @@ my $base = { tn_dataset => 'tank/pve', tn_api_host => '198.51.100.7', tn_transpo
     ok(!$ok, 'explicit cap value, failed -> dies');
 }
 {
+    # Cap set but no writable max_sectors_kb found at all: nothing was capped,
+    # so the cap is unreadable/unwritable, not satisfied.
+    my ($ok, $err) = activate({ %$base }, 0, 0, 0);
+    ok(!$ok, 'cap configured but no writable queue found (0,0,0) -> dies');
+    like($err, qr/no writable queue/, '  ...saying no writable queue was found');
+    ($ok, $err) = activate({ %$base, tn_nvme_max_io_kb => 0 }, 0, 0, 0);
+    ok($ok, 'same (0,0,0) with the cap disabled -> succeeds') or diag($err);
+}
+{
     # No cap configured: the REAL _nvme_cap_max_io answers (0,0,0) and touches
     # nothing, so the activation is exactly what it was.
     $use_real = 1;
