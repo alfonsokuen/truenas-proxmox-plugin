@@ -60,7 +60,14 @@ use Time::HiRes qw(time);
 # late, a missing module fails just the SCRAM login, with the module named.
 # An explicit scram / scram-plus stays failed; auto falls back to
 # API_KEY_PLAIN, with a warning logged once (see _authenticate).
+# That fallback is only for a module of SCRAM's own that is not installed at
+# all ($SCRAM_OWN_MODULE): nothing was sent, the Depends are just missing. A
+# module that is there but does not compile, an import that fails, or some
+# other missing module is a broken node ($SCRAM_BROKEN), and no mechanism
+# falls back past it.
 my $SCRAM_UNAVAILABLE = '[TrueNAS] SCRAM is not available on this node';
+my $SCRAM_BROKEN      = '[TrueNAS] SCRAM support on this node is broken';
+my $SCRAM_OWN_MODULE  = qr{^(?:Crypt/PBKDF2(?:/\S+)?|Crypt/URandom|TrueNAS/SCRAM)$};
 my $scram_load_error;          # undef = not tried yet, '' = loaded
 my $scram_fallback_warned = 0;
 
@@ -722,7 +729,8 @@ sub _scram_step {
 }
 
 # Load TrueNAS::SCRAM once, or die "$SCRAM_UNAVAILABLE: <module> ..." naming
-# the module that is missing. The answer is kept: perl refuses to require
+# the module of its own that is missing, or "$SCRAM_BROKEN: ..." with perl's
+# error for any other load failure. The answer is kept: perl refuses to require
 # again a file that failed to compile ("Attempt to reload"), which would hide
 # the module from every later login. Installing the module needs a broker
 # restart, which the package's postinst does.
@@ -738,12 +746,18 @@ sub _load_scram {
             $scram_load_error = '';
         } else {
             my $err = $@;
-            my ($file) = $err =~ /Can't locate (\S+)\.pm in \@INC/;
-            (my $module = $file // '') =~ s{/}{::}g;
-            $scram_load_error = "$SCRAM_UNAVAILABLE: "
-                . ($module ne ''
-                    ? "Perl module $module is missing (install the package's Depends)"
-                    : "loading TrueNAS::SCRAM failed: " . ($err =~ s/\s+\z//r)) . "\n";
+            # The first "Can't locate" is the module actually missing; a
+            # compile error further down mentions it again as "Compilation
+            # failed in require".
+            my ($file) = $err =~ /^Can't locate (\S+)\.pm in \@INC/m;
+            if (defined $file && $file =~ $SCRAM_OWN_MODULE) {
+                (my $module = $file) =~ s{/}{::}g;
+                $scram_load_error = "$SCRAM_UNAVAILABLE: Perl module $module is missing "
+                    . "(install the package's Depends)\n";
+            } else {
+                $scram_load_error = "$SCRAM_BROKEN: loading TrueNAS::SCRAM failed, not falling back "
+                    . "to a weaker login: " . ($err =~ s/\s+\z//r) . "\n";
+            }
         }
     }
     die $scram_load_error if $scram_load_error ne '';
