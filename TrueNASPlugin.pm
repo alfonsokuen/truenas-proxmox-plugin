@@ -11543,9 +11543,16 @@ sub _free_image_nvme {
     # (no device found) has nothing to protect locally and is freed as before;
     # for an attached one _nvme_check_devices_in_use answers "in use" on every
     # doubt. Other nodes' use is not visible from here (TrueNAS refuses that).
+    # A lookup that fails (e.g. a half-freed volume whose namespace is already
+    # gone) must not block the free that cleans it up, so it proceeds - but
+    # visibly, since the in-use check was then not made.
     my $local_uuid = $device_uuid // eval { _resolve_nvme_uuid($scfg, $zname, undef) };
+    _log($scfg, 0, 'warning', "[TrueNAS] _free_image_nvme: could not resolve the UUID of $zname, "
+        . "local in-use check skipped: $@") if !defined $local_uuid && $@;
     if (defined $local_uuid) {
         my $found = eval { _nvme_find_device_by_subsystem($scfg, $local_uuid) };
+        _log($scfg, 0, 'warning', "[TrueNAS] _free_image_nvme: device lookup for $zname failed, "
+            . "local in-use check skipped: $@") if $@;
         my $dev = _nvme_selector_selected_device_path($found);
         if (defined $dev && _nvme_check_devices_in_use($scfg, $dev)) {
             die "[TrueNAS] refusing to free '$volname': its device $dev is still in use on this node "
