@@ -28,7 +28,11 @@ my ($ns_answer, $subsys_answer, $busy, $disconnects, $deletes, $ns_calls, $retry
     *{"${PKG}::_defer_after_lock"} = sub { 1 };
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_verify_devices_disconnected"} = sub { 1 };
-    *{"${PKG}::_nvme_find_device_by_subsystem"} = sub { undef };
+    # Not attached on this node, said positively: an undef answer means "could
+    # not tell" and free_image refuses it before reaching the paths under test.
+    *{"${PKG}::_nvme_find_device_by_subsystem"} = sub {
+        { selector_outcome => 'publication_mismatch', mismatch_reason => 'subsystem_not_visible',
+          linux_device_count => 0 } };
     *{"${PKG}::_assert_no_child_datasets"} = sub { 1 };
     *{"${PKG}::_nvme_connect"} = sub { push @events, 'connect'; die "nvme connect failed: Connection timed out\n" if $connect_dies; 1 };
     *{"${PKG}::usleep"} = sub ($) { 1 };

@@ -11526,6 +11526,45 @@ sub _free_image_iscsi {
     };
 }
 
+# The local device backing an NVMe volume about to be freed: its path when the
+# selector matched one, undef when it positively found none on this node, and a
+# die when it cannot tell. "Found none" is a publication_mismatch (TrueNAS
+# metadata in hand, or the subsystem not connected here, and no visible device
+# carries this namespace's identity) or TrueNAS answering that the namespace or
+# subsystem does not exist; the UUID match against sysfs runs before either, so
+# a device carrying our UUID would have been selected. Anything else - the
+# lookup died, answered nothing readable, its API query failed, or a "match"
+# without a path - leaves the in-use check unmade, so the free must not go on.
+my %NVME_FREE_ABSENT_METADATA = map { $_ => 1 } qw(namespace_uuid_not_returned api_subsystem_not_found);
+
+sub _nvme_free_local_device {
+    my ($volname, $found, $lookup_err) = @_;
+
+    my $why;
+    if ($lookup_err) {
+        chomp($why = "the device lookup failed: $lookup_err");
+    } elsif (ref($found) ne 'HASH') {
+        $why = 'the device lookup returned no readable answer';
+    } else {
+        my $outcome = $found->{selector_outcome} // '';
+        my $reason = $found->{mismatch_reason} // '';
+        if (_nvme_selector_outcome_is_success($outcome)) {
+            my $dev = $found->{selected_device_path};
+            return $dev if defined $dev && $dev ne '';
+            $why = "the device lookup reported a match ($outcome) but named no device";
+        } elsif ($outcome eq 'publication_mismatch'
+            || ($outcome eq 'metadata_failure' && $NVME_FREE_ABSENT_METADATA{$reason})) {
+            return undef;
+        } else {
+            $why = 'the device lookup could not decide (' . ($outcome || 'no outcome')
+                . ($reason ne '' ? ": $reason" : '') . ')';
+        }
+    }
+    die "[TrueNAS] refusing to free '$volname': could not tell whether its NVMe device is in use on "
+      . "this node, because $why. Freeing it unchecked could delete the namespace under a guest that "
+      . "still has it open. Retry once the lookup works (TrueNAS reachable, nvme subsystem readable).\n";
+}
+
 # NVMe-specific deletion
 sub _free_image_nvme {
     my ($class, $storeid, $scfg, $volname, $zname, $full_ds, $device_uuid) = @_;
@@ -11539,21 +11578,32 @@ sub _free_image_nvme {
     # destroy then fails, leaving a zvol no namespace points at and that
     # list_images never shows. A check inside the worker would be too late (the
     # namespace is gone by then), so it sits here, before the first mutating
-    # call, and covers both halves. A volume that is not attached on this node
-    # (no device found) has nothing to protect locally and is freed as before;
-    # for an attached one _nvme_check_devices_in_use answers "in use" on every
-    # doubt. Other nodes' use is not visible from here (TrueNAS refuses that).
-    # A lookup that fails (e.g. a half-freed volume whose namespace is already
-    # gone) must not block the free that cleans it up, so it proceeds - but
-    # visibly, since the in-use check was then not made.
-    my $local_uuid = $device_uuid // eval { _resolve_nvme_uuid($scfg, $zname, undef) };
-    _log($scfg, 0, 'warning', "[TrueNAS] _free_image_nvme: could not resolve the UUID of $zname, "
-        . "local in-use check skipped: $@") if !defined $local_uuid && $@;
+    # call, and covers both halves. A volume the selector positively finds NOT
+    # attached on this node has nothing to protect locally and is freed as
+    # before; for an attached one _nvme_check_devices_in_use answers "in use" on
+    # every doubt. A lookup that cannot tell (see _nvme_free_local_device) dies
+    # here: skipping the check then would delete the namespace under a guest
+    # that may still have it open. Other nodes' use is not visible from here
+    # (TrueNAS refuses that).
+    my $local_uuid = $device_uuid;
+    if (!defined $local_uuid) {
+        $local_uuid = eval { _resolve_nvme_uuid($scfg, $zname, undef) };
+        if (!defined $local_uuid) {
+            my $err = $@ || "no UUID returned\n";
+            # TrueNAS answered and has no namespace for this zvol (e.g. a
+            # half-freed volume): nothing is exported, so nothing can be open
+            # through it here, and the free that cleans it up must not block.
+            die "[TrueNAS] refusing to free '$volname': could not check whether it is in use on this "
+              . "node, because looking up its NVMe namespace failed. Retry once TrueNAS answers.\n"
+              . "  cause: $err"
+                if $err !~ /^Could not locate NVMe namespace/;
+            _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: TrueNAS has no namespace for $zname, "
+                . "nothing exported to check for local use");
+        }
+    }
     if (defined $local_uuid) {
         my $found = eval { _nvme_find_device_by_subsystem($scfg, $local_uuid) };
-        _log($scfg, 0, 'warning', "[TrueNAS] _free_image_nvme: device lookup for $zname failed, "
-            . "local in-use check skipped: $@") if $@;
-        my $dev = _nvme_selector_selected_device_path($found);
+        my $dev = _nvme_free_local_device($volname, $found, $@);
         if (defined $dev && _nvme_check_devices_in_use($scfg, $dev)) {
             die "[TrueNAS] refusing to free '$volname': its device $dev is still in use on this node "
               . "(a running guest, a mount or a holder). Freeing it now would delete the NVMe namespace "

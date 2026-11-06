@@ -12,6 +12,10 @@
 #
 # Both directions are asserted: in use -> dies and nothing was touched;
 # not in use / not attached on this node -> the free works as before.
+# A lookup that cannot tell (it dies, answers nothing readable, or the API
+# query behind it failed) is NOT "not attached": the in-use check never ran,
+# so free_image dies before touching TrueNAS. Only a selector that positively
+# found no matching device on this node lets the free go on unchecked.
 # And when the zvol delete does fail after the namespace is gone, the error
 # must name the zvol that is left.
 #
@@ -32,7 +36,7 @@ my $DS   = 'tank/pve/vm-101-disk-0';
 my $scfg = { tn_dataset => 'tank/pve', tn_api_host => '198.51.100.7', tn_transport_mode => 'nvme-tcp',
              tn_subsystem_nqn => 'nqn.x:y' };
 
-my (@events, @checked, $selector, $in_use, $dataset_delete_dies);
+my (@events, @checked, $selector, $selector_dies, $resolve_err, $in_use, $dataset_delete_dies);
 {
     no strict 'refs'; no warnings 'redefine';
     *{"${PKG}::_log"} = sub { 1 };
@@ -40,7 +44,17 @@ my (@events, @checked, $selector, $in_use, $dataset_delete_dies);
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_assert_no_child_datasets"} = sub { 1 };
     *{"${PKG}::_nvme_disconnect"} = sub { push @events, 'nvme_disconnect'; 1 };
-    *{"${PKG}::_nvme_find_device_by_subsystem"} = sub { $selector };
+    *{"${PKG}::_nvme_find_device_by_subsystem"} = sub {
+        push @events, 'lookup';
+        die $selector_dies if $selector_dies;
+        $selector;
+    };
+    *{"${PKG}::_resolve_nvme_uuid"} = sub {
+        my ($s, $z, $known) = @_;
+        return $known if defined $known;
+        die $resolve_err if $resolve_err;
+        return $UUID;
+    };
     *{"${PKG}::_nvme_check_devices_in_use"} = sub {
         my ($s, @paths) = @_;
         push @checked, @paths;
@@ -61,11 +75,14 @@ sub run_free {
     $selector = exists $o{selector} ? $o{selector} : {
         selector_outcome => 'exact_match', selected_device_path => '/dev/nvme0n1',
         linux_device_count => 1 };
+    $selector_dies = $o{selector_dies};
+    $resolve_err = $o{resolve_err};
     $in_use = $o{in_use};
     $dataset_delete_dies = $o{dataset_dies};
     (@events, @checked) = ();
     my ($worker_err, $worker);
-    my $ok = eval { $worker = $PKG->free_image('store', $scfg, $VOL, 0, 'raw'); 1 };
+    my $vol = $o{vol} // $VOL;
+    my $ok = eval { $worker = $PKG->free_image('store', $scfg, $vol, 0, 'raw'); 1 };
     my $err = $@;
     if ($ok && ref($worker) eq 'CODE') {
         eval { $worker->('UPID:t'); 1 } or $worker_err = $@;
@@ -79,20 +96,70 @@ sub run_free {
     like($err, qr/in use/i, '  ...saying the volume is in use');
     like($err, qr/\Q$VOL\E|\Q$DS\E/, '  ...naming the volume');
     is_deeply(\@checked, ['/dev/nvme0n1'], '  ...after checking exactly that volume\'s device');
-    is_deeply(\@events, ['in_use_check'],
+    is_deeply(\@events, ['lookup', 'in_use_check'],
         '  ...with NO namespace delete, NO dataset delete, NO disconnect (nothing mutated)');
 }
 {
     my ($ok, $err, $werr) = run_free(in_use => 0);
     ok($ok, 'device not in use -> free_image works as before') or diag($err);
-    is_deeply(\@events, ['in_use_check', 'delete_namespace', 'delete_dataset'],
+    is_deeply(\@events, ['lookup', 'in_use_check', 'delete_namespace', 'delete_dataset'],
         '  ...check first, then namespace, then the worker deletes the zvol');
     ok(!$werr, '  ...and the worker does not die');
 }
+
+# The lookup could not tell: fail closed, before any TrueNAS call.
+my @undecided = (
+    [ 'selector dies (sysfs/API exception)', selector_dies => "connection refused
+" ],
+    [ 'selector returns nothing (undef)', selector => undef ],
+    [ 'selector returns a non-hash answer', selector => 'garbage' ],
+    [ 'selector API query failed (TrueNAS down)', selector => {
+        selector_outcome => 'metadata_failure', mismatch_reason => 'namespace_metadata_query_failed',
+        linux_device_count => 1 } ],
+    [ 'selector claims a match but names no device', selector => {
+        selector_outcome => 'exact_match', linux_device_count => 1 } ],
+    [ 'selector answers with an unknown outcome', selector => { linux_device_count => 1 } ],
+    [ 'cloud-init volume (no embedded UUID), namespace lookup errors (API down)',
+        vol => 'vm-101-cloudinit', resolve_err => "API call nvmet.namespace.query failed: timeout
+" ],
+);
+for my $c (@undecided) {
+    my ($name, %o) = @$c;
+    my ($ok, $err) = run_free(%o);
+    ok(!$ok, "$name -> free_image dies");
+    like($err // '', qr/could not (tell|check)/i, '  ...saying the in-use check could not be made');
+    like($err // '', qr/\Q$VOL\E|vm-101-cloudinit/, '  ...naming the volume');
+    ok(!grep({ /delete_namespace|delete_dataset|nvme_disconnect|in_use_check/ } @events),
+        '  ...with nothing mutated on TrueNAS') or diag("events: @events");
+}
+
+# The selector positively found no device for this namespace here (the volume
+# is not attached on this node: a stopped guest, the normal case): free goes on.
+my @absent = (
+    [ 'subsystem not connected on this node', {
+        selector_outcome => 'publication_mismatch', mismatch_reason => 'subsystem_not_visible',
+        linux_device_count => 0 } ],
+    [ 'subsystem connected, this namespace not among its devices', {
+        selector_outcome => 'publication_mismatch',
+        mismatch_reason => 'namespace_metadata_did_not_match_visible_devices',
+        linux_device_count => 3, nguid_contradicted => 1 } ],
+    [ 'namespace already gone on TrueNAS, no local device carries its UUID', {
+        selector_outcome => 'metadata_failure', mismatch_reason => 'namespace_uuid_not_returned',
+        linux_device_count => 2 } ],
+);
+for my $c (@absent) {
+    my ($name, $sel) = @$c;
+    my ($ok, $err, $werr) = run_free(selector => $sel);
+    ok($ok, "$name -> free proceeds") or diag($err);
+    is_deeply(\@events, ['lookup', 'delete_namespace', 'delete_dataset'],
+        '  ...with no in-use check (no local device to check)');
+}
 {
-    my ($ok, $err) = run_free(selector => undef);
-    ok($ok, 'volume not attached on this node (no device) -> free proceeds') or diag($err);
-    is_deeply(\@events, ['delete_namespace', 'delete_dataset'], '  ...and no in-use check is needed');
+    my ($ok, $err) = run_free(vol => 'vm-101-cloudinit',
+        resolve_err => "Could not locate NVMe namespace for 'vm-101-cloudinit'
+");
+    ok($ok, 'cloud-init volume whose namespace TrueNAS no longer has -> free proceeds') or diag($err);
+    is_deeply(\@events, ['delete_namespace', 'delete_dataset'], '  ...nothing exported, nothing to check');
 }
 {
     my ($ok, $err, $werr) = run_free(in_use => 0, dataset_dies => 1);
