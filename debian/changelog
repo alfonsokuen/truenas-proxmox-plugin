@@ -32,6 +32,21 @@ truenas-proxmox-plugin (1:2.1.24+idk30) unstable; urgency=medium
     _portal_match_keys, que suma a la clave IPv6 de upstream TODOS los
     registros A de un nombre (el fork ya lo hacia con _portal_match_needles),
     no solo el primero. La IQN se compara entera (#124).
+  * free_image (NVMe) se niega con un mensaje claro si el dispositivo del
+    volumen sigue en uso en este nodo (_nvme_check_devices_in_use: holders,
+    mountinfo de todos los namespaces, fuser), ANTES de cualquier llamada que
+    modifique TrueNAS. Antes borraba el namespace y dejaba el zvol huerfano e
+    invisible a list_images. La comprobacion va en el camino sincrono: el
+    namespace se borra bajo el lock y el zvol en el worker diferido, asi que
+    comprobar en el worker llegaria tarde. Si el namespace ya se borro y falla
+    el zvol, el error nombra el dataset que queda. Test t/nvme/41.
+  * activate_volume falla cerrado si el cap de tamano de peticion
+    (tn_nvme_max_io_kb, #96) esta configurado y no se pudo aplicar: escritura
+    fallida, valor que no se queda, llamada que muere o ninguna
+    queue/max_sectors_kb escribible. El target no declara MDTS y una E/S mayor
+    falla en silencio y pierde datos, asi que el disco no se expone. Sin cap
+    configurado, igual que antes; el barrido de activate_storage sigue sin
+    bloquear. Test t/nvme/42.
   * JSON: sigue igual que en idk28, JSON::XS solo decodifica y JSON::PP
     codifica (t/nvme/39). Se conserva Depends nvme-cli y Recommends
     libjson-xs-perl del fork.
