@@ -13290,15 +13290,14 @@ sub activate_volume {
         # Cloud-init volumes (issue #84) carry no embedded UUID; resolve by zname.
         my $device_uuid = _resolve_nvme_uuid($scfg, $zname, $metadata);
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for device UUID $device_uuid");
+        my $dev;
         eval {
-            my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
+            $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
             # path() hands out the by-id link, and udev publishes it after the
             # block device exists. Activation is not done until it is there.
             my $link = _nvme_wait_for_uuid_link($scfg, $device_uuid, $dev);
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: stable link ready at $link");
-            # The device is about to carry I/O: cap it before qemu-img or QEMU opens it.
-            _nvme_cap_max_io($scfg, 'activate', $dev);
         };
         $lap_av->('device_for_uuid_exit');
         if ($@) {
@@ -13309,6 +13308,28 @@ sub activate_volume {
             # and it raises for every caller, not just this one.
             $err .= "\n" if $err !~ /\n\z/;
             die $err;
+        }
+
+        # The device is about to carry I/O: cap it before qemu-img or QEMU opens
+        # it, and do not expose it if the cap did not take. An I/O larger than
+        # the target's (undeclared) MDTS is failed silently by the target and
+        # has already lost data (#96), so a device that could not be capped is
+        # worse than no device. Kept outside the locate eval above so the error
+        # does not read as "device not found". No cap configured ->
+        # _nvme_cap_max_io returns (0,0,0) and nothing changes. A died call is
+        # a failure too. atajo: total==0 with a cap set (no writable queue
+        # found) is not treated as failure; revisit if that shows up in the field.
+        my ($cap_changed, $cap_failed, $cap_total) = eval { _nvme_cap_max_io($scfg, 'activate', $dev) };
+        my $cap_died = $@;
+        if ($cap_died || $cap_failed) {
+            my $why = $cap_died ? "the cap call failed: $cap_died" : "$cap_failed of $cap_total queue(s) could not be capped (see the warning above)";
+            chomp $why;
+            _log($scfg, 0, 'err', "[TrueNAS] activate_volume: refusing to expose $dev: $why");
+            die "[TrueNAS] refusing to activate '$volname': the request size cap (tn_nvme_max_io_kb, issue #96) "
+              . "could not be applied to $dev ($why). The target declares no MDTS, so an I/O larger than "
+              . "the cap makes the target fail requests silently and can corrupt or lose data; the disk is "
+              . "therefore not exposed. Check that /sys/block/nvme*/queue/max_sectors_kb is writable "
+              . "(udev rule tools/udev/99-nvme-tcp-max-sectors.rules) and retry.\n";
         }
     }
 
