@@ -80,8 +80,8 @@ my $base = { tn_dataset => 'tank/pve', tn_api_host => '198.51.100.7', tn_transpo
     # Cap set but no writable max_sectors_kb found at all: nothing was capped,
     # so the cap is unreadable/unwritable, not satisfied.
     my ($ok, $err) = activate({ %$base }, 0, 0, 0);
-    ok(!$ok, 'cap configured but no writable queue found (0,0,0) -> dies');
-    like($err, qr/no writable queue/, '  ...saying no writable queue was found');
+    ok(!$ok, 'cap configured but no queue found (0,0,0) -> dies');
+    like($err, qr{no queue/max_sectors_kb was found}, '  ...saying no queue was found');
     ($ok, $err) = activate({ %$base, tn_nvme_max_io_kb => 0 }, 0, 0, 0);
     ok($ok, 'same (0,0,0) with the cap disabled -> succeeds') or diag($err);
 }

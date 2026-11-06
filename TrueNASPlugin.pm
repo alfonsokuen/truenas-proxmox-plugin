@@ -8996,6 +8996,9 @@ sub _nvme_get_subsystem_device_paths {
 # the bio-based head only splits, the path devices (nvmeXcYnZ) re-merge up to
 # their own limit, so both are capped. sysfs is written directly: the
 # temp-file-and-rename of file_set_contents does not work there.
+# A sub so a test can say "not writable": as root, -w is true for any file.
+sub _nvme_queue_writable { return -w $_[0] }
+
 sub _nvme_cap_max_io {
     my ($scfg, $ctx, @heads) = @_;
 
@@ -9003,18 +9006,29 @@ sub _nvme_cap_max_io {
     return (0, 0, 0) if !$cap;
 
     my ($changed, $failed, $total) = (0, 0, 0);
+    my $block = "$_NVME_SYSFS/block";
     for my $head (@heads) {
         my $real = abs_path($head) // next;
         my ($name, $subsys, $ns) = $real =~ m{^/dev/(nvme(\d+)n(\d+))$} ? ($1, $2, $3) : next;
-        for my $q ("/sys/block/$name/queue/max_sectors_kb",
-                   glob("/sys/block/nvme${subsys}c*n${ns}/queue/max_sectors_kb")) {
+        for my $q ("$block/$name/queue/max_sectors_kb",
+                   glob("$block/nvme${subsys}c*n${ns}/queue/max_sectors_kb")) {
             # Untaint: glob results are tainted under pvedaemon's -T.
-            next unless $q =~ m{^(/sys/block/nvme\d+(?:c\d+)?n\d+/queue/max_sectors_kb)$};
+            next unless $q =~ m{^(\Q$block\E/nvme\d+(?:c\d+)?n\d+/queue/max_sectors_kb)$};
             $q = $1;
-            next if !-w $q;
+            next if !-e $q;
             $total++;
+            # Read before asking whether it can be written: the cap is a
+            # ceiling, so a queue already at or below it is applied whether or
+            # not it can be written. Only one above it that cannot be brought
+            # down is a failure.
             my $cur = PVE::Tools::file_read_firstline($q) // '';
-            next if $cur eq $cap;
+            next if $cur =~ /^\d+$/ && $cur <= $cap;
+            if (!_nvme_queue_writable($q)) {
+                $failed++;
+                _log($scfg, 0, 'warning', "[TrueNAS] nvme_cap_max_io: $q reads '$cur', above ${cap}KB, "
+                    . "and is not writable");
+                next;
+            }
             my $ok = eval {
                 open(my $fh, '>', $q) or die "$!\n";
                 print $fh "$cap\n" or die "$!\n";
@@ -13383,7 +13397,7 @@ sub activate_volume {
         if ($cap_died || $cap_failed || ($cap_wanted && !$cap_total)) {
             my $why = $cap_died ? "the cap call failed: $cap_died"
                     : $cap_failed ? "$cap_failed of $cap_total queue(s) could not be capped (see the warning above)"
-                    : "no writable queue/max_sectors_kb was found for it";
+                    : "no queue/max_sectors_kb was found for it";
             chomp $why;
             _log($scfg, 0, 'err', "[TrueNAS] activate_volume: refusing to expose $dev: $why");
             die "[TrueNAS] refusing to activate '$volname': the request size cap (tn_nvme_max_io_kb, issue #96) "
