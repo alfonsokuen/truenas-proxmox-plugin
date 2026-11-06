@@ -11532,6 +11532,29 @@ sub _free_image_nvme {
 
     _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: deleting NVMe namespace for $zname");
 
+    # Refuse while the volume is still active on this node. The free is split:
+    # the namespace is deleted right below (synchronously, under the storage
+    # lock) and the zvol later by the worker PVE runs outside the lock. With
+    # the device open here the namespace delete goes through and the zvol
+    # destroy then fails, leaving a zvol no namespace points at and that
+    # list_images never shows. A check inside the worker would be too late (the
+    # namespace is gone by then), so it sits here, before the first mutating
+    # call, and covers both halves. A volume that is not attached on this node
+    # (no device found) has nothing to protect locally and is freed as before;
+    # for an attached one _nvme_check_devices_in_use answers "in use" on every
+    # doubt. Other nodes' use is not visible from here (TrueNAS refuses that).
+    my $local_uuid = $device_uuid // eval { _resolve_nvme_uuid($scfg, $zname, undef) };
+    if (defined $local_uuid) {
+        my $found = eval { _nvme_find_device_by_subsystem($scfg, $local_uuid) };
+        my $dev = _nvme_selector_selected_device_path($found);
+        if (defined $dev && _nvme_check_devices_in_use($scfg, $dev)) {
+            die "[TrueNAS] refusing to free '$volname': its device $dev is still in use on this node "
+              . "(a running guest, a mount or a holder). Freeing it now would delete the NVMe namespace "
+              . "and leave the zvol $full_ds orphaned and invisible to list_images. "
+              . "Stop whatever uses the volume (shut down the guest, unmount) and retry.\n";
+        }
+    }
+
     # Helper to detect "in use" errors
     my $in_use = sub {
         my ($err) = @_;
@@ -11754,7 +11777,15 @@ sub _free_image_nvme {
                 # looks gone; make sure before calling it done
                 _confirm_dataset_gone($delete_scfg, $delete_full_ds, $err);
             } else {
-                die "Failed to delete dataset $delete_full_ds: $err\n";
+                # The namespace is already deleted (that happened synchronously
+                # before this worker was handed out), so a failure here leaves
+                # the zvol behind with no namespace: list_images will not show
+                # it. Name it so the operator can remove it by hand.
+                chomp(my $cause = $err);
+                die "Failed to delete dataset $delete_full_ds: $cause\n"
+                  . "The NVMe namespace was already removed, so zvol $delete_full_ds is LEFT BEHIND "
+                  . "(orphaned, not listed by list_images). Delete it manually on TrueNAS "
+                  . "(zfs destroy -r $delete_full_ds) once nothing holds it.\n";
             }
         }
     };
