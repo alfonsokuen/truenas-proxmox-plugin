@@ -1,3 +1,43 @@
+truenas-proxmox-plugin (1:2.1.24+idk30) unstable; urgency=medium
+
+  * Base upstream: la 2.1.24 final (tag v2.1.24), que promociona 2.1.24~beta8
+    sin cambios de codigo. Se adopta de upstream: beta7, autenticacion del
+    broker por auth.login_ex con SCRAM-SHA-512, SCRAM-PLUS (channel binding
+    tls-server-end-point) y API_KEY_PLAIN, con caida al login heredado solo
+    cuando el servidor no lo soporta; opciones tn_api_username y
+    tn_auth_mechanism (auto|scram|scram-plus|plain), lib/TrueNAS/SCRAM.pm y
+    Depends libcrypt-pbkdf2-perl, libcrypt-urandom-perl; install.sh acota los
+    reinicios locales de systemctl (#133). beta8, portales iSCSI IPv6 (#140)
+    y login solo a los portales configurados en tn_discovery_portal/tn_portals.
+  * Gana el fork donde ya cubria lo mismo: check_config sigue devolviendo en
+    una edicion antes de las comprobaciones de creacion y no exige tn_api_key
+    (es sensitive-property y la exige on_add_hook); tn_api_key sigue sin
+    fixed para poder rotarla; el broker recibe la clave desde el fichero priv
+    (_tn_api_key). Las comprobaciones nuevas de upstream se conservan:
+    tn_api_username sin ':' en cualquier ruta, y scram/scram-plus exigen
+    tn_api_username al crear.
+  * Broker: todo el login nuevo (sondeo auth.mechanism_choices, T1/T1-PLUS,
+    T2, T3) corre contra el MISMO plazo absoluto de la peticion que ya usaba
+    el fork; sin esto el login SCRAM de varios pasos podia sobrepasar el plazo
+    que el plugin da a toda la llamada. El login heredado conserva los
+    mensajes del fork: sin respuesta dice que TrueNAS no contesto (no que la
+    clave sea mala; t/broker/01 lo exige, y la asercion de upstream en
+    t/scram/02 se adapta) y un bloqueo por rate limit se nombra como tal.
+    TrueNAS::SCRAM se carga al hacer el login SCRAM y no al arrancar: sin
+    Crypt::PBKDF2/Crypt::URandom el daemon ya no se niega a arrancar (lo que
+    tumbaria todos los storages); solo falla el login SCRAM, nombrando el
+    modulo, y nunca cae a un mecanismo mas debil. t/scram/01 y 02 se saltan
+    si faltan esos modulos; el CI los instala y corre t/scram, t/ipv6, t/login.
+  * Portales iSCSI: _portal_connected y el filtro de login de upstream usan
+    _portal_match_keys, que suma a la clave IPv6 de upstream TODOS los
+    registros A de un nombre (el fork ya lo hacia con _portal_match_needles),
+    no solo el primero. La IQN se compara entera (#124).
+  * JSON: sigue igual que en idk28, JSON::XS solo decodifica y JSON::PP
+    codifica (t/nvme/39). Se conserva Depends nvme-cli y Recommends
+    libjson-xs-perl del fork.
+
+ -- Alfonso Kuen <alfonsokuen@gmail.com>  Fri, 06 Nov 2026 12:00:00 -0500
+
 truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
 
   * JSON: el plugin y el broker DECODIFICAN con JSON::XS cuando esta instalado y

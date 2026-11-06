@@ -29,7 +29,7 @@ Architecture: all
 # in TrueNASPlugin.pm for exactly what is and is not lost below 9.0.16
 # (in short: new keys still land in priv correctly; a stale inline copy
 # from before a rotation just cannot be auto-cleaned on that one path).
-Depends: pve-manager (>= 8.0.0), libpve-storage-perl (>= 8.3.5), open-iscsi, multipath-tools, nvme-cli, perl, libio-socket-ssl-perl, liburi-perl, ${misc:Depends}, ${perl:Depends}
+Depends: pve-manager (>= 8.0.0), libpve-storage-perl (>= 8.3.5), open-iscsi, multipath-tools, nvme-cli, perl, libio-socket-ssl-perl, libcrypt-pbkdf2-perl, libcrypt-urandom-perl, liburi-perl, ${misc:Depends}, ${perl:Depends}
 Recommends: libjson-xs-perl
 Description: TrueNAS SCALE storage plugin for Proxmox VE
  This package provides the TrueNAS Proxmox storage plugin for shared VM disk

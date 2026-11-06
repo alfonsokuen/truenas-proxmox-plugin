@@ -1,5 +1,43 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.24 (November 5, 2026)
+
+GA release. Same code as 2.1.24~beta8; no fixes or feature changes beyond beta8. See the 2.1.24~beta1 through 2.1.24~beta8 entries below for what landed across the cycle (HA NVMe/TCP auto-detect, SCRAM-SHA-512 / SCRAM-PLUS / API_KEY_PLAIN authentication, snapshot and lifecycle fixes, PVE 9.2 boot-race fix, IPv6 iSCSI portals, and configured-portals-only iSCSI login).
+
+## Version 2.1.24~beta8 (November 4, 2026)
+
+### Bug Fixes
+
+- **#140 — IPv6 iSCSI portals**. A portal written as `[fd00::1]:3260` was normalised to `fd00::1:3260`, probed with the IPv4-only `IO::Socket::INET` (always "not reachable") and matched against `iscsiadm` session lines by substring, so an IPv6 portal could not be used at all. Portals are now parsed once into host and port, kept bracketed for every `iscsiadm -p` argument, probed with `IO::Socket::IP` (both address families), and matched against sessions and node records by parsed value, so equivalent IPv6 spellings (`2001:db8:0:0::1` vs `2001:db8::1`) count as the same portal. IPv4 and hostname portals behave as before, including the FQDN-to-IPv4 session match from #102 and the longer-IQN guard from #124. `path()` now renders the synthesised by-path name the way udev spells an IPv6 portal (`ip-fd42::70:3260-iscsi-...`, no brackets). Unit tests in `t/ipv6`.
+- **Log into configured iSCSI portals only**. After SendTargets discovery, open-iscsi holds a node record for every address the target advertises, and a TrueNAS portal bound to `0.0.0.0` or `::` advertises every address on the box (docker and VM bridges, link-local and public IPv6). `_iscsi_login_all` logged into all of them, and each unreachable address blocked for open-iscsi's whole login retry budget (about two minutes), serially, on the first login and on every reconnect after a session drop. The loop now logs into the portals listed in `tn_discovery_portal` and `tn_portals` only, logs the skipped discovered portals once, and keeps the direct fallback login for configured portals missing from the node list (#91). Unit test in `t/login`.
+
+### Behaviour Change
+
+- A host that configured only `tn_discovery_portal` against a TrueNAS with several reachable storage interfaces used to get a session on each of them implicitly. It now gets one, and a warning in the journal names the portals that were skipped. List the extra portals in `tn_portals` to keep the additional paths.
+
+### Notes
+
+- Live-verified from Proxmox VE 9 to TrueNAS 28.0 MASTER: plain, CHAP, hostname, portless, multipath (two IPv4 portals), multipath + CHAP, IPv6 (ULA), IPv6 + CHAP, IPv6 + IPv4 mixed, and IPv4 regression. On a portal bound to `0.0.0.0` advertising 8 addresses (7 unreachable), first login took 858 s before and 4 s after; reconnect after a session drop 856 s before and 1-2 s after; boot-style `--loginall=automatic` 122 s before and 0 s after, with the same usable sessions in every case. Only the configured portals' node records are marked `startup=automatic` now.
+- Unit suites `t/ipv6`, `t/login`, `t/scram` and `t/nvme` run on this release with the same results as beta7 (the one pre-existing `t/nvme/06` failure is unchanged).
+
+## Version 2.1.24~beta7 (November 2, 2026)
+
+### New Features
+
+- **SCRAM-SHA-512 authentication**. Three-tier auth model gated by `tn_auth_mechanism` (`auto` | `scram` | `scram-plus` | `plain`, default `auto`). The broker probes `auth.mechanism_choices`, picks the strongest tier available, and falls through to legacy `auth.login_with_api_key` only when no modern mechanism is possible. Adds `tn_api_username` as a per-storage opt-in to SCRAM / API_KEY_PLAIN. Backward-compatible: existing storages without `tn_api_username` keep the legacy path with no behavior change. Design doc: `docs/superpowers/specs/2026-10-29-scram-auth-design.md`.
+- **SCRAM-PLUS with TLS channel binding**. `tn_auth_mechanism=scram-plus` enforces SCRAM-SHA-512 bound to the TLS server's `tls-server-end-point` (RFC 5929). Picks the SHA digest per cert signature algorithm per RFC 5929 section 4.1. Fails hard if the server does not advertise SCRAM, if the TLS peer cert cannot be read, or if the server rejects the `c=` attribute. Does not fall back under any circumstance. Allowed together with `tn_api_insecure=1` (CB still binds the SCRAM exchange to the cert the client saw, defeating a relaying MITM even without CA validation). Design doc: `docs/superpowers/specs/2026-10-29-scram-plus-design.md`.
+- Pool-key separation: `scram` and `scram-plus` storages on the same host end up in distinct broker worker pools (the pool key hashes the mechanism string).
+
+### Bug Fixes
+
+- **#133 — installer hang on "Restarting Proxmox services..."**. The `install.sh` restart loop now bounds each `systemctl restart` call to 60 s through a named `SYSTEMCTL_RESTART_TIMEOUT_SECS` constant. On a wedged systemd job queue the installer now surfaces the stuck unit by name and points the operator at `systemctl status <unit>` and the unit journal, instead of silently waiting out systemd's TimeoutStopSec default (90 s on PVE's own units, unbounded elsewhere). Both local-node restart sites covered: `restart_pve_services`'s loop and the `schedule_pveproxy_deferred_restart` immediate fallback.
+
+### Notes
+
+- Live-verified across TrueNAS 26.0 BETA.3 (192.168.1.68) and TrueNAS 28.0 MASTER (192.168.1.70). Four-node PVE 9.2.21 cluster deploy. Dev full-function test with `tn_auth_mechanism=scram`: 50/50 PASS, 1 SKIP, 0 FAIL. Lifecycle run-all: 7 PASS + 1 SKIP (environmental). SCRAM-PLUS confirmed server-side via a flipped-CB negative test that produced `response_type: AUTH_ERR` as expected, and a correctly-computed `c=` that produced a `SERVER_FINAL_RESPONSE` with a verified `v=`.
+- New runtime dependencies: `libcrypt-pbkdf2-perl` and `libcrypt-urandom-perl`. Both ship in bookworm and trixie; `apt install truenas-proxmox-plugin` pulls them automatically.
+- `wiki/Configuration.md` documents the two new properties, each mechanism value, the TN version matrix, the ~1-3 s first-auth PBKDF2 cost at TrueNAS's 500000-iteration server-side default, and the old-key-format caveat (pre-25.10 `id-token` keys have no SCRAM credentials bound server-side).
+
 ## Version 2.1.23~beta7 (September 29, 2026)
 
 ### New Features

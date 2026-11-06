@@ -3,12 +3,13 @@ use v5.36;
 use strict;
 use warnings;
 
-# Plugin Version. Base upstream real: 2.1.24~beta6 -- el "2.1.24" que este
-# fork declaro hasta idk11 NUNCA existio en upstream y ordenaba por ENCIMA de
-# todas sus releases. El paquete lleva ademas epoch 1 (ver debian/changelog):
-# el epoch es solo de empaquetado y mantiene el fork por encima del repo apt
-# de upstream, que esta configurado en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.24~beta6+idk28';
+# Plugin Version. Base upstream real: 2.1.24 (release final, tag v2.1.24).
+# Hasta idk11 este fork declaro un "2.1.24" que entonces NO existia en
+# upstream; desde idk30 la base es la 2.1.24 de verdad. El paquete lleva
+# ademas epoch 1 (ver debian/changelog): el epoch es solo de empaquetado y
+# mantiene el fork por encima del repo apt de upstream, que esta configurado
+# en los nodos y si no nos sobreescribiria.
+our $VERSION = '2.1.24+idk30';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 16;
 use JSON::PP ();    # JSON::PP::true / JSON::PP::false stay this plugin's booleans
@@ -919,6 +920,17 @@ sub properties {
             description => "TrueNAS user-linked API key.",
             type => 'string',
         },
+        tn_api_username => {
+            description => "TrueNAS account that owns the API key. Required by the SCRAM and SCRAM-PLUS authentication mechanisms (tn_auth_mechanism=scram or scram-plus); leaving it empty forces the legacy auth.login_with_api_key path (deprecated upstream; scheduled for removal in a future TrueNAS release).",
+            type => 'string', optional => 1,
+            format_description => 'account',
+        },
+        tn_auth_mechanism => {
+            description => "API-key authentication mechanism. 'auto' (default) prefers SCRAM when the server offers it, falling back to plain. 'scram' refuses to connect to servers that cannot do SCRAM-SHA-512. 'scram-plus' is the strict option: it requires SCRAM-SHA-512 with channel binding (tls-server-end-point) and refuses to connect otherwise. 'plain' never attempts SCRAM.",
+            type => 'string', optional => 1,
+            enum => ['auto','scram','scram-plus','plain'],
+            default => 'auto',
+        },
         tn_api_scheme => {
             title => 'API Scheme',
             description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
@@ -1285,6 +1297,8 @@ sub options {
         # _tn_api_key() dies with a clear message if a storage somehow has
         # neither a priv file nor an inline value when actually used.
         tn_api_key       => { optional => 1 },
+        tn_api_username  => { optional => 1 },
+        tn_auth_mechanism => { optional => 1 },
         tn_api_scheme    => { optional => 1, fixed => 1 },
         tn_api_transport => { optional => 1, fixed => 1 },
         tn_api_port      => { optional => 1, fixed => 1 },
@@ -1498,6 +1512,10 @@ sub check_config {
         );
     }
 
+    if (defined $opts->{tn_api_username} && $opts->{tn_api_username} =~ /:/) {
+        die "tn_api_username must not contain ':'\n";
+    }
+
     # A hostnqn can be changed on an existing storage, so its format is checked
     # on every path, not only at creation.
     if (defined($opts->{tn_hostnqn}) && $opts->{tn_hostnqn} ne ''
@@ -1527,6 +1545,12 @@ sub check_config {
     # would refuse every creation unconditionally. The actual "is it there"
     # requirement now lives in on_add_hook(), which sees the real value via
     # %sensitive and is the only place PVE calls exactly once, at creation.
+    # tn_api_username and tn_auth_mechanism are not sensitive, so unlike the
+    # key they are really here on a create.
+    my $mech = $opts->{tn_auth_mechanism} // '';
+    if ($mech =~ /\Ascram(-plus)?\z/ && !$opts->{tn_api_username}) {
+        die "tn_auth_mechanism=$mech requires tn_api_username\n";
+    }
     if (!$opts->{tn_dataset}) {
         die "tn_dataset is required\n";
     }
@@ -2443,6 +2467,8 @@ sub _broker_rpc {
         scfg => {
             api_host     => $scfg->{tn_api_host},
             api_key      => _tn_api_key($scfg),
+            api_username   => $scfg->{tn_api_username},
+            auth_mechanism => $scfg->{tn_auth_mechanism},
             api_scheme   => $scfg->{tn_api_scheme}   // 'wss',
             api_port     => $scfg->{tn_api_port},
             api_insecure => $scfg->{tn_api_insecure} // 0,
@@ -2577,7 +2603,10 @@ sub _ws_get_persistent($scfg) {
     _log($scfg, 0, 'warning',
         "[TrueNAS] broker socket missing; TRUENAS_PLUGIN_ALLOW_DIRECT_WS is set, " .
         "using direct WS. This bypasses D2/D3 rate-limit protection and is not " .
-        "supported in production."
+        "supported in production. The direct-WS path still uses the legacy " .
+        "auth.login_with_api_key call, which is scheduled for removal in a " .
+        "future TrueNAS release; the broker is the only path that migrates to " .
+        "auth.login_ex (SCRAM / API_KEY_PLAIN)."
     );
 
     # Fork detection: if we're in a child process, inherited connections are invalid
@@ -6519,21 +6548,84 @@ sub _resolve_target_id {
 }
 
 # ======== Portal normalization & reachability ========
-sub _normalize_portal($p) {
+# ---- iSCSI portal strings and IPv6 (issue #140) ----------------------------
+#
+# An iSCSI portal is written "host:port", "[v6]:port", a bare host or a bare
+# "[v6]"; iscsiadm prints sessions and node records as "[v6]:port,tpgt" and
+# needs the brackets back on -p. Until 2.1.24 the plugin stripped the brackets
+# ("fd00::1:3260"), probed with the IPv4-only IO::Socket::INET and matched
+# session lines by substring, so an IPv6 portal failed at the reachability
+# probe and would have been unusable past it. Everything below works on one
+# parsed (host, port) pair and renders the bracketed form where a tool wants a
+# single string.
+
+# _parse_portal: portal string -> (host without brackets, port or undef).
+# A trailing ",tpgt" (as iscsiadm prints it) is dropped. Without brackets a
+# string with more than one ':' is a bare IPv6 address (no port).
+sub _parse_portal($p) {
     $p //= '';
     $p =~ s/^\s+|\s+$//g;
-    return $p if !$p;
-    # strip IPv6 brackets for by-path normalization
-    $p = ($p =~ /^\[(.+)\]:(\d+)$/) ? "$1:$2" : $p;
-    # strip trailing ",TPGT"
     $p =~ s/,\d+$//;
-    return $p;
+    return (undef, undef) if $p eq '';
+    return ($1, $2)    if $p =~ /^\[([^\]]+)\]:(\d+)$/;
+    return ($1, undef) if $p =~ /^\[([^\]]+)\]$/;
+    return ($p, undef) if ($p =~ tr/:/:/) > 1;      # bare IPv6
+    return ($1, $2)    if $p =~ /^([^:]+):(\d+)$/;
+    return ($p, undef);
 }
+
+# _portal_is_ipv6: a host that contains ':' is an IPv6 literal (zone index
+# allowed).
+sub _portal_is_ipv6($host) { return defined($host) && index($host, ':') >= 0 ? 1 : 0; }
+
+# _format_portal: (host, port) -> the string iscsiadm accepts and prints.
+sub _format_portal($host, $port) {
+    return '' if !defined($host) || $host eq '';
+    my $h = _portal_is_ipv6($host) ? "[$host]" : $host;
+    return defined($port) ? "$h:$port" : $h;
+}
+
+# _normalize_portal: canonical spelling of a configured portal for use as an
+# iscsiadm -p argument and as a comparison key: trimmed, ",tpgt" dropped,
+# IPv6 bracketed, no default port added (iscsiadm applies 3260 itself and the
+# node list echoes whatever was discovered).
+sub _normalize_portal($p) {
+    my ($host, $port) = _parse_portal($p);
+    return '' if !defined $host;
+    return _format_portal($host, $port);
+}
+
+# _portal_key: comparison key that also folds equivalent IPv6 spellings
+# (2001:db8:0:0::1 vs 2001:db8::1, case) and a missing port to 3260, so a
+# configured portal matches the session line iscsiadm prints for it.
+sub _portal_key($p) {
+    my ($host, $port) = _parse_portal($p);
+    return '' if !defined $host;
+    if (_portal_is_ipv6($host)) {
+        my $canon = _nvme_normalize_addr($host);
+        $host = $canon if defined $canon && $canon ne '';
+    }
+    return _format_portal($host, $port // 3260);
+}
+
+# _bypath_portal: the portal as udev spells it inside a /dev/disk/by-path name,
+# "ip-<host>:<port>-iscsi-<iqn>-lun-<n>": the host is NOT bracketed for IPv6
+# (observed: ip-fd42:7f7f:1::70:3260-iscsi-...), and the port is always
+# present (3260 when the configuration left it out).
+sub _bypath_portal($p) {
+    my ($host, $port) = _parse_portal($p);
+    return '' if !defined $host;
+    return "$host:" . ($port // 3260);
+}
+
 sub _probe_portal($portal) {
-    my ($h,$port) = $portal =~ /^(.+):(\d+)$/;
-    return 1 if !$h || !$port; # nothing to probe
-    my $sock = IO::Socket::INET->new(PeerHost=>$h, PeerPort=>$port, Proto=>'tcp', Timeout=>5);
-    die "iSCSI portal $portal is not reachable (TCP connect failed)\n" if !$sock;
+    my ($h, $port) = _parse_portal($portal);
+    return 1 if !defined $h || !defined $port; # nothing to probe
+    # IO::Socket::IP speaks both address families; IO::Socket::INET is IPv4
+    # only and made every IPv6 portal "not reachable" (issue #140).
+    require IO::Socket::IP;
+    my $sock = IO::Socket::IP->new(PeerHost=>$h, PeerPort=>$port, Proto=>'tcp', Timeout=>5);
+    die "iSCSI portal $portal is not reachable (TCP connect failed: " . ($@ || $!) . ")\n" if !$sock;
     close $sock;
     return 1;
 }
@@ -6587,27 +6679,33 @@ sub _target_sessions_active($scfg) {
 }
 
 # SendTargets records portals as IP:port even when discovery was issued
-# against a hostname. Return every string that can identify $portal in an
-# `iscsiadm -m session` line: the original host:port plus each resolved A.
-sub _portal_match_needles($portal) {
+# against a hostname, and iscsiadm prints IPv6 sessions bracketed. Return
+# every _portal_key that can identify $portal in an `iscsiadm -m session` line
+# or a node record: the configured portal itself (IPv6 spellings folded,
+# default port filled in; issue #140) plus each resolved A record of a
+# hostname (#102). All A records, not only the first: a round-robin name may
+# have been discovered through any of them. _host_ipv4 covers the case where
+# the multi-record lookup returns nothing.
+sub _portal_match_keys($portal) {
     my $norm = _normalize_portal($portal);
     return () unless $norm;
-    my @needles = ($norm);
-    if ($norm =~ /^([^:]+):(\d+)$/) {
-        my ($host, $port) = ($1, $2);
-        if ($host !~ /^\d+\.\d+\.\d+\.\d+$/) {
-            push @needles, map { "$_:$port" } _ipv4_addrs($host);
-        }
+    my @keys = (_portal_key($norm));
+    my ($host, $port) = _parse_portal($norm);
+    if (defined $host && !_portal_is_ipv6($host) && $host !~ /^\d+\.\d+\.\d+\.\d+$/) {
+        my @ips = _ipv4_addrs($host);
+        @ips = (_host_ipv4($host)) if !@ips;
+        push @keys, map { _portal_key(_format_portal($_, $port)) }
+                    grep { $_ && $_ ne $host } @ips;
     }
     my %seen;
-    return grep { !$seen{$_}++ } @needles;
+    return grep { !$seen{$_}++ } @keys;
 }
 
 # Check if a specific portal has an active session for this target
 sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
     my $iqn = $scfg->{tn_target_iqn} or return 0;
-    my @needles = _portal_match_needles($portal);
-    return 0 unless @needles;
+    my %want = map { $_ => 1 } _portal_match_keys($portal);
+    return 0 unless %want;
 
     # Get active sessions if not provided
     my @session_lines;
@@ -6618,15 +6716,15 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
         return 0 if $@;
     }
 
-    # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
-    # Match hostname portals against the IP open-iscsi actually logged.
     for my $line (@session_lines) {
-        # (?![\w.:-]) refuses to count a longer-IQN session as this one (issue
-        # #124: ...:protected-16k would otherwise match ...:protected).
-        next unless $line =~ /\Q$iqn\E(?![\w.:-])/;
-        for my $needle (@needles) {
-            return 1 if $line =~ /\Q$needle\E/;
-        }
+        # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
+        # IPv6:                tcp: [2] [fd00::1]:3260,1 iqn.2005-10.org.freenas.ctl:target0
+        # The IQN is compared whole, so a longer-IQN session never counts as
+        # this one (issue #124: ...:protected-16k against ...:protected).
+        next unless $line =~ /^\s*\S+:\s+\[\d+\]\s+(\S+?)(?:,\d+)?\s+(\S+)/;
+        my ($sess_portal, $sess_iqn) = ($1, $2);
+        next unless $sess_iqn eq $iqn;
+        return 1 if $want{_portal_key($sess_portal)};
     }
     return 0;
 }
@@ -6714,11 +6812,28 @@ sub _iscsi_login_all($scfg) {
 
     my $chap_password = _tn_chap_password($scfg);
 
-    # Login to all discovered portals for this IQN; ensure node.startup=automatic
+    # Only the portals the operator configured are logged into. SendTargets
+    # makes open-iscsi record a node for EVERY address the target advertises,
+    # and a TrueNAS portal on 0.0.0.0 / :: advertises every address on the
+    # box: docker and VM bridges, link-local and public IPv6. A --login to an
+    # address this host cannot reach blocks for open-iscsi's whole retry
+    # budget (about two minutes each, serially) before the loop reaches a
+    # real portal - on the very first login and on every reconnect after a
+    # session drop. Multipath users list their portals in tn_portals, so the
+    # configured set is the wanted set; unconfigured records are left alone.
+    #
+    # Keys: _portal_match_keys of each configured portal (default port filled
+    # in, IPv6 spellings folded, every resolved IPv4 of a hostname for #102),
+    # since the node record carries the address.
+    my %configured = map { $_ => 1 } map { _portal_match_keys($_) } grep { length } ($primary, @extra);
+    my @skipped;
+
+    # Login to the configured portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
         # the list form is "192.0.2.1:3260,1 iqn..." - strip the ,tpgt suffix
         next unless $n =~ /^(\S+?)(?:,\d+)?\s+\Q$iqn\E$/;
         my $portal = _normalize_portal($1);
+        if (!$configured{_portal_key($portal)}) { push @skipped, $portal; next; }
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
                  "iscsiadm update failed (node.startup)");
         if ($scfg->{tn_chap_user} && $chap_password) {
@@ -6733,6 +6848,13 @@ sub _iscsi_login_all($scfg) {
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
                  "iscsiadm login failed ($portal)");
     }
+    # Always visible (level 0): an operator who relied on discovery adding
+    # paths implicitly must see that those portals are now ignored and list
+    # them in tn_portals if they want them.
+    _log($scfg, 0, 'warning',
+        "[TrueNAS] iscsi login: skipped " . scalar(@skipped) . " discovered portal(s) not in " .
+        "tn_discovery_portal/tn_portals (add them to tn_portals to use them): " . join(', ', @skipped)) if @skipped;
+
     # attempt direct login for any configured portal not already in -m node.
     # $primary must get the same guaranteed fallback as @extra, otherwise it
     # silently ends up with no session if sendtargets discovery from it alone
@@ -10387,7 +10509,10 @@ sub path {
                 # first, which authoritatively waits for the device.
                 my $resolved_lun = defined $real_lun ? $real_lun : $lun;
                 if (defined $resolved_lun) {
-                    my $portal = $scfg->{tn_discovery_portal} // '';
+                    # udev spells the portal without IPv6 brackets and always
+                    # with the port; the configured string may have either
+                    # (issue #140), so render it the way udev does.
+                    my $portal = _bypath_portal($scfg->{tn_discovery_portal} // '');
                     my $iqn    = $scfg->{tn_target_iqn}       // '';
                     if ($portal ne '' && $iqn ne '') {
                         $dev = "/dev/disk/by-path/ip-${portal}-iscsi-${iqn}-lun-${resolved_lun}";

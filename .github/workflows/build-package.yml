@@ -49,11 +49,14 @@ jobs:
             libio-socket-ssl-perl \
             liburi-perl \
             libjson-xs-perl \
+            libcrypt-pbkdf2-perl \
+            libcrypt-urandom-perl \
             curl
 
       # Only the offline suites run here: t/nvme loads TrueNASPlugin.pm against
       # the PVE stand-ins in t/nvme/lib, and t/installer drives the shell
-      # installers with stubs. The t/rate-limit tests are integration tests
+      # installers with stubs. t/scram, t/ipv6 and t/login are upstream's offline
+      # tests for SCRAM auth, IPv6 portals and the configured-portal login. The t/rate-limit tests are integration tests
       # (they need a real TrueNAS array / Proxmox host), so CI does not run them.
       # The compile check comes first on purpose: every t/nvme test does
       # skip_all when the plugin does not load, so without it a syntax error
@@ -61,7 +64,7 @@ jobs:
       - name: Run unit tests
         run: |
           perl -I t/nvme/lib -c TrueNASPlugin.pm
-          prove -I t/nvme/lib -r t/nvme t/installer
+          prove -I t/nvme/lib -r t/nvme t/installer t/scram t/ipv6 t/login
 
       - name: Build package and run lintian
         run: tools/build-deb.sh
