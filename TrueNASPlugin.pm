@@ -8497,6 +8497,7 @@ my %NVME_SELECTOR_REASON_LABELS = (
     # inequality is normal in shared NVMe-oF subsystems, not a fault.)
     namespace_metadata_did_not_match_visible_devices      => 'TrueNAS metadata did not match any visible Linux NVMe namespace device',
     subsystem_not_visible                                 => 'NVMe subsystem is not visible in Linux sysfs',
+    sysfs_enumeration_failed                              => 'a sysfs listing or attribute read failed, so the visible devices are not known',
 );
 
 sub _nvme_selector_reason_label {
@@ -8504,7 +8505,7 @@ sub _nvme_selector_reason_label {
     return $NVME_SELECTOR_REASON_LABELS{$reason // ''} // 'unknown selector mismatch reason';
 }
 
-my %NVME_FAILURE_OUTCOMES = map { $_ => 1 } qw(publication_mismatch metadata_failure);
+my %NVME_FAILURE_OUTCOMES = map { $_ => 1 } qw(publication_mismatch metadata_failure enumeration_failed);
 
 sub _nvme_selector_failure_detail {
     my ($result, $nqn) = @_;
@@ -8536,6 +8537,12 @@ sub _nvme_selector_failure_detail {
         return "TrueNAS namespace metadata could not be trusted for UUID matching.\n"
             . $common_detail . "\n"
             . "Verify the namespace still exists and is mapped to subsystem '$nqn'.";
+    }
+
+    if ($selector_outcome eq 'enumeration_failed') {
+        return "The local NVMe enumeration in sysfs could not be completed.\n"
+            . $common_detail . "\n"
+            . "  -> Failed reads: " . join('; ', @{ $result->{enumeration_errors} // [] });
     }
 
     return "Unrecognized selector outcome '$selector_outcome'.\n" . $common_detail;
@@ -8800,34 +8807,91 @@ sub _nvme_select_namespace_device {
     );
 }
 
+# Injectable roots so the in-use gate can be tested against a fake tree and
+# probed read-only on real hardware: sysfs root, host mountinfo, proc root,
+# and a fuser runner (returns its exit status, undef when it could not run).
+our $_NVME_SYSFS     = '/sys';
+our $_NVME_MOUNTINFO = '/proc/self/mountinfo';
+our $_NVME_PROC_ROOT = q(/proc);
+our $_NVME_FUSER_RC;
+
+# One sysfs attribute: (value) when read, (undef) when the attribute does not
+# exist, and (undef, error) when it exists but could not be read. Absence is
+# an answer (the kernel hides nguid when it is zero); a failed read is not.
+sub _nvme_sysfs_attr {
+    my ($path) = @_;
+
+    my $fh;
+    if (!open($fh, '<', $path)) {
+        return (undef) if $!{ENOENT};
+        return (undef, "open $path: $!");
+    }
+    $! = 0;
+    my $val = <$fh>;
+    my $read_err = $!;
+    close $fh;
+    return (undef, "read $path: " . ($read_err || 'no data')) if !defined $val;
+    chomp($val);
+    return ($val);
+}
+
+# The selector's answers other than a match rest on this walk having seen
+# everything; when any listing or read of it failed, "no device of ours here"
+# is not established and the result says enumeration_failed instead (the rest
+# of the result is kept, so the activate retry loop behaves as before). A match
+# stays a match: the device found is real. readdir cannot report errors in
+# Perl, so a listing cut short mid-way is not caught here.
 sub _nvme_find_device_by_subsystem {
     my ($scfg, $device_uuid) = @_;
 
     my $nqn = $scfg->{tn_subsystem_nqn};
+    my $class_dir = "$_NVME_SYSFS/class/nvme-subsystem";
+    my $block_dir = "$_NVME_SYSFS/block";
+    my (@subsys_errors, @enum_errors);
 
-    # Find subsystem matching our NQN
-    opendir(my $dh, "/sys/class/nvme-subsystem") or return _nvme_selector_result(
+    my $finish = sub {
+        my ($result, @errors) = @_;
+        return { %$result, enumeration_complete => 1 } if !@errors
+            || _nvme_selector_outcome_is_success($result->{selector_outcome});
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: local NVMe enumeration incomplete: "
+            . join('; ', @errors));
+        return { %$result, selector_outcome => 'enumeration_failed', enumeration_complete => 0,
+                 underlying_outcome => $result->{selector_outcome},
+                 underlying_mismatch_reason => $result->{mismatch_reason},
+                 mismatch_reason => 'sysfs_enumeration_failed', enumeration_errors => [@errors] };
+    };
+    my $not_visible = _nvme_selector_result(
         linux_device_count => 0,
         selector_outcome => 'publication_mismatch',
         mismatch_reason => 'subsystem_not_visible',
     );
+
+    # Find subsystem matching our NQN. No class directory at all means the
+    # nvme core is not loaded: there is no NVMe device on this node.
+    my $dh;
+    if (!opendir($dh, $class_dir)) {
+        return $finish->($not_visible) if $!{ENOENT};
+        return $finish->($not_visible, "opendir $class_dir: $!");
+    }
     while (my $subsys = readdir($dh)) {
         next unless $subsys =~ /^(nvme-subsys\d+)$/;
         $subsys = $1;  # Untaint via capture
 
-        my $subsys_nqn = eval {
-            open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
-            my $val = <$fh>;
-            close $fh;
-            chomp($val);
-            $val;
-        };
+        my ($subsys_nqn, $nqn_err) = _nvme_sysfs_attr("$class_dir/$subsys/subsysnqn");
+        # Any subsystem left unread might be ours; once ours is found it no
+        # longer matters (an NQN names one subsystem).
+        push @subsys_errors, $nqn_err if $nqn_err;
         next unless $subsys_nqn && $subsys_nqn eq $nqn;
 
         # Found our subsystem - collect all namespace devices from /sys/block
         # Controller-specific devices don't appear in subsystem directory
         my @devices;
-        opendir(my $bdh, "/sys/block") or next;
+        my $bdh;
+        if (!opendir($bdh, $block_dir)) {
+            push @enum_errors, "opendir $block_dir: $!";
+            closedir($dh);
+            return $finish->($not_visible, @enum_errors);
+        }
         while (my $entry = readdir($bdh)) {
             my $type;
 
@@ -8844,56 +8908,29 @@ sub _nvme_find_device_by_subsystem {
                 next;
             }
 
-            # Verify this device belongs to our subsystem by checking NQN
-            my $dev_nqn = eval {
-                # For standard devices, check via subsystem link
-                if ($type eq 'standard' && -e "/sys/block/$entry/device/subsysnqn") {
-                    open my $fh, '<', "/sys/block/$entry/device/subsysnqn" or return undef;
-                    my $val = <$fh>;
-                    close $fh;
-                    chomp($val);
-                    return $val;
-                }
-                # For controller devices, navigate to controller then subsystem
-                if ($type eq 'controller' && -e "/sys/block/$entry/device/../subsysnqn") {
-                    open my $fh, '<', "/sys/block/$entry/device/../subsysnqn" or return undef;
-                    my $val = <$fh>;
-                    close $fh;
-                    chomp($val);
-                    return $val;
-                }
-                return undef;
-            };
+            # Verify this device belongs to our subsystem by checking NQN:
+            # standard devices via the subsystem link, controller devices by
+            # navigating to the controller then the subsystem.
+            my ($dev_nqn, $dev_nqn_err) = _nvme_sysfs_attr($type eq 'standard'
+                ? "$block_dir/$entry/device/subsysnqn"
+                : "$block_dir/$entry/device/../subsysnqn");
+            # A device whose NQN could not be read may well be ours.
+            push @enum_errors, $dev_nqn_err if $dev_nqn_err;
 
             if ($dev_nqn && $dev_nqn eq $nqn) {
                 # Read NSID and NGUID from sysfs (reliable sources)
-                my $sysfs_nsid = eval {
-                    open my $fh, '<', "/sys/block/$entry/nsid" or return undef;
-                    my $val = <$fh>;
-                    close $fh;
-                    chomp($val);
-                    return $val;
-                };
-                my $sysfs_nguid = eval {
-                    open my $fh, '<', "/sys/block/$entry/nguid" or return undef;
-                    my $val = <$fh>;
-                    close $fh;
-                    chomp($val);
-                    return $val;
-                };
+                my ($sysfs_nsid, $nsid_err) = _nvme_sysfs_attr("$block_dir/$entry/nsid");
+                my ($sysfs_nguid, $nguid_err) = _nvme_sysfs_attr("$block_dir/$entry/nguid");
                 # The namespace UUID, which the kernel exposes alongside nguid and
                 # the API returns as device_uuid. Measured against a live target:
                 # when the target's device_nguid is all zeros the nguid attribute
                 # does not exist at all, while uuid is always there. Without this
                 # the selector had no identity left to match on and fell through
                 # to NSID, which is recycled.
-                my $sysfs_uuid = eval {
-                    open my $fh, '<', "/sys/block/$entry/uuid" or return undef;
-                    my $val = <$fh>;
-                    close $fh;
-                    chomp($val);
-                    return $val;
-                };
+                my ($sysfs_uuid, $uuid_err) = _nvme_sysfs_attr("$block_dir/$entry/uuid");
+                # An identity that could not be read leaves "this device is not
+                # ours" unproven.
+                push @enum_errors, grep { defined } $nsid_err, $nguid_err, $uuid_err;
 
                 push @devices, {
                     path => "/dev/$entry",
@@ -8912,26 +8949,14 @@ sub _nvme_find_device_by_subsystem {
         my $namespace_meta = _nvme_get_namespace_selector_metadata($scfg, $device_uuid);
         my $result = _nvme_select_namespace_device($scfg, $device_uuid, \@devices, $namespace_meta);
         closedir($dh);
-        return $result;
+        return $finish->($result, @enum_errors);
     }
     closedir($dh);
 
-    return _nvme_selector_result(
-        linux_device_count => 0,
-        selector_outcome => 'publication_mismatch',
-        mismatch_reason => 'subsystem_not_visible',
-    );
+    return $finish->($not_visible, @subsys_errors);
 }
 
 # Collect /dev/nvmeXnY paths for all block devices belonging to our subsystem NQN
-# Injectable roots so the in-use gate can be tested against a fake tree and
-# probed read-only on real hardware: sysfs root, host mountinfo, proc root,
-# and a fuser runner (returns its exit status, undef when it could not run).
-our $_NVME_SYSFS     = '/sys';
-our $_NVME_MOUNTINFO = '/proc/self/mountinfo';
-our $_NVME_PROC_ROOT = q(/proc);
-our $_NVME_FUSER_RC;
-
 # With strict => 1 an unreadable /sys/block DIES instead of returning an empty
 # list: an empty list reads as "no devices, nothing to protect", which is the
 # wrong answer to "I could not look".
@@ -11546,9 +11571,12 @@ sub _free_image_iscsi {
 # metadata in hand, or the subsystem not connected here, and no visible device
 # carries this namespace's identity) or TrueNAS answering that the namespace or
 # subsystem does not exist; the UUID match against sysfs runs before either, so
-# a device carrying our UUID would have been selected. Anything else - the
-# lookup died, answered nothing readable, its API query failed, or a "match"
-# without a path - leaves the in-use check unmade, so the free must not go on.
+# a device carrying our UUID would have been selected. Both only hold when the
+# selector walked sysfs to the end (enumeration_complete): a listing or read
+# that failed is enumeration_failed, and a result without the flag is treated
+# the same. Anything else - the lookup died, answered nothing readable, could
+# not enumerate, its API query failed, or a "match" without a path - leaves
+# the in-use check unmade, so the free must not go on.
 my %NVME_FREE_ABSENT_METADATA = map { $_ => 1 } qw(namespace_uuid_not_returned api_subsystem_not_found);
 
 sub _nvme_free_local_device {
@@ -11566,9 +11594,14 @@ sub _nvme_free_local_device {
             my $dev = $found->{selected_device_path};
             return $dev if defined $dev && $dev ne '';
             $why = "the device lookup reported a match ($outcome) but named no device";
+        } elsif ($outcome eq 'enumeration_failed') {
+            $why = 'the local NVMe enumeration failed ('
+                . join('; ', @{ $found->{enumeration_errors} // [] }) . ')';
         } elsif ($outcome eq 'publication_mismatch'
             || ($outcome eq 'metadata_failure' && $NVME_FREE_ABSENT_METADATA{$reason})) {
-            return undef;
+            return undef if $found->{enumeration_complete};
+            $why = "the device lookup found no device ($outcome) without confirming it enumerated "
+                . 'every local NVMe device';
         } else {
             $why = 'the device lookup could not decide (' . ($outcome || 'no outcome')
                 . ($reason ne '' ? ": $reason" : '') . ')';

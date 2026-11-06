@@ -12,8 +12,9 @@
 #
 # Both directions are asserted: in use -> dies and nothing was touched;
 # not in use / not attached on this node -> the free works as before.
-# A lookup that cannot tell (it dies, answers nothing readable, or the API
-# query behind it failed) is NOT "not attached": the in-use check never ran,
+# A lookup that cannot tell (it dies, answers nothing readable, the API query
+# behind it failed, or the local sysfs enumeration did not complete) is NOT
+# "not attached": the in-use check never ran,
 # so free_image dies before touching TrueNAS. Only a selector that positively
 # found no matching device on this node lets the free go on unchecked.
 # And when the zvol delete does fail after the namespace is gone, the error
@@ -119,6 +120,13 @@ my @undecided = (
     [ 'selector claims a match but names no device', selector => {
         selector_outcome => 'exact_match', linux_device_count => 1 } ],
     [ 'selector answers with an unknown outcome', selector => { linux_device_count => 1 } ],
+    [ 'selector could not enumerate local NVMe devices (sysfs read failed)', selector => {
+        selector_outcome => 'enumeration_failed', mismatch_reason => 'sysfs_enumeration_failed',
+        underlying_outcome => 'publication_mismatch', linux_device_count => 2, enumeration_complete => 0,
+        enumeration_errors => ['read /sys/block/nvme0n2/uuid: Is a directory'] } ],
+    [ 'publication_mismatch not marked as a complete enumeration', selector => {
+        selector_outcome => 'publication_mismatch', mismatch_reason => 'subsystem_not_visible',
+        linux_device_count => 0 } ],
     [ 'cloud-init volume (no embedded UUID), namespace lookup errors (API down)',
         vol => 'vm-101-cloudinit', resolve_err => "API call nvmet.namespace.query failed: timeout
 " ],
@@ -135,17 +143,29 @@ for my $c (@undecided) {
 
 # The selector positively found no device for this namespace here (the volume
 # is not attached on this node: a stopped guest, the normal case): free goes on.
+# "Positively" means enumeration_complete: every sysfs listing and read of the
+# walk succeeded (t/nvme/44 runs the real selector over a scratch sysfs).
+#
+# Why "three local devices, none matched -> proceeds" is safe: those three are
+# the complete set of this subsystem's devices on this node, each with a
+# readable identity. The selector tries NGUID, then the namespace UUID, before
+# NSID; a device carrying this namespace's UUID or NGUID is selected
+# (exact_match) and then checked for use, never reported as a mismatch. None
+# did, so this namespace is not attached here and no local guest can hold it
+# open. nguid_contradicted says the same thing from the other side: the
+# devices carry real identities that are not ours. Use on OTHER nodes is not
+# visible from here at all; that is TrueNAS's to refuse.
 my @absent = (
     [ 'subsystem not connected on this node', {
         selector_outcome => 'publication_mismatch', mismatch_reason => 'subsystem_not_visible',
-        linux_device_count => 0 } ],
-    [ 'subsystem connected, this namespace not among its devices', {
+        linux_device_count => 0, enumeration_complete => 1 } ],
+    [ 'subsystem connected, this namespace not among its three devices', {
         selector_outcome => 'publication_mismatch',
         mismatch_reason => 'namespace_metadata_did_not_match_visible_devices',
-        linux_device_count => 3, nguid_contradicted => 1 } ],
+        linux_device_count => 3, nguid_contradicted => 1, enumeration_complete => 1 } ],
     [ 'namespace already gone on TrueNAS, no local device carries its UUID', {
         selector_outcome => 'metadata_failure', mismatch_reason => 'namespace_uuid_not_returned',
-        linux_device_count => 2 } ],
+        linux_device_count => 2, enumeration_complete => 1 } ],
 );
 for my $c (@absent) {
     my ($name, $sel) = @$c;

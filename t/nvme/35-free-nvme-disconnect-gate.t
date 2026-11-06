@@ -32,7 +32,7 @@ my ($ns_answer, $subsys_answer, $busy, $disconnects, $deletes, $ns_calls, $retry
     # not tell" and free_image refuses it before reaching the paths under test.
     *{"${PKG}::_nvme_find_device_by_subsystem"} = sub {
         { selector_outcome => 'publication_mismatch', mismatch_reason => 'subsystem_not_visible',
-          linux_device_count => 0 } };
+          linux_device_count => 0, enumeration_complete => 1 } };
     *{"${PKG}::_assert_no_child_datasets"} = sub { 1 };
     *{"${PKG}::_nvme_connect"} = sub { push @events, 'connect'; die "nvme connect failed: Connection timed out\n" if $connect_dies; 1 };
     *{"${PKG}::usleep"} = sub ($) { 1 };
