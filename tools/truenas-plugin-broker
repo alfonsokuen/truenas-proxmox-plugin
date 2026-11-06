@@ -57,8 +57,12 @@ use Time::HiRes qw(time);
 # time made the whole daemon refuse to start on a node where those modules are
 # missing - an install from a copied tree rather than the .deb that Depends on
 # them - taking every storage down, even ones that never use SCRAM. Loaded
-# late, a missing module fails just the SCRAM login, with the module named,
-# and never falls back to a weaker mechanism (see _authenticate).
+# late, a missing module fails just the SCRAM login, with the module named.
+# An explicit scram / scram-plus stays failed; auto falls back to
+# API_KEY_PLAIN, with a warning logged once (see _authenticate).
+my $SCRAM_UNAVAILABLE = '[TrueNAS] SCRAM is not available on this node';
+my $scram_load_error;          # undef = not tried yet, '' = loaded
+my $scram_fallback_warned = 0;
 
 # Paths are overridable so the daemon can be exercised by a test as an
 # unprivileged user against a scratch directory. The systemd unit sets none of
@@ -409,8 +413,17 @@ sub _authenticate {
         my $unsupported = _is_scram_unsupported_error($err)
                           || $err =~ /SCRAM unsupported by server/;
         my $nomethod = _is_method_not_found($err);
-        die $err if $mech ne 'auto' || !($unsupported || $nomethod);
-        lwarn("auth: SCRAM unavailable on server, falling back to API_KEY_PLAIN");
+        # SCRAM's modules missing on this node: no SCRAM message was sent, so
+        # auto can log in the way it would have without a username.
+        my $no_local_scram = $err =~ /^\Q$SCRAM_UNAVAILABLE\E/;
+        die $err if $mech ne 'auto' || !($unsupported || $nomethod || $no_local_scram);
+        if (!$no_local_scram) {
+            lwarn("auth: SCRAM unavailable on server, falling back to API_KEY_PLAIN");
+        } elsif (!$scram_fallback_warned++) {
+            chomp(my $why = $err);
+            lwarn("auth: $why; tn_auth_mechanism is auto, falling back to API_KEY_PLAIN "
+                . "(this warning is logged once)");
+        }
         $tier = 'T2';
     }
     if ($tier eq 'T2') {
@@ -708,13 +721,40 @@ sub _scram_step {
     return $res;
 }
 
+# Load TrueNAS::SCRAM once, or die "$SCRAM_UNAVAILABLE: <module> ..." naming
+# the module that is missing. The answer is kept: perl refuses to require
+# again a file that failed to compile ("Attempt to reload"), which would hide
+# the module from every later login. Installing the module needs a broker
+# restart, which the package's postinst does.
+
+sub _load_scram {
+    if (!defined $scram_load_error) {
+        if (eval {
+            require TrueNAS::SCRAM;
+            TrueNAS::SCRAM->import(qw(scram_split_api_key scram_client_first scram_process_server_first
+                                      scram_client_final scram_verify_server_final));
+            1;
+        }) {
+            $scram_load_error = '';
+        } else {
+            my $err = $@;
+            my ($file) = $err =~ /Can't locate (\S+)\.pm in \@INC/;
+            (my $module = $file // '') =~ s{/}{::}g;
+            $scram_load_error = "$SCRAM_UNAVAILABLE: "
+                . ($module ne ''
+                    ? "Perl module $module is missing (install the package's Depends)"
+                    : "loading TrueNAS::SCRAM failed: " . ($err =~ s/\s+\z//r)) . "\n";
+        }
+    }
+    die $scram_load_error if $scram_load_error ne '';
+    return 1;
+}
+
 # T1 login: SCRAM-SHA-512 over auth.login_ex. The secret never goes on the
 # wire; the server's signature is verified before success is returned.
 sub _do_t1_login {
     my ($conn, $username, $api_key, %opts) = @_;
-    require TrueNAS::SCRAM;
-    TrueNAS::SCRAM->import(qw(scram_split_api_key scram_client_first scram_process_server_first
-                              scram_client_final scram_verify_server_final));
+    _load_scram();
     my ($key_id, $secret) = scram_split_api_key($api_key);
     my ($state, $first_wire) = scram_client_first($username, $key_id,
         (defined $opts{channel_binding} ? (channel_binding => $opts{channel_binding}) : ()));
