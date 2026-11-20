@@ -31,6 +31,7 @@ ok(defined &main, 'loaded the real broker entry point');
         return $self->{client};
     }
     sub close { push @{ $_[0]->{events} }, $_[0]->{close_event} if $_[0]->{close_event} }
+    sub shutdown { ++$_[0]->{shutdowns}; return 1 }
 }
 
 {
@@ -200,6 +201,36 @@ subtest 'the listener path stays published until in-flight workers exit' => sub 
     is($@, "exit 0\n", 'supervisor drains normally');
     is_deeply([grep { ref } @events], [['worker finished', 4], ['socket removed', 4]],
         'no part of the four-second drain occurs without the socket path');
+};
+
+subtest 'new connections are refused for the whole drain, right after the TERM' => sub {
+    local $SIG{TERM};
+    local $SIG{INT};
+    my $elapsed = 0;
+    my $worker = 43;
+    my @order;
+    $listener->{shutdowns} = 0;
+    $fork = sub { $worker };
+    # TERM first, so no idle worker wakes up for the refused connections.
+    $kill = sub { push @order, 'TERM'; 1 };
+    $unlink = sub { return scalar @_ };
+    $waitpid = sub {
+        if (!@order) {
+            $SIG{TERM}->();
+            return 0;
+        }
+        push @order, $listener->{shutdowns} ? 'drain refusing' : 'drain accepting' if @order == 1;
+        return 0 if $elapsed < 2;
+        return $worker;
+    };
+    local *Time::HiRes::clock_gettime = sub { $elapsed };
+    local *Time::HiRes::sleep = sub { $elapsed += $_[0] };
+    eval { main() };
+    is($@, "exit 0
+", 'supervisor drains normally');
+    is_deeply(\@order, ['TERM', 'drain refusing'],
+        'a client connecting during the drain is refused, not left in the backlog');
+    is($listener->{shutdowns}, 1, 'the listener is shut down for reading exactly once');
 };
 
 done_testing();

@@ -32,6 +32,16 @@
 15. Repone los workers del broker con espera creciente entre intentos.
 16. Documenta la sonda de uso con holders, `mountinfo` y `fuser`, los reinicios de #144 y la versión idk31.
 17. Añade `tools/idk-readonly-smoke.pl` para comprobar NVMe en nodos PVE y emitir TAP.
+18. Exime al dueño solo si su configuración está en el nodo local; un dueño en otro nodo bloquea el borrado.
+19. Fija la identidad ZFS del zvol al empezar el borrado, antes de retirar el namespace; el worker solo borra esa generación.
+20. No selecciona un dispositivo cuyo UUID contradice el pedido aunque coincida el NGUID.
+21. Repite la comprobación de uso antes de borrar un namespace que las primeras consultas no vieron.
+22. El broker rechaza conexiones nuevas durante el drenaje para que el cliente reintente contra el broker nuevo.
+23. Expone el snapshot bajo el lock de almacenamiento: una activación fallida no retira la de otra.
+24. Un listado completo de namespaces vacío con UUID conocido deja el namespace y el zvol en su sitio.
+25. Un resize que no rescanea ningún controlador NVMe termina con error.
+
+Límites conocidos: un alias desde otro ID de storage o un CT remoto con `dev0` no bloquean; el sufijo `.raw` da un falso positivo; la primera actualización desde idk30 aún usa el handler TERM antiguo; el barrido iSCSI #147 se abstiene sin mapeos y puede no limpiar nunca; borrar el último namespace del array falla cerrado si TrueNAS ya no lo lista.
 
 ## Version 2.1.25~beta2 (November 19, 2026)
 

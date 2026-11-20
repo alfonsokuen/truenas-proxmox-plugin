@@ -27,6 +27,7 @@ my $marker;
         die $child_error if $child_error;
         return 1;
     };
+    *{"${pkg}::_read_dataset_delete_identity"} = sub { return (guid => '1') };
     *{"${pkg}::_nvme_delete_namespace"} = sub {
         push @events, 'delete_namespace';
         die $namespace_error if $namespace_error;

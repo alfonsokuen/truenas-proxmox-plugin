@@ -1405,11 +1405,16 @@ sub worker_loop {
 }
 
 sub stop_workers {
-    my ($workers) = @_;
+    my ($workers, $srv) = @_;
     linfo("parent shutting down, signalling workers");
     my $deadline = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) + $DRAIN_TIMEOUT;
     my $escalated = 0;
     kill 'TERM', keys %$workers;
+    # Nobody accepts once the workers stop: refuse new connections (after the
+    # TERM, so no idle worker wakes for them) and a client gets ECONNREFUSED
+    # and retries against the replacement broker instead of waiting in the
+    # backlog for an EOF. Requests already accepted still finish.
+    $srv->shutdown(0) or lwarn("cannot refuse new connections while draining: $!") if $srv;
     while (%$workers) {
         my $dead = waitpid(-1, WNOHANG);
         if ($dead > 0) {
@@ -1494,7 +1499,7 @@ sub main {
         }
         Time::HiRes::sleep($SUPERVISOR_POLL) unless $stopping;
     }
-    my $drained = !%workers || stop_workers(\%workers);
+    my $drained = !%workers || stop_workers(\%workers, $srv);
     $srv->close();
     unlink $SOCKET_PATH if $drained;
     unlink $PIDFILE;

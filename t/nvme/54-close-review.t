@@ -84,6 +84,7 @@ subtest '6 path query gaps cannot hide a live namespace' => sub {
         my $dataset_deletes = 0;
         local *{"${pkg}::_assert_nvme_cluster_unreferenced"} = sub {};
         local *{"${pkg}::_assert_no_child_datasets"} = sub { { id => $ds, guid => 12 } };
+        local *{"${pkg}::_read_dataset_delete_identity"} = sub { return (guid => '12') };
         local *{"${pkg}::_nvme_pending_free_mark"} = sub {};
         local *{"${pkg}::_nvme_find_device_by_subsystem"} = sub {
             return { selector_outcome => 'publication_mismatch', enumeration_complete => 1 };
@@ -108,6 +109,7 @@ subtest '8 failed snapshot exposure preserves an earlier backup' => sub {
         $exists = 1;
         return { id => $_[2][0]{dataset_dst} };
     };
+    local *{"${pkg}::cluster_lock_storage"} = sub { $_[4]->(@_[5 .. $#_]) };
     local *{"${pkg}::_api_call"} = sub { [{ id => 1 }] };
     local *{"${pkg}::_nvme_create_namespace_idempotent"} = sub { { id => 42, device_uuid => $uuid } };
     local *{"${pkg}::_nvme_resync_configfs"} = sub {};
@@ -136,6 +138,7 @@ subtest '13 free returns before reaper and pending-free reads' => sub {
         return { selector_outcome => 'publication_mismatch', enumeration_complete => 1 };
     };
     local *{"${pkg}::_nvme_delete_namespace"} = sub {};
+    local *{"${pkg}::_read_dataset_delete_identity"} = sub { return (guid => '12') };
     local *{"${pkg}::_nvme_reap_orphan_namespaces"} = sub { push @calls, 'reaper'; return 0 };
     local *{"${pkg}::_delete_dataset_with_retry"} = sub {};
     local *{"${pkg}::run_command"} = sub {};

@@ -48,6 +48,7 @@ my (@events, @checked, $in_use);
     *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_assert_no_child_datasets"} = sub { 1 };
+    *{"${PKG}::_read_dataset_delete_identity"} = sub { return (guid => '1') };
     *{"${PKG}::_verify_devices_disconnected"} = sub { 1 };
     *{"${PKG}::_nvme_disconnect"} = sub { push @events, 'nvme_disconnect'; 1 };
     *{"${PKG}::_nvme_get_namespace_selector_metadata"} = sub {

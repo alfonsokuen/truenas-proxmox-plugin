@@ -18,6 +18,8 @@ no warnings 'redefine';
 local *{"${pkg}::_log"} = sub {};
 local *{"${pkg}::_clone_snapshot_zvol"} = sub { push @calls, 'clone' };
 local *{"${pkg}::_api_call"} = sub { [ { id => 1 } ] };
+# activate_volume exposes a snapshot under the storage lock.
+local *{"${pkg}::cluster_lock_storage"} = sub { $_[4]->(@_[5 .. $#_]) };
 local *{"${pkg}::_nvme_create_namespace_idempotent"} = sub { { device_uuid => $uuid } };
 local *{"${pkg}::_nvme_resync_configfs"} = sub {};
 local *{"${pkg}::_nvme_connect"} = sub {};

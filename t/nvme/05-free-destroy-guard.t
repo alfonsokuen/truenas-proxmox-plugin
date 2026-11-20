@@ -39,7 +39,7 @@ plan skip_all => "_free_image_nvme not found" unless $free;
 
 my @calls;      # every method the code tried to call, in order
 my %fail;       # method => error string to throw
-my ($gone, $namespace_gone);
+my ($gone, $namespace_gone, $array_empty);
 my $dataset = 'tank/pve/vm-101-disk-0';
 my $uuid = '5abc4321-9abc-4def-abcd-123456789012';
 
@@ -68,11 +68,15 @@ my $uuid = '5abc4321-9abc-4def-abcd-123456789012';
         die $fail{$method} if exists $fail{$method};
         $gone = 1 if $method eq 'pool.dataset.delete';
         die "[ENOENT] InstanceNotFound\n" if $gone && $method eq 'pool.dataset.get_instance';
-        # One namespace, pointing at our zvol.
-        return $namespace_gone ? [] : [
-            { id => 42, device_path => "zvol/$dataset", device_uuid => $uuid, nsid => 1, subsys => { id => 7 } },
-        ]
-            if $method eq 'nvmet.namespace.query';
+        # One namespace, pointing at our zvol. Once it is gone the path query is
+        # empty and the full listing still shows the rest of the array.
+        if ($method eq 'nvmet.namespace.query') {
+            return [{ id => 42, device_path => "zvol/$dataset", device_uuid => $uuid, nsid => 1, subsys => { id => 7 } }]
+                unless $namespace_gone;
+            return [] if $array_empty || ($params && $params->[0] && @{ $params->[0] });
+            return [{ id => 43, device_path => 'zvol/tank/pve/vm-999-disk-0',
+                device_uuid => '6abc4321-9abc-4def-abcd-123456789012', nsid => 2, subsys => { id => 7 } }];
+        }
         return [] if $method eq 'nvmet.subsys.query';
         # a real dataset object carries its (here empty) children list
         return { id => $dataset, type => 'VOLUME', guid => { rawvalue => '123456789' }, children => [] }
@@ -158,6 +162,17 @@ sub destroyed {
     ok($ok, 'a namespace that was already gone does not block the free')
         or diag("died with: $err");
     ok(destroyed($calls), '...and the dataset is still destroyed');
+}
+
+# An empty full listing is the documented transient answer: with the UUID known
+# it cannot confirm the namespace is gone, so the zvol stays.
+{
+    $array_empty = 1;
+    my ($ok, $err, $calls) = run_free('nvmet.namespace.delete' => "InstanceNotFound: does not exist
+");
+    $array_empty = 0;
+    ok(!$ok, 'an empty full listing after an already-gone delete is inconclusive');
+    is(destroyed($calls), 0, '...and the dataset is NOT destroyed');
 }
 
 # ---------------------------------------------------------------------------

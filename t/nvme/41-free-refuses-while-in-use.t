@@ -46,6 +46,7 @@ my (@events, @checked, $selector, $selector_dies, $resolve_err, $in_use, $datase
     *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_assert_no_child_datasets"} = sub { 1 };
+    *{"${PKG}::_read_dataset_delete_identity"} = sub { return (guid => '1') };
     *{"${PKG}::_nvme_disconnect"} = sub { push @events, 'nvme_disconnect'; 1 };
     *{"${PKG}::_nvme_find_device_by_subsystem"} = sub {
         push @events, 'lookup';

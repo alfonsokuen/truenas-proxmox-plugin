@@ -23,6 +23,9 @@ my $during_child_check;
     ${"${pkg}::_PRUNE_PVE_ROOT"} = $root;
     $INC{'PVE/Cluster.pm'} = __FILE__;
     *PVE::Cluster::check_cfs_quorum = sub { return $quorate };
+    $INC{'PVE/INotify.pm'} = __FILE__;
+    *PVE::INotify::nodename = sub { 'local' };
+    *{"${pkg}::_read_dataset_delete_identity"} = sub { return (guid => '123') };
     *{"${pkg}::_log"} = sub {};
     *{"${pkg}::_defer_after_lock"} = sub {};
     *{"${pkg}::_assert_no_child_datasets"} = sub {
@@ -93,6 +96,14 @@ subtest '2 only other guests referencing the same disk block a free' => sub {
         is(ref(eval { free_volume() }), 'CODE', "$flow permits the owner's reference") or diag $@;
         is_deeply(\@mutations, [qw(mark namespace)], "$flow actually unpublishes the disk");
     }
+
+    # PVE frees on the owner's node; an owner config elsewhere may be running.
+    guest_index(101 => { node => 'remote', type => 'qemu' });
+    put('nodes/remote/qemu-server/101.conf', "scsi0: store:$vol
+");
+    ok(!eval { free_volume(); 1 }, 'remoteOwner=BLOCK: the owner on another node still protects its disk');
+    like($@, qr/guest 101 on node 'remote'/, 'the refusal names the remote owner');
+    is_deeply(\@mutations, [], 'a remote owner permits zero mutations');
 
     guest_index(900 => { node => 'remote', type => 'qemu' });
     my $remote = 'nodes/remote/qemu-server/900.conf';

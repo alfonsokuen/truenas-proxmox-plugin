@@ -3340,16 +3340,18 @@ sub _delete_dataset_with_retry {
 
     my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
     my $verify = $opts && $opts->{verify_gone};
-    my ($identity_property, $identity);
+    # A caller that captured the generation earlier pins every delete to it.
+    my ($identity_property, $identity) = $verify && $opts->{identity} ? @{ $opts->{identity} } : ();
 
     for my $attempt (1..$max_retries) {
+        $opts->{before_delete}->() if $opts && $opts->{before_delete};
         if ($verify) {
-            # A name is reusable while we wait or after an ambiguous result.
+            # A name is reusable while we wait or after an ambiguous result,
+            # so read the generation right before each delete.
             my ($property, $current) = _read_dataset_delete_identity($scfg, $full_ds, $identity_property);
             return if !defined($current) || (defined($identity) && $current ne $identity);
             ($identity_property, $identity) = ($property, $current);
         }
-        $opts->{before_delete}->() if $opts && $opts->{before_delete};
         eval {
             _log($scfg, 1, 'info', "[TrueNAS] Deleting dataset $full_ds (attempt $attempt/$max_retries)");
             my $result = _api_call_mutate($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
@@ -4081,8 +4083,9 @@ sub volume_resize {
         # this subsystem was successfully rescanned.
         my $rescanned = _nvme_rescan_subsystem_controllers($scfg)
             || _nvme_rescan_controller_fallback($scfg);
-        _log($scfg, 0, 'warning', "[TrueNAS] volume_resize: no NVMe controller rescanned after resizing $volname")
-            if !$rescanned;
+        die "[TrueNAS] Resized $volname on TrueNAS, but no NVMe controller rescanned; "
+            . "the local device may still report its previous size.
+" unless $rescanned;
     }
     run_command(['udevadm','settle'], outfunc => sub {});
     select(undef, undef, undef, 0.25); # ~250ms
@@ -9160,6 +9163,7 @@ my %NVME_SELECTOR_REASON_LABELS = (
     subsystem_not_visible                                 => 'NVMe subsystem is not visible in Linux sysfs',
     sysfs_enumeration_failed                              => 'a sysfs listing or attribute read failed, so the visible devices are not known',
     sysfs_changed_during_walk                             => 'the NVMe sysfs entries kept changing during enumeration',
+    identity_contradiction                                => 'a device matching the NGUID reports a different namespace UUID',
 );
 
 sub _nvme_selector_reason_label {
@@ -9324,6 +9328,18 @@ sub _nvme_select_namespace_device {
 
             for my $dev (@preferred) {
                 if ($dev->{nguid} && $dev->{nguid} eq $target_nguid) {
+                    # A UUID naming another namespace outweighs the NGUID match.
+                    if (defined($device_uuid) && $device_uuid =~ /[1-9a-f]/i
+                        && ($dev->{uuid} // '') =~ /[1-9a-f]/i && lc($dev->{uuid}) ne lc($device_uuid)) {
+                        _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: $dev->{path} matches NGUID "
+                            . "$target_nguid but reports UUID $dev->{uuid}, not $device_uuid; selecting nothing");
+                        return _nvme_selector_result(
+                            linux_device_count => $linux_device_count,
+                            api_namespace_count => $api_namespace_count,
+                            selector_outcome => 'metadata_failure',
+                            mismatch_reason => 'identity_contradiction',
+                        );
+                    }
                     my $selected = $prefer_head->($dev);
                     _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $selected by NGUID (NSID: $dev->{nsid})");
                     return _nvme_selector_result(
@@ -10764,6 +10780,12 @@ sub _nvme_confirm_namespaces_for_path {
     if (!$valid->($rows) || !@$rows || grep { $_->{device_path} ne $path } @$rows) {
         my $all = _api_call($scfg, 'nvmet.namespace.query', [], { retry_opts => { retry_max => 0 } });
         die "Could not verify NVMe namespace state for $path: invalid full listing\n" unless $valid->($all);
+        # An empty full listing is the documented transient answer, not proof:
+        # a known UUID or a row from the first query says the export existed.
+        die "Could not verify NVMe namespace for $path: the full listing is empty although "
+          . (defined($uuid) ? "the volume names UUID $uuid" : 'the path query returned a row')
+          . "; leaving the namespace and its zvol in place\n"
+            if !@$all && (defined($uuid) || (ref($rows) eq 'ARRAY' && @$rows));
         die "Could not verify NVMe namespace for $path: its UUID points at a different zvol\n"
             if defined($uuid) && grep { lc($_->{device_uuid}) eq lc($uuid) && $_->{device_path} ne $path } @$all;
         $rows = [grep { $_->{device_path} eq $path } @$all];
@@ -11159,7 +11181,7 @@ sub _nvme_delete_namespace {
 
     my @failed;
     for my $ns (@$namespaces) {
-        $before_delete->() if $before_delete;
+        $before_delete->($ns) if $before_delete;
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_delete_namespace: deleting namespace id=$ns->{id}");
         eval {
             _api_call($scfg, 'nvmet.namespace.delete', [$ns->{id}], { retry_opts => { retry_max => 0 } });
@@ -12480,6 +12502,12 @@ sub _guest_config_disk_refs {
     return @refs;
 }
 
+# The name pmxcfs files this node's guests under (POSIX::uname keeps a domain).
+sub _pve_nodename {
+    require PVE::INotify;
+    return PVE::INotify::nodename();
+}
+
 sub _assert_cluster_unreferenced {
     my ($storeid, $volname, $uuid) = @_;
     my (undef, $zname, $owner) = __PACKAGE__->parse_volname($volname);
@@ -12502,8 +12530,10 @@ sub _assert_cluster_unreferenced {
             my ($guestnode) = ($entry->{node} // '') =~ /\A([A-Za-z0-9_-]+)\z/;
             my $type = $entry->{type} // '';
             die "invalid pmxcfs location for guest $id\n" unless defined($guestnode) && ($type eq 'qemu' || $type eq 'lxc');
-            # PVE calls vdisk_free before persisting the owner's disk removal.
-            next if defined($owner) && $guestid == $owner;
+            # PVE calls vdisk_free before persisting the owner's disk removal,
+            # on the node that holds the owner's config. An owner on another
+            # node may still be running there, out of reach of the local probe.
+            next if defined($owner) && $guestid == $owner && $guestnode eq _pve_nodename();
             my $kind = $type eq 'qemu' ? 'qemu-server' : 'lxc';
             my $path = "$root/nodes/$guestnode/$kind/$guestid.conf";
             my $text = _prune_read_file($path);
@@ -12639,8 +12669,10 @@ sub _free_image_nvme {
                 . "nothing exported to check for local use");
         }
     }
-    if (defined $local_uuid) {
-        my $found = eval { _nvme_find_device_by_subsystem($scfg, $local_uuid) };
+    my %use_checked;
+    my $assert_unused_here = sub {
+        my ($uuid) = @_;
+        my $found = eval { _nvme_find_device_by_subsystem($scfg, $uuid) };
         my $dev = _nvme_free_local_device($volname, $found, $@);
         if (defined $dev && _nvme_check_devices_in_use($scfg, $dev)) {
             die "[TrueNAS] refusing to free '$volname': its device $dev is still in use on this node "
@@ -12648,7 +12680,9 @@ sub _free_image_nvme {
               . "and leave the zvol $full_ds orphaned and invisible to list_images. "
               . "Stop whatever uses the volume (shut down the guest, unmount) and retry.\n";
         }
-    }
+        $use_checked{lc $uuid} = 1;
+    };
+    $assert_unused_here->($local_uuid) if defined $local_uuid;
 
     # Helper to detect "in use" errors
     my $in_use = sub {
@@ -12659,8 +12693,23 @@ sub _free_image_nvme {
     my $need_force_disconnect = 0;
 
     my $assert_free = sub { _assert_nvme_cluster_unreferenced($class, $storeid, $volname, $zname, $local_uuid) };
+    # The lookups above can miss an export that the delete's own query finds:
+    # check each namespace not yet checked right before deleting it.
+    my $before_ns_delete = sub {
+        my ($ns) = @_;
+        $assert_free->();
+        my $ns_uuid = ref($ns) eq 'HASH' ? $ns->{device_uuid} // '' : '';
+        die "[TrueNAS] refusing to free '$volname': a namespace for it has no UUID to check for local use
+"
+            if $ns_uuid eq '';
+        $assert_unused_here->($ns_uuid) unless $use_checked{lc $ns_uuid};
+    };
     my $dataset = _assert_no_child_datasets($scfg, $full_ds);
     $assert_free->();
+    # Pin the deferred delete to this generation before anything is unpublished:
+    # an unreadable identity stops the free while the disk is still exported,
+    # and a zvol that reuses the name later is not this free's to delete.
+    my @identity = $dataset ? _read_dataset_delete_identity($scfg, $full_ds) : ();
     my $marked = $dataset && eval {
         _nvme_pending_free_mark($scfg, $full_ds, join(':', int(time()), $storeid, $volname));
         1;
@@ -12677,7 +12726,7 @@ sub _free_image_nvme {
 
     # 1) Delete NVMe namespace
     my $ok = eval {
-        _nvme_delete_namespace($scfg, $zname, $full_ds, $local_uuid, $assert_free);
+        _nvme_delete_namespace($scfg, $zname, $full_ds, $local_uuid, $before_ns_delete);
         1;
     };
     if (!$ok) {
@@ -12783,7 +12832,7 @@ sub _free_image_nvme {
 
             # Retry namespace deletion
             eval {
-                _nvme_delete_namespace($scfg, $zname, $full_ds, $local_uuid, $assert_free);
+                _nvme_delete_namespace($scfg, $zname, $full_ds, $local_uuid, $before_ns_delete);
             };
             if (my $retry_err = $@) {
                 # The namespace is still exported. Carrying on would hand the
@@ -12862,11 +12911,13 @@ sub _free_image_nvme {
     return sub {
         my $upid = shift;
         eval {
+            # No generation was pinned when nothing existed at the start.
+            return unless @identity;
             _udev_settle_bounded();
             _assert_no_child_datasets($delete_scfg, $delete_full_ds);
             $assert_free->();
             eval { _delete_dataset_with_retry($delete_scfg, $delete_full_ds, undef,
-                { verify_gone => 1, before_delete => $assert_free }); 1 }
+                { verify_gone => 1, identity => \@identity, before_delete => $assert_free }); 1 }
                 or do {
                     my $err = $@;
                     die $err unless _is_dataset_absent_error($err);
@@ -14345,7 +14396,10 @@ sub activate_volume {
     # own device so LXC vzdump snapshot backups can read it. path() resolves the
     # same clone; deactivate_volume tears it down.
     if (defined($snapname) && $snapname ne '') {
-        $class->_expose_snapshot_device($scfg, $volname, $snapname);
+        # Overlapping activations reuse one clone and export; the storage lock
+        # keeps a failing one from rolling back what another is reading.
+        my $expose = sub { $class->_expose_snapshot_device($scfg, $volname, $snapname) };
+        $_storage_lock_held{$storeid} ? $expose->() : $class->cluster_lock_storage($storeid, 1, undef, $expose);
         return 1;
     }
 

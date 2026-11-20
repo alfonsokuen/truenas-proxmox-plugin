@@ -22,6 +22,7 @@ ok(defined &main, 'loaded the real broker supervisor');
 {
     package BrokerTest::Listener;
     sub close {}
+    sub shutdown { 1 }
 }
 
 my ($elapsed, $reaped, $ready) = (0, 0, 0);
