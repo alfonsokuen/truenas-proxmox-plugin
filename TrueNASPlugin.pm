@@ -14238,8 +14238,13 @@ sub _expose_snapshot_device {
         }
     };
     if (my $err = $@) {
-        if ($created_clone) {
-            eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname, \%created) };
+        # Undo only what THIS activation created. A clone it found already
+        # there keeps living (another activation may be reading it), but an
+        # extent/namespace it added to that clone is its own and is retired,
+        # or it stayed exported with nobody left to tear it down.
+        if ($created_clone || grep { defined } values %created) {
+            eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname, \%created,
+                { keep_clone => !$created_clone }) };
             $class->_log_clone_teardown_failure($scfg, '_expose_snapshot_device rollback', $volname, $snapname, $@) if $@;
         }
         die $err;
@@ -14270,7 +14275,7 @@ sub _log_clone_teardown_failure {
 }
 
 sub _teardown_snapshot_device {
-    my ($class, $scfg, $volname, $snapname, $created) = @_;
+    my ($class, $scfg, $volname, $snapname, $created, $opts) = @_;
 
     my (undef, $zname) = $class->parse_volname($volname);
     my ($clone_zname, $clone_full) = _snapshot_clone_paths($scfg, $zname, $snapname);
@@ -14280,6 +14285,23 @@ sub _teardown_snapshot_device {
     # Pin the clone's generation while it is still exported: an unreadable
     # identity dies here, before the export is retired or anything deleted.
     my @identity = _read_dataset_delete_identity($scfg, $clone_full);
+
+    # The clone name is deterministic per snapshot, so another activation can
+    # re-create it while this teardown runs. Re-read the generation right
+    # before retiring the export and before the delete: a clone that was
+    # absent at the start, or whose generation changed (or vanished), is not
+    # the one this teardown pinned, so neither its export nor the dataset is
+    # touched. Absent from start to end stays an idempotent no-op.
+    my $changed;
+    my $assert_same_clone = sub {
+        my (undef, $now) = _read_dataset_delete_identity($scfg, $clone_full, $identity[0]);
+        return if !@identity && !defined($now);
+        return if @identity && defined($now) && $now eq $identity[1];
+        $changed = "snapshot clone $clone_full is no longer the generation this teardown pinned ("
+            . (@identity ? "$identity[0] $identity[1]" : 'absent') . ' at the start, now '
+            . ($now // 'absent') . "); leaving it and its export in place\n";
+        die $changed;
+    };
 
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
@@ -14318,6 +14340,8 @@ sub _teardown_snapshot_device {
                 }
             }
 
+            $assert_same_clone->() if $extent;
+
             # Flush multipath map for this clone's WWID (derived from extent NAA).
             if ($scfg->{tn_use_multipath} && $extent && $extent->{naa} && $extent->{naa} =~ /^0x/i) {
                 (my $flush_wwid = lc($extent->{naa})) =~ s/^0x/3/;
@@ -14355,14 +14379,15 @@ sub _teardown_snapshot_device {
             }
             _clear_cache(_cache_host_key($scfg));
         };
+        die $changed if $changed;
         die $@ if $created && $@;
         warn "[TrueNAS] _teardown_snapshot_device: iSCSI cleanup failed: $@\n" if $@;
 
     } elsif ($mode eq 'nvme-tcp') {
-        _nvme_delete_namespace($scfg, $clone_zname, $clone_full, undef, undef, $created)
+        _nvme_delete_namespace($scfg, $clone_zname, $clone_full, undef, $assert_same_clone, $created)
             if $created;
         if (!$created) {
-            eval { _nvme_delete_namespace($scfg, $clone_zname, $clone_full) };
+            eval { _nvme_delete_namespace($scfg, $clone_zname, $clone_full, undef, $assert_same_clone) };
             die "[TrueNAS] _teardown_snapshot_device: namespace delete failed: $@" if $@;
         }
     }
@@ -14387,9 +14412,17 @@ sub _teardown_snapshot_device {
     # verify_gone: TrueNAS 26.0 BETA.36 can answer pool.dataset.delete with
     # success while the zvol is still live (a holder has the device open), so
     # for the clone a "success" is confirmed by reading the dataset back.
+    # A rollback that reused an existing clone retires only its own export.
+    return if $opts && $opts->{keep_clone};
     _udev_settle_bounded();
+    # Without a pinned generation the delete would adopt whatever clone now
+    # carries the name; one that appeared after the initial ENOENT is not ours.
+    if (!@identity) {
+        $assert_same_clone->();
+        return;
+    }
     eval { _delete_dataset_with_retry($scfg, $clone_full, undef,
-        { verify_gone => 1, identity => (@identity ? \@identity : undef) }) };
+        { verify_gone => 1, identity => \@identity }) };
     if (my $err = $@) {
         die "[TrueNAS] _teardown_snapshot_device: could not delete the snapshot clone $clone_full: $err";
     }
