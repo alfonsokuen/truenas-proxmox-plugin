@@ -31,6 +31,8 @@ $INC{'PVE/Cluster.pm'} = $INC{'PVE/INotify.pm'} = __FILE__;
 *PVE::INotify::nodename = sub { 'local' };
 local *{"${pkg}::_log"} = sub {};
 local *{"${pkg}::_defer_after_lock"} = sub {};
+# The delete worker takes the storage lock per attempt; no real cluster here.
+local *{"${pkg}::cluster_lock_storage"} = sub { $_[4]->(@_[5 .. $#_]) };
 local *{"${pkg}::_invalidate_status_capacity_cache"} = sub {};
 local *{"${pkg}::_udev_settle_bounded"} = sub {};
 local *{"${pkg}::_backoff_sleep"} = sub {};

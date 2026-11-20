@@ -47,6 +47,8 @@ my $uuid = '5abc4321-9abc-4def-abcd-123456789012';
     no strict 'refs';
     no warnings 'redefine';
     *{"${PKG}::_log"} = sub { 1 };
+    # The delete worker takes the storage lock per attempt; no real cluster here.
+    *{"${PKG}::cluster_lock_storage"} = sub { $_[4]->(@_[5 .. $#_]) };
     # Keep the destructive steps off any real machine while still recording
     # the intent. The fixture's namespace is exported but not attached here.
     *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };

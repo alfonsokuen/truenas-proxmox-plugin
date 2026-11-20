@@ -73,6 +73,8 @@ sub exported_namespace {
     no strict 'refs';
     no warnings 'redefine';
     *{"${PKG}::_log"} = sub { push @logs, [@_[1..3]]; 1 };
+    # The delete worker takes the storage lock per attempt; no real cluster here.
+    *{"${PKG}::cluster_lock_storage"} = sub { $_[4]->(@_[5 .. $#_]) };
     # Keep the destructive steps off any real machine while still recording
     # the intent. The fixture's namespaces are exported but not attached here.
     *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };

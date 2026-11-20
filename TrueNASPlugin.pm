@@ -3342,35 +3342,33 @@ sub _delete_dataset_with_retry {
     my $verify = $opts && $opts->{verify_gone};
     # A caller that captured the generation earlier pins every delete to it.
     my ($identity_property, $identity) = $verify && $opts->{identity} ? @{ $opts->{identity} } : ();
+    # Optional wrapper for one attempt (read identity, delete, wait, verify).
+    # A caller holding a name that the allocator may reuse passes the storage
+    # lock here, so no new generation can appear between the read and the
+    # delete by name. Backoff sleeps stay outside it.
+    my $serialize = $opts && $opts->{serialize};
 
     for my $attempt (1..$max_retries) {
-        $opts->{before_delete}->() if $opts && $opts->{before_delete};
-        if ($verify) {
-            # A name is reusable while we wait or after an ambiguous result,
-            # so read the generation right before each delete.
-            my ($property, $current) = _read_dataset_delete_identity($scfg, $full_ds, $identity_property);
-            return if !defined($current) || (defined($identity) && $current ne $identity);
-            ($identity_property, $identity) = ($property, $current);
+        my $outcome;
+        if ($serialize) {
+            # Carry the error out as data: the lock wrapper rewrites messages
+            # that the callers match on.
+            my $box = $serialize->(sub {
+                my $r = eval { _delete_dataset_attempt($scfg, $full_ds, $attempt, $max_retries,
+                    $payload, $opts, \$identity_property, \$identity) };
+                return { outcome => $r, err => $@ };
+            });
+            die "dataset deletion attempt for $full_ds returned no outcome\n" if ref($box) ne 'HASH';
+            die $box->{err} if $box->{err};
+            $outcome = $box->{outcome};
+        } else {
+            $outcome = _delete_dataset_attempt($scfg, $full_ds, $attempt, $max_retries,
+                $payload, $opts, \$identity_property, \$identity);
         }
-        eval {
-            _log($scfg, 1, 'info', "[TrueNAS] Deleting dataset $full_ds (attempt $attempt/$max_retries)");
-            my $result = _api_call_mutate($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
-                $verify ? { retry_opts => { retry_max => 0 } } : undef);
+        return if !$outcome;
 
-            my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
-            if (!$job_result->{success}) {
-                die $job_result->{error};
-            }
-            _invalidate_status_capacity_cache(undef, $scfg);
-            _log($scfg, 1, 'info', "[TrueNAS] Successfully deleted dataset $full_ds");
-        };
-
-        if (!$@) {
-            return if !$verify;
-            my (undef, $current) = _read_dataset_delete_identity($scfg, $full_ds, $identity_property);
-            return if !defined($current) || $current ne $identity;
-            my $masked = "pool.dataset.delete reported success but "
-                . "pool.dataset.get_instance still finds $full_ds (TN masked EBUSY)";
+        if (defined $outcome->{masked}) {
+            my $masked = $outcome->{masked};
             if ($attempt < $max_retries && _retry_time_left()) {
                 my $delay = 2 ** ($attempt - 1);
                 _log($scfg, 1, 'warning', "[TrueNAS] $masked; retrying in ${delay}s ($attempt/$max_retries)");
@@ -3385,20 +3383,9 @@ sub _delete_dataset_with_retry {
             die "$masked, $why_stop\n";
         }
 
-        my $err = $@;
-        my $error_info = _parse_dataset_error($err);
-
-        # If already gone, treat as success
-        if ($error_info->{type} eq 'not_found') {
-            # The phrase can come from a transport failure; ask the array
-            # before calling it done (dies unless absence is confirmed).
-            _confirm_dataset_gone($scfg, $full_ds, $err);
-            _log($scfg, 2, 'debug', "[TrueNAS] Dataset $full_ds already deleted");
-            return;
-        }
-
+        my $err = $outcome->{busy};
         # If busy and more retries available, wait and retry
-        if ($error_info->{type} eq 'busy' && $attempt < $max_retries && _retry_time_left()) {
+        if ($attempt < $max_retries && _retry_time_left()) {
             my $delay = 2 ** ($attempt - 1);  # Exponential backoff: 1s, 2s, 4s
             _log($scfg, 1, 'info', "[TrueNAS] Dataset busy, retrying in ${delay}s... ($err)");
             _backoff_sleep($delay);
@@ -3409,54 +3396,104 @@ sub _delete_dataset_with_retry {
             }
             next;
         }
-
-        # An abandoned wait says nothing about whether the delete worked: the
-        # job was accepted, and a destroy of a large or heavily-snapshotted
-        # zvol routinely outlives the wait window and completes on its own.
-        # Dying with the raw timeout here reported "the delete failed" for
-        # deletes that had in fact succeeded, inviting exactly the wrong manual
-        # intervention. Look at the dataset before deciding what to report, and
-        # do not re-issue the delete - the first job may still be running, and
-        # a second recursive force destroy racing it is not a state anyone can
-        # reason about.
-        if ($error_info->{type} eq 'indeterminate') {
-            chomp(my $why = $err);
-            my $ds_check = eval { _tn_dataset_get($scfg, $full_ds) };
-            my $check_err = $@;
-            if (!$ds_check && $check_err && _is_dataset_absent_error($check_err)) {
-                _log($scfg, 0, 'warning',
-                    "[TrueNAS] Deletion of dataset $full_ds outlived its wait "
-                  . "window but the dataset is gone - treating as success ($why)");
-                _invalidate_status_capacity_cache(undef, $scfg);
-                return;
-            }
-            if ($ds_check) {
-                die "stopped waiting for the deletion of $full_ds: $why\n"
-                  . "The dataset was still present when checked, but the TrueNAS "
-                  . "deletion job may still be running and may yet complete on its "
-                  . "own. This is 'we gave up waiting', not 'the delete failed': "
-                  . "check the job in the TrueNAS UI before intervening manually, "
-                  . "then re-run the free.\n";
-            }
-            die "stopped waiting for the deletion of $full_ds ($why), and could "
-              . "not verify whether the dataset is gone. Outcome unknown; re-run "
-              . "the free once the TrueNAS API answers.\n"
-              . "  verification failure: $check_err";
-        }
-
-        # Otherwise, this is a real error. For a busy dataset say how many attempts
-        # really happened and why the retrying stopped, as the other stop paths do.
-        if ($error_info->{type} eq 'busy') {
-            chomp(my $busy_cause = $err);
-            my $stop = ($attempt < $max_retries)
-                ? 'the deadline was spent before the next retry' : 'retries exhausted';
-            die "Dataset $full_ds still busy; stopped after $attempt attempt(s) ($stop): $busy_cause\n";
-        }
-        die $err;
+        # A busy dataset: say how many attempts really happened and why the
+        # retrying stopped, as the other stop paths do.
+        chomp(my $busy_cause = $err);
+        my $stop = ($attempt < $max_retries)
+            ? 'the deadline was spent before the next retry' : 'retries exhausted';
+        die "Dataset $full_ds still busy; stopped after $attempt attempt(s) ($stop): $busy_cause\n";
     }
 
     # Should not reach here, but if we do, it means all retries failed
     die "Failed to delete dataset $full_ds after $max_retries attempts";
+}
+
+# One delete attempt of _delete_dataset_with_retry. Returns false when done
+# (deleted, gone, or another generation now owns the name), { masked => $msg }
+# when the dataset survived a reported success, { busy => $err } for a busy
+# error; dies otherwise. Retry decisions and sleeps belong to the caller.
+sub _delete_dataset_attempt {
+    my ($scfg, $full_ds, $attempt, $max_retries, $payload, $opts, $identity_property_ref, $identity_ref) = @_;
+    my $verify = $opts && $opts->{verify_gone};
+
+    $opts->{before_delete}->() if $opts && $opts->{before_delete};
+    if ($verify) {
+        # A name is reusable while we wait or after an ambiguous result,
+        # so read the generation right before each delete.
+        my ($property, $current) = _read_dataset_delete_identity($scfg, $full_ds, $$identity_property_ref);
+        return if !defined($current) || (defined($$identity_ref) && $current ne $$identity_ref);
+        ($$identity_property_ref, $$identity_ref) = ($property, $current);
+    }
+    eval {
+        _log($scfg, 1, 'info', "[TrueNAS] Deleting dataset $full_ds (attempt $attempt/$max_retries)");
+        my $result = _api_call_mutate($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
+            $verify ? { retry_opts => { retry_max => 0 } } : undef);
+
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
+        if (!$job_result->{success}) {
+            die $job_result->{error};
+        }
+        _invalidate_status_capacity_cache(undef, $scfg);
+        _log($scfg, 1, 'info', "[TrueNAS] Successfully deleted dataset $full_ds");
+    };
+
+    if (!$@) {
+        return if !$verify;
+        my (undef, $current) = _read_dataset_delete_identity($scfg, $full_ds, $$identity_property_ref);
+        return if !defined($current) || $current ne $$identity_ref;
+        return { masked => "pool.dataset.delete reported success but "
+            . "pool.dataset.get_instance still finds $full_ds (TN masked EBUSY)" };
+    }
+
+    my $err = $@;
+    my $error_info = _parse_dataset_error($err);
+
+    # If already gone, treat as success
+    if ($error_info->{type} eq 'not_found') {
+        # The phrase can come from a transport failure; ask the array
+        # before calling it done (dies unless absence is confirmed).
+        _confirm_dataset_gone($scfg, $full_ds, $err);
+        _log($scfg, 2, 'debug', "[TrueNAS] Dataset $full_ds already deleted");
+        return;
+    }
+
+    return { busy => $err } if $error_info->{type} eq 'busy';
+
+    # An abandoned wait says nothing about whether the delete worked: the
+    # job was accepted, and a destroy of a large or heavily-snapshotted
+    # zvol routinely outlives the wait window and completes on its own.
+    # Dying with the raw timeout here reported "the delete failed" for
+    # deletes that had in fact succeeded, inviting exactly the wrong manual
+    # intervention. Look at the dataset before deciding what to report, and
+    # do not re-issue the delete - the first job may still be running, and
+    # a second recursive force destroy racing it is not a state anyone can
+    # reason about.
+    if ($error_info->{type} eq 'indeterminate') {
+        chomp(my $why = $err);
+        my $ds_check = eval { _tn_dataset_get($scfg, $full_ds) };
+        my $check_err = $@;
+        if (!$ds_check && $check_err && _is_dataset_absent_error($check_err)) {
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] Deletion of dataset $full_ds outlived its wait "
+              . "window but the dataset is gone - treating as success ($why)");
+            _invalidate_status_capacity_cache(undef, $scfg);
+            return;
+        }
+        if ($ds_check) {
+            die "stopped waiting for the deletion of $full_ds: $why\n"
+              . "The dataset was still present when checked, but the TrueNAS "
+              . "deletion job may still be running and may yet complete on its "
+              . "own. This is 'we gave up waiting', not 'the delete failed': "
+              . "check the job in the TrueNAS UI before intervening manually, "
+              . "then re-run the free.\n";
+        }
+        die "stopped waiting for the deletion of $full_ds ($why), and could "
+          . "not verify whether the dataset is gone. Outcome unknown; re-run "
+          . "the free once the TrueNAS API answers.\n"
+          . "  verification failure: $check_err";
+    }
+
+    die $err;
 }
 
 # ======== WebSocket API operations ========
@@ -12940,8 +12977,20 @@ sub _free_image_nvme {
             _udev_settle_bounded();
             _assert_no_child_datasets($delete_scfg, $delete_full_ds);
             $assert_free->();
+            # Two workers of the same free can overlap, and between one's
+            # identity read and its delete by name the other can delete and
+            # the allocator reuse the name. Alloc, free and clone run under the
+            # storage lock, so each attempt takes it too (re-entrant when this
+            # process already holds it); the backoff sleeps stay outside.
+            # tn_use_cluster_lock=0 opts out of the lock, and of this.
+            my $serialize = sub {
+                my ($attempt) = @_;
+                return $attempt->() if $_storage_lock_held{$storeid};
+                return $class->cluster_lock_storage($storeid, 1, undef, $attempt);
+            };
             eval { _delete_dataset_with_retry($delete_scfg, $delete_full_ds, undef,
-                { verify_gone => 1, identity => \@identity, before_delete => $assert_free }); 1 }
+                { verify_gone => 1, identity => \@identity, before_delete => $assert_free,
+                  serialize => $serialize }); 1 }
                 or do {
                     my $err = $@;
                     die $err unless _is_dataset_absent_error($err);

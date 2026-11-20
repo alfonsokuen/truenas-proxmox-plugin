@@ -26,6 +26,8 @@ my ($ns_answer, $subsys_answer, $busy, $disconnects, $deletes, $ns_calls, $retry
     no strict 'refs'; no warnings 'redefine';
     *{"${PKG}::_log"} = sub { push @log0, $_[3] if $_[1] == 0; 1 };
     *{"${PKG}::_defer_after_lock"} = sub { 1 };
+    # The delete worker takes the storage lock per attempt; no real cluster here.
+    *{"${PKG}::cluster_lock_storage"} = sub { $_[4]->(@_[5 .. $#_]) };
     *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
     *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
     *{"${PKG}::_tn_dataset_get"} = sub {
