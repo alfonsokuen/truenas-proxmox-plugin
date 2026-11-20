@@ -42,8 +42,18 @@
 25. Un resize que no rescanea ningún controlador NVMe termina con error.
 26. Si un zvol tiene más de un namespace, o uno con otro UUID, el borrado no retira ninguno y termina con error.
 27. El desmontaje del clon de vzdump fija su identidad ZFS antes de retirar la exportación; si no puede leerla, no retira ni borra nada.
+28. Reintentar un resize que ya amplió el zvol en TrueNAS ya no se rechaza como reducción: no vuelve a ampliar y solo repite el rescan.
+29. Al reiniciarse, el broker retira el socket y sale enseguida (`KillMode=process`): el nuevo escucha en menos de un segundo y la petición en curso termina en su worker, acotada por una alarma.
+30. El borrado diferido del zvol de un free NVMe toma el lock de storage del clúster en cada intento (leer identidad, borrar, verificar); dos workers solapados del mismo free ya no borran la generación que el asignador crea con el mismo nombre.
+31. Liberar un disco NVMe ya no retira su namespace ni borra el zvol si un invitado de otro nodo lo referencia por la ruta by-id/UUID descubierta tarde.
+32. La comprobación de uso local se repite justo antes de retirar cada namespace NVMe; una enumeración anterior sin dispositivo ya no la exime.
+33. Dos respuestas vacías de namespaces NVMe ya no cuentan como «nada exportado»: hace falta un listado no vacío sin coincidencia o el zvol ausente.
+34. El desmontaje del clon de vzdump relee su generación antes de retirar la exportación y antes de borrarlo; un clon recreado por otra activación conserva exportación y dataset.
+35. Si falla una activación de snapshot, solo se deshace lo que ella creó: su namespace o extent sobre un clon preexistente se retira y el clon se conserva.
 
 Límites conocidos: un alias desde otro ID de storage o un CT remoto con `dev0` no bloquean; el sufijo `.raw` da un falso positivo; la primera actualización desde idk30 aún usa el handler TERM antiguo; el barrido iSCSI #147 se abstiene sin mapeos y puede no limpiar nunca; borrar el último namespace del array falla cerrado si TrueNAS ya no lo lista.
+
+Límites conocidos (ronda 6): un participante idk30 sin lock que reutiliza el clon creado por otra activación no está cubierto (haría falta un contador de referencias); con `tn_use_cluster_lock=0` vuelve la carrera del borrado diferido; un array sin ningún namespace no libera un cloud-init sin exportar y un clon de vzdump sin exportar con el listado vacío no se desmonta (ambos fallan cerrados); un mapping iSCSI creado sobre un extent reutilizado queda exportado si la activación falla; un worker del broker atascado más allá de su presupuesto muere por la alarma; al reiniciar, systemd avisa de los workers sobrantes y `systemctl stop` los deja vivos hasta que terminan su petición.
 
 ## Version 2.1.25~beta2 (November 19, 2026)
 
