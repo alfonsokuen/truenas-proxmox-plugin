@@ -3,15 +3,11 @@ use v5.36;
 use strict;
 use warnings;
 
-# Plugin Version. Base upstream real: 2.1.24 (release final, tag v2.1.24).
-# Hasta idk11 este fork declaro un "2.1.24" que entonces NO existia en
-# upstream; desde idk30 la base es la 2.1.24 de verdad. El paquete lleva
-# ademas epoch 1 (ver debian/changelog): el epoch es solo de empaquetado y
-# mantiene el fork por encima del repo apt de upstream, que esta configurado
-# en los nodos y si no nos sobreescribiria.
-our $VERSION = '2.1.24+idk30';
+# Plugin Version. Base upstream: 2.1.25~beta2.
+# El paquete conserva el epoch 1 para prevalecer sobre el APT de upstream.
+our $VERSION = '2.1.25~beta2+idk31';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 16;
+our $TESTED_APIVER = 17;
 use JSON::PP ();    # JSON::PP::true / JSON::PP::false stay this plugin's booleans
 # JSON::PP is pure Perl. Measured on a 352 KB answer (what dataset queries return):
 # decode 258 ms with JSON::PP against 4.8 ms with JSON::XS, and every answer goes
@@ -37,7 +33,7 @@ use IO::Socket::SSL;
 use IO::Select;
 use Time::HiRes qw(usleep);
 use POSIX ();
-use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL S_ISBLK);
 use Errno qw(EEXIST);
 use Socket qw(inet_ntoa inet_aton inet_pton inet_ntop getaddrinfo getnameinfo
     AF_INET AF_INET6 SOCK_STREAM NI_NUMERICHOST NIx_NOSERV);
@@ -200,6 +196,19 @@ sub _set_cache {
         timestamp => time()
     };
     return $data;
+}
+
+# Resolve the effective status()-capacity-cache TTL. One knob
+# (tn_status_capacity_ttl_s) controls both the in-process cache that
+# pvestatd consults each tick and the cross-process on-disk stamp a
+# fresh pvesm status picks up. Without a valid override, each cache
+# retains its existing default.
+sub _status_capacity_ttl_s {
+    my ($scfg, $default) = @_;
+    my $v = $scfg->{tn_status_capacity_ttl_s};
+    return $default // $STATUS_CAPACITY_TTL_S
+        if !defined($v) || $v !~ /^\d+$/ || $v < 1 || $v > 3600;
+    return $v + 0;
 }
 
 sub _clear_cache {
@@ -871,21 +880,65 @@ sub plugindata {
     return {
         content => [ { images => 1, rootdir => 1 }, { images => 1 } ],
         format  => [ { raw => 1 }, 'raw' ],
-        # Tuning knobs: collapsed under "Advanced" in the form PVE generates
-        # for custom plugins (pve-devel "GUI Support for Custom Storage
-        # Plugins"); ignored by PVE versions without that series.
-        'advanced-properties' => { map { $_ => 1 } qw(
-            tn_api_scheme tn_api_port tn_prefer_ipv4
-            tn_use_by_path tn_ipv6_by_path tn_debug
-            tn_force_delete_on_inuse tn_logout_on_free
-            tn_enable_bulk_operations
-            tn_api_retry_max tn_api_retry_delay tn_status_budget_s
-            tn_status_probe_backoff_s tn_nvme_max_io_kb tn_op_budget_s
-            tn_api_budget_s tn_broker_timeout tn_storage_lock_timeout
-            tn_use_cluster_lock
-            tn_device_ready_retries tn_nr_io_queues tn_nvme_ctrl_loss_tmo
-            tn_nvme_reconnect_delay tn_nvme_keep_alive_tmo
-        ) },
+        meta => { 'display-name' => 'TrueNAS' },
+        # GUI integration keys read by pve-manager 9.2.29+ via the
+        # /plugins/storage/plugin/<type> API route. The API layer uses
+        # these hashes to annotate each property's x-advanced / x-hidden /
+        # sensitive flag, overriding anything set per-property; older
+        # pve-manager versions silently ignore the keys.
+        'advanced-properties' => {
+            tn_chap_password => 1,
+            tn_chap_user => 1,
+            tn_compression => 1,
+            tn_debug => 1,
+            tn_enable_bulk_operations => 1,
+            tn_enable_live_snapshots => 1,
+            tn_force_delete_on_inuse => 1,
+            tn_hostnqn => 1,
+            tn_ipv6_by_path => 1,
+            tn_logout_on_free => 1,
+            tn_nvme_allow_any_host => 1,
+            tn_nvme_dhchap_ctrl_secret => 1,
+            tn_nvme_dhchap_secret => 1,
+            tn_nvme_manage_ports => 1,
+            tn_nvme_max_io_kb => 1,
+            tn_op_budget_s => 1,
+            tn_portals => 1,
+            tn_prefer_ipv4 => 1,
+            tn_snapshot_volume_chains => 1,
+            tn_sparse => 1,
+            tn_status_budget_s => 1,
+            tn_status_capacity_ttl_s => 1,
+            tn_use_by_path => 1,
+            tn_use_cluster_lock => 1,
+            tn_use_multipath => 1,
+            tn_vmstate_storage => 1,
+            tn_zvol_blocksize => 1,
+        },
+        # Hidden from the UI but still settable via `pvesm set` /
+        # storage.cfg. Candidates: deprecated shims, tunings whose
+        # defaults fit everyone we have seen in the field, and
+        # safety-net gates that only matter in last-resort troubleshooting.
+        'hidden-properties' => {
+            tn_api_transport           => 1,  # deprecated, always wss
+            tn_api_scheme              => 1,  # 99% wss
+            tn_api_port                => 1,  # 99% 443
+            tn_api_insecure            => 1,  # 99% off
+            tn_api_budget_s            => 1,  # default 120s
+            tn_api_retry_delay         => 1,  # default 1s
+            tn_api_retry_max           => 1,  # default 3
+            tn_broker_timeout          => 1,  # default 30s
+            tn_device_ready_retries    => 1,  # default 60s of retries
+            tn_storage_lock_timeout    => 1,  # only matters with the above
+            tn_status_probe_backoff_s  => 1,  # default 30s
+            tn_reconcile               => 1,  # #147 default is correct
+            tn_reconcile_grace_s       => 1,  # #147 default is correct
+            tn_reconcile_hint_ttl_s    => 1,  # #147 default is correct
+            tn_nr_io_queues            => 1,  # auto-detected
+            tn_nvme_ctrl_loss_tmo      => 1,  # NVMe kernel tuning
+            tn_nvme_keep_alive_tmo     => 1,  # NVMe kernel tuning
+            tn_nvme_reconnect_delay    => 1,  # NVMe kernel tuning
+        },
         # Routed by PVE's storage API (PVE::API2::Storage::Config) around
         # check_config instead of through it: on add/update, these are
         # extracted from the request into a separate %sensitive hash BEFORE
@@ -906,48 +959,51 @@ sub plugindata {
     };
 }
 
+
 # ======== Config schema (only plugin-specific keys) ========
 sub properties {
     return {
         # Transport & connection
         tn_api_host => {
-            title => 'API Host',
+            title => 'TrueNAS host',
             description => "TrueNAS hostname or IP (IPv6 literals must be bracketed, e.g. [fd00:1::1]).",
             type => 'string', format => 'pve-storage-portal-dns',
         },
         tn_api_key => {
-            title => 'API Key',
+            title => 'API key',
             description => "TrueNAS user-linked API key.",
             type => 'string',
         },
         tn_api_username => {
+            title => 'TrueNAS account',
             description => "TrueNAS account that owns the API key. Required by the SCRAM and SCRAM-PLUS authentication mechanisms (tn_auth_mechanism=scram or scram-plus); leaving it empty forces the legacy auth.login_with_api_key path (deprecated upstream; scheduled for removal in a future TrueNAS release).",
             type => 'string', optional => 1,
             format_description => 'account',
         },
         tn_auth_mechanism => {
+            title => 'Auth mechanism',
             description => "API-key authentication mechanism. 'auto' (default) prefers SCRAM when the server offers it, falling back to plain. 'scram' refuses to connect to servers that cannot do SCRAM-SHA-512. 'scram-plus' is the strict option: it requires SCRAM-SHA-512 with channel binding (tls-server-end-point) and refuses to connect otherwise. 'plain' never attempts SCRAM.",
             type => 'string', optional => 1,
             enum => ['auto','scram','scram-plus','plain'],
             default => 'auto',
         },
         tn_api_scheme => {
-            title => 'API Scheme',
+            title => 'API scheme',
             description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
             type => 'string', optional => 1,
         },
         tn_api_transport => {
-            title => 'API Transport (Legacy)',
+            title => 'Legacy transport (deprecated)',
             description => "Deprecated legacy transport selector. Ignored; WebSocket is always used.",
             type => 'string', optional => 1,
         },
         tn_api_port => {
-            title => 'API Port',
+            title => 'API port',
             description => "TCP port (defaults: 443 for wss, 80 for ws).",
             type => 'integer', optional => 1,
         },
         tn_api_insecure => {
-            title => 'Skip TLS Verification',
+            title => 'Skip TLS verification',
             description => "Skip TLS certificate verification.",
             type => 'boolean', optional => 1, default => 0,
         },
@@ -959,19 +1015,19 @@ sub properties {
 
         # Placement
         tn_dataset => {
-            title => 'Dataset',
+            title => 'Parent dataset',
             description => "Parent dataset for zvols (e.g. tank/proxmox).",
             type => 'string',
         },
         tn_zvol_blocksize => {
-            title => 'Zvol Block Size',
+            title => 'ZVOL blocksize',
             description => "ZVOL volblocksize (e.g. 16K, 64K).",
             type => 'string', optional => 1,
         },
 
         # Transport mode selection
         tn_transport_mode => {
-            title => 'Transport Mode',
+            title => 'Transport',
             description => "Storage transport protocol: 'iscsi' or 'nvme-tcp'.",
             type => 'string',
             enum => ['iscsi', 'nvme-tcp'],
@@ -981,97 +1037,97 @@ sub properties {
 
         # iSCSI target & portals
         tn_target_iqn => {
-            title => 'Target IQN',
+            title => 'iSCSI target IQN',
             description => "Shared iSCSI Target IQN on TrueNAS (or target's short name) - required for iSCSI transport.",
             type => 'string',
             optional => 1,
         },
         tn_discovery_portal => {
-            title => 'Discovery Portal',
+            title => 'iSCSI discovery portal',
             description => "Primary SendTargets portal (hostname[:port], IP[:port], or [IPv6]:port).",
             type => 'string',
         },
         tn_portals => {
-            title => 'Additional Portals',
+            title => 'Additional iSCSI portals',
             description => "Comma-separated additional portals.",
             type => 'string', optional => 1,
         },
 
         # Initiator pathing
         tn_use_multipath => {
-            title => 'Use Multipath',
+            title => 'Enable iSCSI multipath',
             description => "Enable multipath for connected block devices.",
             type => 'boolean', optional => 1, default => 1,
         },
         tn_force_delete_on_inuse => {
-            title => 'Force Delete When In Use',
+            title => 'Force delete on in-use LUN',
             description => 'Temporarily logout the target on this node to force delete when TrueNAS reports "target is in use". NOT hardened and not recommended: on NVMe/TCP the retry after the disconnect accepts an empty namespace query as "namespace absent", and the compensating reconnect is best effort. See wiki/Known-Limitations.md.',
             type => 'boolean',
             default => 'false',
         },
         tn_logout_on_free => {
-            title => 'Logout Target On Free',
+            title => 'Logout target after last free',
             description => 'After delete, logout the target if no LUNs remain for this node.',
             type => 'boolean',
             default => 'false',
         },
         tn_use_by_path => {
-            title => 'Use By-Path Devices',
+            title => 'Use /dev/disk/by-path names',
             description => "Use /dev/disk/by-path device names instead of /dev/disk/by-id (iSCSI only; ignored in nvme-tcp mode).",
             type => 'boolean', optional => 1, default => 0,
         },
         tn_ipv6_by_path => {
-            title => 'IPv6 By-Path Names',
+            title => 'Normalize IPv6 by-path names',
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
             type => 'boolean', optional => 1, default => 0,
         },
 
         # Debug level
         tn_debug => {
-            title => 'Debug Level',
+            title => 'Debug logging level',
             description => "Debug level: 0=none (errors only), 1=light (function calls), 2=verbose (full trace)",
             type => 'integer', optional => 1, default => 0, minimum => 0, maximum => 2,
         },
 
         # CHAP (optional - iSCSI only)
         tn_chap_user => {
-            title => 'CHAP User',
+            title => 'iSCSI CHAP user',
             description => "CHAP username for iSCSI discovery and session authentication.",
             type => 'string', optional => 1,
         },
         tn_chap_password => {
-            title => 'CHAP Password',
+            title => 'iSCSI CHAP password',
             description => "CHAP password for iSCSI discovery and session authentication.",
             type => 'string', optional => 1,
         },
 
         # NVMe/TCP parameters
         tn_subsystem_nqn => {
-            title => 'Subsystem NQN',
+            title => 'NVMe subsystem NQN',
             description => "NVMe subsystem NQN - required for nvme-tcp transport.",
             type => 'string',
             optional => 1,
         },
         tn_hostnqn => {
-            title => 'Host NQN',
+            title => 'Initiator host NQN',
             description => "NVMe host NQN (optional, auto-generated from /etc/nvme/hostnqn if not specified).",
             type => 'string',
             optional => 1,
         },
         tn_nvme_dhchap_secret => {
-            title => 'DHCHAP Host Secret',
+            title => 'NVMe DH-HMAC-CHAP secret',
             description => "DH-HMAC-CHAP host authentication key (format: DHHC-1:01:...) - optional.",
             type => 'string',
             optional => 1,
         },
         tn_nvme_dhchap_ctrl_secret => {
-            title => 'DHCHAP Controller Secret',
+            title => 'NVMe DH-HMAC-CHAP controller secret',
             description => "DH-HMAC-CHAP controller authentication key for bidirectional auth - optional.",
             type => 'string',
             optional => 1,
         },
         tn_nvme_allow_any_host => {
-            title => 'Allow Any NVMe Host',
+            title => 'NVMe allow-any-host',
             description => "Allow any NVMe host to attach (open access). Default 1 for "
                 . "backward compatibility. Set to 0 to use an explicit host whitelist: "
                 . "the plugin registers each node's host NQN (with DH-HMAC-CHAP keys if "
@@ -1090,7 +1146,7 @@ sub properties {
 
         # ZFS compression algorithm for new volumes
         tn_compression => {
-            title => 'Compression',
+            title => 'Compression (zvol)',
             description => "ZFS compression algorithm for new volumes. When unset, inherits from parent dataset.",
             type => 'string',
             enum => [qw(OFF LZ4 GZIP GZIP-1 GZIP-9 ZSTD ZSTD-1 ZSTD-3 ZSTD-5 ZSTD-7 ZSTD-9 ZLE LZJB)],
@@ -1099,45 +1155,45 @@ sub properties {
 
         # Thin provisioning toggle (maps to TrueNAS sparse)
         tn_sparse => {
-            title => 'Sparse Volumes',
+            title => 'Sparse zvols',
             description => "Create thin-provisioned zvols on TrueNAS (maps to 'sparse').",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Live snapshot support
         tn_enable_live_snapshots => {
-            title => 'Live Snapshots',
+            title => 'Live snapshots',
             description => "Enable live snapshots with VM state storage on TrueNAS.",
             type => 'boolean', optional => 1, default => 1,
         },
         # Volume chains for snapshots (enables vmstate support)
         tn_snapshot_volume_chains => {
-            title => 'Snapshot Volume Chains',
+            title => 'Snapshot-as-volume-chains',
             description => "Use volume chains for snapshots (enables vmstate on iSCSI).",
             type => 'boolean', optional => 1, default => 1,
         },
         # vmstate storage location
         tn_vmstate_storage => {
-            title => 'VM State Storage',
+            title => 'VM state storage',
             description => "Storage location for vmstate: 'shared' (TrueNAS iSCSI) or 'local' (node filesystem).",
             type => 'string', optional => 1, default => 'local',
         },
 
         # Bulk operations for improved performance
         tn_enable_bulk_operations => {
-            title => 'Bulk Operations',
+            title => 'Bulk API calls',
             description => "Enable bulk API operations for better performance (requires WebSocket transport).",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Retry configuration
         tn_api_retry_max => {
-            title => 'API Retries',
+            title => 'API retry attempts',
             description => "Maximum number of API call retries on transient failures.",
             type => 'integer', optional => 1, default => 3,
         },
         tn_api_retry_delay => {
-            title => 'API Retry Delay (s)',
+            title => 'API retry backoff (s)',
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
@@ -1206,15 +1262,30 @@ sub properties {
                           "under load. Default: 30.",
             type => 'integer', optional => 1, default => 30, minimum => 5, maximum => 600,
         },
+        tn_status_capacity_ttl_s => {
+            title => 'Status cache TTL (s)',
+            description => "TTL in seconds for the status() capacity cache -- both the " .
+                          "in-process cache that pvestatd consults on each tick and the " .
+                          "cross-process on-disk stamp that a fresh `pvesm status` picks " .
+                          "up. If unset, use 30 s in memory and 15 s on disk. Raise " .
+                          "on clusters where many nodes poll the same TrueNAS: with N " .
+                          "nodes and S storages per node, the API sees roughly N*S capacity " .
+                          "queries per TTL interval. 11 nodes * 3 storages at the 10 s " .
+                          "default has been reported to saturate the TN middleware " .
+                          "(issue #147); raising to 60-120 brings the per-call latency " .
+                          "back to normal at the cost of staler `pvesm status` output. " .
+                          "Range: 1-3600.",
+            type => 'integer', optional => 1, minimum => 1, maximum => 3600,
+        },
         tn_storage_lock_timeout => {
-            title => 'Storage Lock Timeout (s)',
+            title => 'Storage lock timeout (s)',
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120. " .
                           "Only relevant while tn_use_cluster_lock is 1 (the default).",
             type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 600,
         },
         tn_use_cluster_lock => {
-            title => 'Serialize With Cluster Lock',
+            title => 'Use pmxcfs cluster lock',
             description => "Serialize storage operations across nodes via the PVE " .
                           "CFS cluster lock. Default: 1 (this fork always takes the " .
                           "lock, bounded by tn_storage_lock_timeout and tn_op_budget_s). " .
@@ -1225,12 +1296,12 @@ sub properties {
             type => 'boolean', optional => 1, default => 1,
         },
         tn_device_ready_retries => {
-            title => 'Device Ready Retries',
+            title => 'Device-ready retry count',
             description => "Number of 100ms retries waiting for a block device to appear after connect.",
             type => 'integer', optional => 1, default => 600, minimum => 0, maximum => 1200,
         },
         tn_nr_io_queues => {
-            title => 'NVMe I/O Queues',
+            title => 'NVMe I/O queues per controller',
             description => "Number of NVMe/TCP I/O queues per controller. When unset, " .
                           "auto-detected: uses online CPU count when all CPUs are online, " .
                           "or half of possible CPUs when any CPU is offline (avoids kernel " .
@@ -1239,7 +1310,7 @@ sub properties {
             type => 'integer', optional => 1, minimum => 1, maximum => 256,
         },
         tn_nvme_ctrl_loss_tmo => {
-            title => 'NVMe Ctrl Loss Timeout',
+            title => 'NVMe ctrl-loss timeout (s)',
             description => "Seconds the kernel keeps retrying a failed NVMe/TCP controller " .
                           "before giving up and removing it (nvme connect --ctrl-loss-tmo). " .
                           "Use -1 to retry forever. When unset the kernel default of 600 applies, " .
@@ -1249,19 +1320,20 @@ sub properties {
             type => 'integer', optional => 1, minimum => -1, maximum => 3600,
         },
         tn_nvme_reconnect_delay => {
-            title => 'NVMe Reconnect Delay',
+            title => 'NVMe reconnect delay (s)',
             description => "Seconds between reconnect attempts for a failed NVMe/TCP controller " .
                           "(nvme connect --reconnect-delay). Kernel default is 10.",
             type => 'integer', optional => 1, minimum => 1, maximum => 3600,
         },
         tn_nvme_keep_alive_tmo => {
-            title => 'NVMe Keep-Alive Timeout',
+            title => 'NVMe keep-alive timeout (s)',
             description => "NVMe/TCP keep-alive timeout in seconds " .
                           "(nvme connect --keep-alive-tmo). Lower values detect a dead path " .
                           "sooner, at the cost of more keep-alive traffic.",
             type => 'integer', optional => 1, minimum => 1, maximum => 3600,
         },
         tn_nvme_manage_ports => {
+            title => 'Manage NVMe ports',
             description => "Whether the plugin creates nvmet port + port_subsys records " .
                           "to match tn_discovery_portal/tn_portals (default: 1). " .
                           "Set to 0 for a TrueNAS HA pair: on 25.10.x TN's nvmet middleware " .
@@ -1273,6 +1345,47 @@ sub properties {
                           "the namespace lifecycle, and the initiator-side connect, but will " .
                           "no longer touch nvmet.port.* records.",
             type => 'boolean', optional => 1, default => 1,
+        },
+
+        # Cross-node stale WWID reconcile (#147).
+        # When a volume is deleted on one cluster node, the other nodes keep
+        # the local SCSI device and multipath map for that LUN. ALUA then
+        # reports the paths as failed and multipathd spams the log every 5 s.
+        # On top of the obvious noise, TrueNAS reuses LUN IDs, so a new
+        # extent getting the same LUN later surfaces behind the stale
+        # devices on peer nodes. This set of knobs enables a hybrid cleanup:
+        # on delete the plugin drops a per-WWID hint into /etc/pve (which
+        # pmxcfs replicates to every node), and on each activate/status
+        # every node checks local sysfs against the hints (fast) and
+        # against TrueNAS's current extent list (floor reconcile).
+        tn_reconcile => {
+            title => 'Cross-node reconcile',
+            description => "Reconcile stale per-LUN SCSI devices and multipath maps across " .
+                          "cluster nodes after a volume is deleted on any one node (#147). " .
+                          "Hint-driven: the deleting node writes a WWID marker under /etc/pve, " .
+                          "pmxcfs replicates it, and every peer's next activate_storage/status " .
+                          "sweeps its own sysfs. A floor reconcile also cross-checks local " .
+                          "WWIDs against TrueNAS's current extent list to catch leftovers from " .
+                          "before this knob existed, or from a delete that happened while this " .
+                          "node was down. iSCSI + multipath only. Default: 1.",
+            type => 'boolean', optional => 1, default => 1,
+        },
+        tn_reconcile_grace_s => {
+            title => 'Reconcile orphan grace (s)',
+            description => "Seconds a WWID must be absent from TrueNAS before the floor " .
+                          "reconcile (#147) considers it an orphan and tears it down. " .
+                          "Protects against brief create-then-vanish windows while another " .
+                          "node is provisioning a new extent. Default: 120.",
+            type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 3600,
+        },
+        tn_reconcile_hint_ttl_s => {
+            title => 'Reconcile hint TTL (s)',
+            description => "Seconds a #147 stale-WWID hint lives in /etc/pve before the node " .
+                          "that wrote it unlinks the marker. Longer values give peers that were " .
+                          "offline at delete time more chances to pick it up on their next " .
+                          "activate; shorter values keep the hint directory tidier. The floor " .
+                          "reconcile is the safety net regardless of this value. Default: 600.",
+            type => 'integer', optional => 1, default => 600, minimum => 60, maximum => 86400,
         },
     };
 }
@@ -1355,6 +1468,7 @@ sub options {
         tn_api_retry_delay => { optional => 1 },
         tn_status_budget_s => { optional => 1 },
         tn_status_probe_backoff_s => { optional => 1 },
+        tn_status_capacity_ttl_s  => { optional => 1 },
         tn_nvme_max_io_kb => { optional => 1 },
         tn_op_budget_s => { optional => 1 },
         tn_api_budget_s => { optional => 1 },
@@ -1373,6 +1487,11 @@ sub options {
         tn_nvme_reconnect_delay => { optional => 1 },
         tn_nvme_keep_alive_tmo  => { optional => 1 },
         tn_nvme_manage_ports    => { optional => 1 },
+
+        # Cross-node stale WWID reconcile (#147)
+        tn_reconcile            => { optional => 1 },
+        tn_reconcile_grace_s    => { optional => 1 },
+        tn_reconcile_hint_ttl_s => { optional => 1 },
     };
 }
 
@@ -6407,7 +6526,8 @@ sub _read_status_stamp {
     my $mtime = (stat($path))[9];
     return undef if !defined $mtime;
     my $age = time() - $mtime;
-    return undef if $age < 0 || $age >= $STATUS_CAPACITY_STAMP_TTL_S;
+    my $stamp_ttl = _status_capacity_ttl_s($scfg, $STATUS_CAPACITY_STAMP_TTL_S);
+    return undef if $age < 0 || $age >= $stamp_ttl;
     my $decoded = eval {
         open(my $fh, '<', $path) or die "open: $!";
         local $/;
@@ -6460,6 +6580,400 @@ sub _unlink_status_stamp {
     my ($status_method) = @_;
     my $path = _status_stamp_path($status_method);
     unlink($path);
+}
+
+# ======== Cross-node stale WWID reconcile (#147) ========
+#
+# When one cluster node deletes a volume, the LUN disappears from TrueNAS
+# but every other node that was logged in still holds the backing SCSI
+# device and the multipath map. ALUA then reports every path failed and
+# multipathd logs "tur checker reports path is down" every 5 s forever;
+# worse, TrueNAS reuses LUN numbers, so a later extent getting the same
+# LUN lands behind the stale sd on peer nodes.
+#
+# The fix is two mechanisms running side by side:
+#
+#   1) Push. The deleting node drops a WWID marker into
+#      /etc/pve/priv/truenas-plugin/stale-wwid/<storeid>/<wwid>. Because
+#      /etc/pve is pmxcfs, the marker is replicated cluster-wide for
+#      free. The pusher removes its own marker after
+#      tn_reconcile_hint_ttl_s so the directory doesn't accumulate.
+#
+#   2) Pull. Each node's activate_storage and status call
+#      _reconcile_stale_wwids, which walks the hint directory and tears
+#      down any WWID that is locally present. status also runs
+#      _floor_reconcile_wwids, a rate-limited sweep that compares local
+#      iSCSI sd* devices against TrueNAS's current extent list
+#      and drops any that have been absent from the array for longer
+#      than tn_reconcile_grace_s. Floor fails CLOSED on any TN query
+#      error - "we are uncertain" never deletes.
+#
+# iSCSI + multipath only. Scope is limited to sd devices behind
+# /sys/class/iscsi_session entries whose targetname matches the
+# configured tn_target_iqn, so other TrueNAS storages or non-TN iSCSI
+# are never touched.
+
+# Package variables (not use-constant) so tests can locally override them
+# to a tempdir without the module's compile-time baking the paths in.
+our $STALE_WWID_HINT_ROOT  = '/etc/pve/priv/truenas-plugin/stale-wwid';
+our $RECONCILE_STAMP_DIR   = '/run/truenas-plugin';
+our $ISCSI_SESSION_ROOT    = '/sys/class/iscsi_session';
+our $SYS_BLOCK_ROOT        = '/sys/block';
+# Floor reconcile is rate-limited to this interval regardless of how
+# often status() is called. pvestatd fires every 10 s; a floor sweep
+# does one TN query + a sysfs walk, so tying it to each tick is wasteful.
+our $FLOOR_RECONCILE_MIN_S = 60;
+
+# Normalize a WWID string. Expected shape: lower-case hex starting with
+# '3' (naa.3-type) followed by 32 more hex characters (33 total, which
+# is what scsi_id reports for TrueNAS iSCSI LUNs). Anything else is
+# rejected to keep untrusted input from being spliced into sysfs or
+# shell arguments.
+sub _sane_wwid {
+    my ($w) = @_;
+    return undef unless defined $w;
+    return undef unless $w =~ /^(3[0-9a-f]{32})$/;
+    return $1;
+}
+
+# TrueNAS extent NAA is '0x6589cfc...' (16 hex after the 0x); multipath
+# prepends '3' for NAA-6, so the WWID is '3' + '6589cfc...'.
+sub _naa_to_wwid {
+    my ($naa) = @_;
+    return undef unless defined $naa;
+    return undef unless $naa =~ /^0[xX]([0-9a-fA-F]{16,})$/;
+    return _sane_wwid('3' . lc($1));
+}
+
+# Local node name. POSIX::uname always exists in core.
+sub _local_node_name {
+    my @u = POSIX::uname();
+    my $n = $u[1] // 'unknown';
+    $n =~ s/[^A-Za-z0-9._-]/_/g;
+    return $n;
+}
+
+# Hint directory for a given storage.
+sub _stale_wwid_hint_dir {
+    my ($storeid) = @_;
+    my $safe = $storeid // 'unknown';
+    $safe =~ s/[^A-Za-z0-9._-]/_/g;
+    return "$STALE_WWID_HINT_ROOT/$safe";
+}
+
+# Path for one WWID's hint.
+sub _stale_wwid_hint_path {
+    my ($storeid, $wwid) = @_;
+    my $w = _sane_wwid($wwid) // return undef;
+    return _stale_wwid_hint_dir($storeid) . "/$w";
+}
+
+# Write a stale-WWID hint. Best-effort: filesystem errors never propagate
+# (the local teardown already happened in _free_image_iscsi; the hint is
+# a nicety for peers).
+sub _write_stale_wwid_hint {
+    my ($scfg, $storeid, $wwid) = @_;
+    my $w = _sane_wwid($wwid) // return;
+    my $path = _stale_wwid_hint_path($storeid, $w) // return;
+    my $dir = _stale_wwid_hint_dir($storeid);
+    my $node = _local_node_name();
+    my $rc = eval {
+        if (!-d $dir) {
+            require File::Path;
+            File::Path::make_path($dir, { mode => 0700 });
+        }
+        my $tmp = "$path.$$";
+        open(my $fh, '>', $tmp) or die "open $tmp: $!";
+        chmod 0600, $tmp;
+        print $fh encode_json({ wwid => $w, by => $node, removed_at => time() });
+        close($fh) or die "close $tmp: $!";
+        rename($tmp, $path) or die "rename $tmp -> $path: $!";
+        1;
+    };
+    if ($@ || !$rc) {
+        _log($scfg, 1, 'warning', "[TrueNAS] stale-wwid hint write failed at $path: " . ($@ // 'unknown'));
+        return;
+    }
+    _log($scfg, 2, 'debug', "[TrueNAS] stale-wwid hint written: $path");
+}
+
+# Read a stale-WWID hint. Returns the decoded hashref or undef.
+sub _read_stale_wwid_hint {
+    my ($path) = @_;
+    my $decoded = eval {
+        open(my $fh, '<', $path) or die "open: $!";
+        local $/;
+        my $blob = <$fh>;
+        close($fh);
+        decode_json($blob);
+    };
+    return undef if $@ || ref($decoded) ne 'HASH';
+    return $decoded;
+}
+
+# Enumerate local sd devices served by an iSCSI session whose targetname
+# matches this storage's configured target IQN, keyed by WWID. Returns
+# a hashref { $wwid => [ 'sdX', 'sdY', ... ] }. Scoped so a reconcile
+# never considers an sd that belongs to another TN storage or to a
+# non-TN iSCSI target.
+#
+# Walks /sys/class/iscsi_session/session*/targetname (matching session) ->
+# /sys/class/iscsi_session/sessionN/device/target*/*/block/sd*.
+sub _enum_local_iscsi_wwids_for_target {
+    my ($scfg) = @_;
+    my $want_iqn = $scfg->{tn_target_iqn};
+    return {} unless defined($want_iqn) && length($want_iqn);
+
+    my %out;
+    my $sess_root = $ISCSI_SESSION_ROOT;
+    opendir(my $dh, $sess_root) or return {};
+    my @sessions = grep { /^session\d+$/ } readdir($dh);
+    closedir($dh);
+
+    for my $s (@sessions) {
+        my $tn_path = "$sess_root/$s/targetname";
+        next unless -r $tn_path;
+        open(my $tfh, '<', $tn_path) or next;
+        chomp(my $iqn = <$tfh> // '');
+        close($tfh);
+        next unless $iqn eq $want_iqn;
+
+        # Session's scsi_host lives at /sys/class/iscsi_session/sessionN/device/target*/...
+        # Simpler: walk /sys/class/iscsi_session/sessionN/device to find sd* under it.
+        my $dev_root = "$sess_root/$s/device";
+        next unless -d $dev_root;
+        # recursive-ish scan for block/sd*
+        my @stack = ($dev_root);
+        while (@stack) {
+            my $cur = pop @stack;
+            opendir(my $cdh, $cur) or next;
+            my @kids = grep { $_ !~ /^\.\.?$/ } readdir($cdh);
+            closedir($cdh);
+            for my $k (@kids) {
+                my $p = "$cur/$k";
+                if ($k =~ /^sd[a-z]+$/ && -d $p) {
+                    my $wwid_file = "$SYS_BLOCK_ROOT/$k/device/wwid";
+                    next unless -r $wwid_file;
+                    open(my $wfh, '<', $wwid_file) or next;
+                    chomp(my $raw = <$wfh> // '');
+                    close($wfh);
+                    # kernel format: 'naa.6589cfc...' or 't10....'
+                    my $w;
+                    if ($raw =~ /^naa\.([0-9a-fA-F]{16,})/i) {
+                        $w = _sane_wwid('3' . lc($1));
+                    }
+                    next unless defined $w;
+                    push @{ $out{$w} }, $k;
+                } elsif (-d $p && $k =~ /^(target\d|\d+:\d+:\d+:\d+|block|host\d+)/) {
+                    push @stack, $p;
+                }
+            }
+        }
+    }
+    return \%out;
+}
+
+# Tear down one WWID on the local node. Best-effort and idempotent.
+#   - kpartx -d /dev/mapper/<wwid> (releases mpathX-partN holders)
+#   - multipath -f <wwid> (removes the dm map)
+#   - echo 1 > /sys/block/<sd>/device/delete for each path
+# Returns 1 if the map is gone after the call, 0 if a step failed.
+sub _teardown_stale_wwid {
+    my ($scfg, $wwid, $sd_list) = @_;
+    my $w = _sane_wwid($wwid) // return 0;
+    $sd_list //= [];
+
+    _log($scfg, 1, 'info', "[TrueNAS] reconcile: tearing down stale WWID $w (sd="
+        . join(',', @$sd_list) . ')');
+
+    # Clear partition holders. Both the aliased and the WWID-named node
+    # might be in play depending on multipath.conf user_friendly_names.
+    for my $cand ("/dev/mapper/$w") {
+        eval { PVE::Tools::run_command(['kpartx','-d',$cand], outfunc=>sub{}, errfunc=>sub{}) };
+    }
+
+    # Remove the dm map. If it's still in use (a running VM holds it),
+    # multipath -f exits non-zero and leaves the map; we log + return 0
+    # without touching the sd devices below.
+    eval {
+        PVE::Tools::run_command(['multipath','-f',$w],
+            outfunc => sub {},
+            errfunc => sub { _log($scfg, 2, 'debug', "[TrueNAS] multipath -f $w: $_[0]"); });
+    };
+    if ($@) {
+        _log($scfg, 1, 'warning', "[TrueNAS] reconcile: multipath -f $w failed (busy?); leaving sd paths alone");
+        return 0;
+    }
+
+    # Drop the backing sd* paths. Each path's TUR will otherwise keep
+    # spamming until the device is actually gone from the kernel.
+    for my $sd (@$sd_list) {
+        next unless $sd =~ /^(sd[a-z]+)$/;
+        my $safe_sd = $1;
+        my $del = "$SYS_BLOCK_ROOT/$safe_sd/device/delete";
+        next unless -e $del && -w $del;
+        if (open my $fh, '>', $del) {
+            print $fh "1";
+            close $fh;
+            _log($scfg, 2, 'debug', "[TrueNAS] reconcile: deleted $SYS_BLOCK_ROOT/$safe_sd (wwid $w)");
+        }
+    }
+
+    eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
+    return 1;
+}
+
+# Hint-driven reconcile. Reads /etc/pve/priv/truenas-plugin/stale-wwid/
+# <storeid>/*, tears down any WWID that is locally present, and clears
+# hints the local node itself wrote once they age past
+# tn_reconcile_hint_ttl_s. Never dies - this is a background sweep.
+sub _reconcile_stale_wwids {
+    my ($storeid, $scfg) = @_;
+    return if !($scfg->{tn_reconcile} // 1);
+    return if ($scfg->{tn_transport_mode} // 'iscsi') ne 'iscsi';
+    return if !($scfg->{tn_use_multipath} // 1);
+
+    my $dir = _stale_wwid_hint_dir($storeid);
+    return unless -d $dir;
+    opendir(my $dh, $dir) or return;
+    my @hints = grep { /^3[0-9a-f]{32}$/ } readdir($dh);
+    closedir($dh);
+    return unless @hints;
+
+    my $local = _enum_local_iscsi_wwids_for_target($scfg);
+    my $me    = _local_node_name();
+    my $ttl   = $scfg->{tn_reconcile_hint_ttl_s} // 600;
+
+    for my $w (@hints) {
+        my $path = "$dir/$w";
+        my $hint = _read_stale_wwid_hint($path);
+        if (!$hint) {
+            _log($scfg, 2, 'debug', "[TrueNAS] reconcile: unreadable hint $path, skipping");
+            next;
+        }
+
+        # Does this hint apply to our local state?
+        if (exists $local->{$w}) {
+            _teardown_stale_wwid($scfg, $w, $local->{$w});
+        }
+
+        # Pusher-only cleanup: a node clears only hints it wrote, after
+        # TTL. This is intentionally conservative; a pusher-death hint
+        # lingers until something manual or the floor reconcile covers it.
+        if (($hint->{by} // '') eq $me) {
+            my $age = time() - ($hint->{removed_at} // 0);
+            if ($age > $ttl) {
+                unlink($path);
+                _log($scfg, 2, 'debug', "[TrueNAS] reconcile: cleared own expired hint $path (age ${age}s)");
+            }
+        }
+    }
+}
+
+# Floor reconcile. Rate-limited sweep that compares local iSCSI sd*
+# backed by $scfg->{tn_target_iqn} against TrueNAS's current extent list.
+# Any WWID present locally for this target but absent on the
+# array for at least tn_reconcile_grace_s is torn down.
+#
+# Fail-closed: a failed TN query aborts the sweep (so a transient outage
+# does not delete anything). State is kept in a /run stamp so repeated
+# status() calls inside FLOOR_RECONCILE_MIN_S are cheap.
+sub _floor_reconcile_wwids {
+    my ($storeid, $scfg) = @_;
+    return if !($scfg->{tn_reconcile} // 1);
+    return if ($scfg->{tn_transport_mode} // 'iscsi') ne 'iscsi';
+    return if !($scfg->{tn_use_multipath} // 1);
+
+    # Rate limit.
+    my $safe = $storeid;
+    $safe =~ s/[^A-Za-z0-9._-]/_/g;
+    my $stamp = "$RECONCILE_STAMP_DIR/reconcile-$safe";
+    my $now   = time();
+    if (my $mt = (stat($stamp))[9]) {
+        return if ($now - $mt) < $FLOOR_RECONCILE_MIN_S;
+    }
+
+    # Snapshot of local state FIRST: if the array query fails below, we
+    # do nothing and leave the stamp un-updated so the next tick retries.
+    my $local = _enum_local_iscsi_wwids_for_target($scfg);
+    return unless %$local;
+
+    # Local enumeration is scoped by target IQN. Compare with every live
+    # NAA on TrueNAS because other datasets can share this target.
+    my %live_wwids;
+    my $ok = eval {
+        my $extents = _api_call($scfg, 'iscsi.extent.query',
+            [ [], { select => ['naa'] } ], { retry_opts => { retry_max => 0 } });
+        die "invalid extent list\n" unless ref($extents) eq 'ARRAY';
+        for my $e (@$extents) {
+            die "invalid extent NAA\n" unless ref($e) eq 'HASH'
+                && defined($e->{naa}) && $e->{naa} =~ /^0x[0-9a-f]{16,}$/i;
+            my $w = _naa_to_wwid($e->{naa});
+            $live_wwids{$w} = 1 if defined $w;
+        }
+        1;
+    };
+    if (!$ok) {
+        _log($scfg, 2, 'debug', "[TrueNAS] floor reconcile: TN extent query failed, skipping sweep: " . ($@ // ''));
+        return;
+    }
+
+    # Update stamp - we have a definitive answer from TN, next call can
+    # rate-limit even if nothing to do.
+    eval {
+        if (!-d $RECONCILE_STAMP_DIR) {
+            require File::Path;
+            File::Path::make_path($RECONCILE_STAMP_DIR, { mode => 0755 });
+        }
+        open(my $fh, '>', $stamp) or die "open: $!";
+        print $fh $now;
+        close($fh);
+    };
+
+    my $grace = $scfg->{tn_reconcile_grace_s} // 120;
+    my $orphan_stamp_dir = "$RECONCILE_STAMP_DIR/orphan-$safe";
+    eval {
+        if (!-d $orphan_stamp_dir) {
+            require File::Path;
+            File::Path::make_path($orphan_stamp_dir, { mode => 0755 });
+        }
+    };
+
+    # Clear any orphan stamp whose WWID either (a) no longer exists on
+    # this node or (b) is live again on TN. Done up front so the loop
+    # below only stamps/teardowns real orphans.
+    if (opendir(my $odh, $orphan_stamp_dir)) {
+        for my $ent (readdir($odh)) {
+            next unless $ent =~ /^(3[0-9a-f]{32})$/;
+            my $w = $1;
+            if (!exists $local->{$w} || $live_wwids{$w}) {
+                unlink("$orphan_stamp_dir/$w");
+            }
+        }
+        closedir($odh);
+    }
+
+    for my $w (keys %$local) {
+        next if $live_wwids{$w};
+
+        # First time we noticed this orphan; stamp it and wait out the
+        # grace window. If it comes back (admin re-created the extent),
+        # the pre-loop cleanup above clears the stamp on the next sweep.
+        my $ostamp = "$orphan_stamp_dir/$w";
+        my $omt    = (stat($ostamp))[9];
+        if (!defined $omt) {
+            if (open my $fh, '>', $ostamp) { print $fh $now; close $fh; }
+            _log($scfg, 2, 'debug', "[TrueNAS] floor reconcile: stamped new orphan $w (grace ${grace}s)");
+            next;
+        }
+        my $age = $now - $omt;
+        if ($age < $grace) {
+            _log($scfg, 2, 'debug', "[TrueNAS] floor reconcile: orphan $w still within grace (${age}s < ${grace}s)");
+            next;
+        }
+
+        unlink($ostamp) if _teardown_stale_wwid($scfg, $w, $local->{$w});
+    }
 }
 
 # Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
@@ -9492,7 +10006,7 @@ sub _nvme_device_for_uuid {
             # has never matched across 35 iterations (~3.5s). The kernel's cached
             # NGUID data is likely stale from a previous TrueNAS service state.
             # Only safe if no running process (QEMU) has any subsystem device open.
-            # Note: inherent TOCTOU window between fuser check and disconnect.
+            # Note: inherent TOCTOU window between the in-use check and disconnect.
             # CFS lock prevents concurrent plugin operations; manual VM starts
             # during this ~1ms window are the residual (very low) risk.
             my ($busy, @dev_paths) = _nvme_subsystem_busy($scfg);
@@ -9539,10 +10053,7 @@ sub _nvme_device_for_uuid {
     # own tn_has_uuid inline query returning empty transiently under
     # TN API load.
     #
-    # This block runs unconditionally if allow_reconnect=1 and we
-    # haven't already reconnected in the loop. No fuser check (loop is
-    # about to fail anyway; the brief NVMe I/O pause on other VMs is
-    # the lesser evil). No tn_has_uuid gate (already proved TN
+    # No tn_has_uuid gate (already proved TN
     # metadata was queryable — that's what set $last_result with
     # namespace_meta or reason 'namespace_metadata_did_not_match_visible_devices').
     # alpha28: emergency block ignores reconnect_attempted. Alpha27
@@ -11496,6 +12007,37 @@ sub _free_image_iscsi {
     # Invalidate cache eagerly (list_images should not see the stale mapping).
     _clear_cache(_cache_host_key($scfg));
 
+    # Cross-node stale-WWID hint (#147). Only drop the hint when the
+    # extent is confirmed gone on TN side, so peers that act on it find
+    # a real orphan rather than wasting a teardown on a LUN that still
+    # exists. We already have the WWID from the original $extent NAA
+    # captured at top of this function.
+    if (($scfg->{tn_use_multipath} // 1) && ($scfg->{tn_reconcile} // 1)
+        && $extent && $extent->{naa})
+    {
+        eval {
+            # Narrow re-query: if the extent is still there, don't drop
+            # a hint that would mislead peers into tearing down a live
+            # LUN. The targetextent might still exist on another node's
+            # "in use" error path, but the plan's scope is only on
+            # EXTENT absence - that's what multipath keys on.
+            my $still = _tn_extent_query_by_disk($scfg, $zvol_path_match);
+            if (ref($still) eq 'ARRAY' && !@$still) {
+                my $wwid = _naa_to_wwid($extent->{naa});
+                if ($wwid) {
+                    _write_stale_wwid_hint($scfg, $storeid, $wwid);
+                } else {
+                    _log($scfg, 2, 'debug',
+                        "[TrueNAS] free_image: extent NAA $extent->{naa} did not parse, skipping stale-wwid hint");
+                }
+            } else {
+                _log($scfg, 2, 'debug',
+                    "[TrueNAS] free_image: extent still present on TN, no stale-wwid hint written");
+            }
+        };
+        # ignore any hint-write errors
+    }
+
     # 6) Defer post-deletion cleanup after lock release (session rescan, self-healing, logout check)
     my $deferred_scfg = $scfg;
     my $deferred_need_force_logout = $need_force_logout;
@@ -12446,7 +12988,7 @@ sub status {
     local $_api_deadline = time() + $status_budget;
 
     eval {
-        my $ds = _get_cached($host_key, $status_method, $STATUS_CAPACITY_TTL_S);
+        my $ds = _get_cached($host_key, $status_method, _status_capacity_ttl_s($scfg));
         if ($ds) {
             $_status_capacity_cache_stats{hit}++;
             _log($scfg, 2, 'debug', "[TrueNAS] status-cache: hit key=$status_method");
@@ -12557,6 +13099,16 @@ sub status {
         # out the window: the marker exists to stop pointless probing, not to
         # keep insisting a working array is down.
         delete $_status_api_down{$host_key};
+    }
+    # Capacity and transport backoff take priority over the #147 sweep.
+    # Run the floor query only with time left in the existing status budget.
+    if ($active && ($scfg->{tn_transport_mode} // 'iscsi') eq 'iscsi' && ($scfg->{tn_use_multipath} // 1)) {
+        eval { _reconcile_stale_wwids($storeid, $scfg) };
+        _log($scfg, 2, 'debug', "[TrueNAS] status: reconcile_stale_wwids failed: $@") if $@;
+        if (time() < $_api_deadline) {
+            eval { _floor_reconcile_wwids($storeid, $scfg) };
+            _log($scfg, 2, 'debug', "[TrueNAS] status: floor_reconcile_wwids failed: $@") if $@;
+        }
     }
     return ($total, $avail, $used, $active);
 }
@@ -12892,6 +13444,11 @@ sub activate_storage {
         if ($@) {
             _log($scfg, 1, 'warning', "[TrueNAS] activate_storage: target visibility pre-flight check failed for $storeid: $@");
         }
+        # Cross-node stale-WWID hint-driven reconcile (#147). Cheap:
+        # readdir of a small /etc/pve directory plus local sysfs walk.
+        # Never raises.
+        eval { _reconcile_stale_wwids($storeid, $scfg) };
+        _log($scfg, 2, 'debug', "[TrueNAS] activate_storage: reconcile_stale_wwids failed: $@") if $@;
     } elsif ($mode eq 'nvme-tcp') {
         # Check nvme-cli is available
         eval {

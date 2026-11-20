@@ -112,9 +112,9 @@ Manual repository setup, and the signing key
 This fork publishes its builds as release assets on
 `github.com/alfonsokuen/truenas-proxmox-plugin`. GitHub rewrites `~` in asset
 names (a `.deb` whose version has a `~`, such as idk22's, is served as
-`…_2.1.23.beta8+idk22_all.deb`). From idk23 on the version is
-`2.1.23+deb1+idk23` - no `~` - so the asset keeps its name and the download
-needs no renaming (idk24 and idk25 are cut from upstream `2.1.24~beta4`, idk26 onward from `2.1.24~beta6`, so its version carries a `~` again and `install-idk.sh` handles the renamed asset; the example below is idk23):
+`…_2.1.23.beta8+idk22_all.deb`). For idk23, the version is
+`2.1.23+deb1+idk23` and the asset keeps its name. For releases based on
+upstream betas, `install-idk.sh` handles the renamed asset. This example uses idk23:
 
 ```bash
 V=2.1.23+deb1+idk23
@@ -142,16 +142,41 @@ anyway.
 If the same version is already installed, `apt install` is a no-op: use
 `apt reinstall ./<file>.deb` or `dpkg -i`. The options below are upstream's.
 
-**No GUI dialog:** Datacenter > Storage > Add does not list TrueNAS — those
-forms live in `pve-manager` and an out-of-tree plugin cannot add one. Create the
-storage with `pvesm add truenasplugin <id> --tn_api_host ... --tn_api_key ...
---tn_dataset ... --tn_target_iqn ...`, or with the wizard below.
+**Add storage in the GUI:** with pve-manager 9.2.29 or newer, select
+**Datacenter > Storage > Add > TrueNAS**. On older versions, use
+`pvesm add truenasplugin <id> --tn_api_host ... --tn_api_key ...
+--tn_dataset ... --tn_target_iqn ...` or the wizard below.
 
 **Storage wizard:** run `truenas-proxmox-manage` (the installer shipped in this
 package). Do not pipe upstream's `main` `install.sh` from the options below over
 this package: that script still uses the pre-2.1.23 `api_host`/`api_key` field
 names, the plugin expects `tn_api_*`, and the wizard fails with
 `broker: scfg missing api_host/api_key` even though network and key are fine.
+
+> **⚠️ Upgrading from upstream 2.1.24 or older: do it over SSH, not the Web Shell.**
+>
+> On upstream `2.1.24` and earlier the postinst script restarts `pvedaemon`
+> immediately, which kills the `termproxy` session backing the Proxmox
+> Web Shell and the **Updates > Upgrade** button. The upgrade dies
+> mid-install and leaves the package half-configured ([#144]).
+>
+> If you are still on `2.1.24`, upgrade this package from an **SSH
+> session** (sshd is independent of `pvedaemon`). If a Web-Shell
+> upgrade has already been interrupted, recover by SSH-ing in and
+> running:
+>
+> ```bash
+> dpkg --configure -a
+> apt -f install
+> apt update && apt dist-upgrade
+> ```
+>
+> This limitation is fixed in `2.1.25~beta1` and later (both
+> `pvedaemon` and `pveproxy` restarts are deferred past the end of the
+> package transaction). The IDK fork leaves both daemons to the
+> pve-manager dpkg trigger.
+>
+> [#144]: https://github.com/truenas/truenas-proxmox-plugin/issues/144
 
 **Option 1 (Recommended): APT Repository**
 
@@ -566,6 +591,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.1.24
-**Last Updated**: November 5, 2026
-**Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+
+**Version**: 2.1.25~beta2+idk31
+**Last Updated**: November 19, 2026
+**Compatibility**: Proxmox VE 8.x+, TrueNAS 25.10+

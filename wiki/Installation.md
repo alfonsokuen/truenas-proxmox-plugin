@@ -2,6 +2,30 @@
 
 Complete installation instructions for the TrueNAS Proxmox VE Storage Plugin.
 
+> **⚠️ Upgrading from upstream 2.1.24 or older: do it over SSH, not the Web Shell.**
+>
+> On upstream `2.1.24` and earlier the postinst script restarts `pvedaemon`
+> immediately. `pvedaemon` owns the `termproxy` session that backs the
+> Proxmox Web Shell and the **Updates > Upgrade** button, so the restart
+> kills the session running the upgrade and leaves the package
+> half-configured (see [issue #144](https://github.com/truenas/truenas-proxmox-plugin/issues/144)).
+>
+> If you are still on `2.1.24`, upgrade this package from an SSH
+> session (`sshd` is independent of `pvedaemon`). If a Web-Shell
+> upgrade has already been interrupted, recover by SSH-ing in and
+> running:
+>
+> ```bash
+> dpkg --configure -a
+> apt -f install
+> apt update && apt dist-upgrade
+> ```
+>
+> This limitation is fixed in `2.1.25~beta1` and later; both
+> `pvedaemon` and `pveproxy` restarts are deferred until after the
+> package transaction finishes. The IDK fork leaves both daemons to the
+> pve-manager dpkg trigger.
+
 ## Table of Contents
 - [Installing the IDK fork](#installing-the-idk-fork)
 - [Automated Installation (Recommended)](#automated-installation-recommended)
@@ -325,11 +349,9 @@ Main Menu:
 Choose an option:
 ```
 
-**Note**: there is no TrueNAS entry in Datacenter > Storage > Add. The
-GUI's storage dialogs live in `pve-manager` and cannot be extended by an
-out-of-tree plugin, so storages are created with `pvesm add truenasplugin
-...` or with this wizard. See
-[Configuration](Configuration.md#no-add-storage-dialog-in-the-gui).
+With pve-manager 9.2.29 or newer, select **Datacenter > Storage > Add > TrueNAS**.
+On older versions, use `pvesm add truenasplugin ...` or this wizard. See
+[Configuration](Configuration.md#add-storage-in-the-gui).
 
 #### Available Operations
 

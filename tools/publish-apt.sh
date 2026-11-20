@@ -52,19 +52,20 @@
 # shellcheck disable=SC2029
 set -euo pipefail
 
-# idk12..idk21 were cut from upstream 2.1.23~alpha1, idk22 from 2.1.23~beta8,
-# idk23 from the stable 2.1.23+deb1, idk24/idk25 from upstream 2.1.24~beta4, idk26..idk28 from 2.1.24~beta6, idk29 onward from
-# the final 2.1.24 (idk29 itself was never cut; the first is idk30); the
-# release tag carries the upstream base it was cut from.
+# The release tag carries the upstream base: idk12..idk21 use 2.1.23~alpha1,
+# idk22 uses 2.1.23~beta8, idk23 uses 2.1.23+deb1, idk24..idk25 use
+# 2.1.24~beta4, idk26..idk28 use 2.1.24~beta6, idk29..idk30 map to final
+# 2.1.24 (idk29 was never cut), and idk31 onward use 2.1.25~beta2.
 base_version_for() {
     local n="${1#idk}"
-    case "$n" in ''|*[!0-9]*) echo '2.1.24'; return ;; esac
+    case "$n" in ''|*[!0-9]*) echo '2.1.25-beta2'; return ;; esac
     if [ "$n" -le 21 ]; then echo '2.1.23-alpha1'
     elif [ "$n" -eq 22 ]; then echo '2.1.23-beta8'
     elif [ "$n" -eq 23 ]; then echo '2.1.23-deb1'
     elif [ "$n" -le 25 ]; then echo '2.1.24-beta4'
     elif [ "$n" -le 28 ]; then echo '2.1.24-beta6'
-    else echo '2.1.24'; fi
+    elif [ "$n" -le 30 ]; then echo '2.1.24'
+    else echo '2.1.25-beta2'; fi
 }
 VAULT_KEY='apt_signing_truenas_plugin'
 MIN_REVISION=15          # idk15 is the first revision worth serving

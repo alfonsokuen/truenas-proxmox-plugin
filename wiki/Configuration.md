@@ -5,7 +5,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
 ## Table of Contents
 
 - [Configuration File](#configuration-file)
-  - [No "Add storage" dialog in the GUI](#no-add-storage-dialog-in-the-gui)
+  - [Add storage in the GUI](#add-storage-in-the-gui)
 - [Required Parameters](#required-parameters)
   - [tn_api_host](#tn_api_host)
   - [tn_api_key](#tn_api_key)
@@ -84,13 +84,10 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
 
 All storage configurations are stored in `/etc/pve/storage.cfg`. This file is automatically shared across all cluster nodes.
 
-### No "Add storage" dialog in the GUI
+### Add storage in the GUI
 
-Datacenter > Storage > Add does not list TrueNAS. The dialogs there are
-ExtJS forms shipped inside `pve-manager`; an out-of-tree storage plugin
-cannot add one, so this is expected and not a broken installation. Once
-the storage exists it behaves like any other in the GUI - only its
-creation is on the command line:
+With pve-manager 9.2.29 or newer, select **Datacenter > Storage > Add > TrueNAS**.
+On older versions, create the storage from the command line:
 
 ```bash
 pvesm add truenasplugin tn-prod   --tn_api_host truenas.example.com --tn_api_key '<api-key>'   --tn_dataset tank/proxmox/prod --tn_target_iqn iqn.2005-10.org.freenas.ctl:pve   --content images,rootdir

@@ -1,3 +1,30 @@
+truenas-proxmox-plugin (1:2.1.25~beta2+idk31) unstable; urgency=medium
+
+  * Base upstream: 2.1.25~beta2 (0b933da). Se adopta el formulario de
+    almacenamiento de pve-manager 9.2.29+, los titulos del esquema y
+    APIVER 17 con el limite del host. Se conservan los secretos privados
+    y la validacion de ediciones del fork.
+  * iSCSI (#147): limpieza entre nodos de mapas multipath y rutas SCSI
+    huerfanas, con avisos WWID en pmxcfs y barrido con periodo de gracia.
+    tn_status_capacity_ttl_s ajusta ambas caches de capacidad. Sin
+    configurar, se conservan 30 s en memoria y 15 s en disco.
+  * NVMe (#134): gana la sonda del fork. Verifica holders, mountinfo por
+    namespace y raiz, y descriptores en /proc sin depender de fuser. Los
+    dispositivos ocultos por multipath no requieren major:minor propio.
+    Una comprobacion incierta impide desconectar, incluso en i==125.
+  * Se conservan las guardas al borrar y activar volumenes, el cap MDTS,
+    la creacion de snapshots con verificacion del ID y el backoff de
+    status ante errores de transporte. El broker solo prueba otro
+    mecanismo SCRAM en auto cuando falta el modulo correspondiente.
+  * Actualizaciones desde la Web Shell (#144): NO se adopta el reinicio
+    diferido de pvedaemon con systemd-run de upstream (un timer puede
+    dispararse mientras apt/dpkg sigue corriendo). El fork mantiene su
+    manejo de reinicios de pvedaemon, pvestatd, pvescheduler y pveproxy,
+    y recarga los daemons de HA. Se incorporan las notas de recuperacion
+    de upstream y se adaptan las pruebas nuevas a las guardas del fork.
+
+ -- Alfonso Kuen <alfonsokuen@gmail.com>  Thu, 19 Nov 2026 18:49:17 -0500
+
 truenas-proxmox-plugin (1:2.1.24+idk30) unstable; urgency=medium
 
   * Base upstream: la 2.1.24 final (tag v2.1.24), que promociona 2.1.24~beta8
@@ -52,6 +79,69 @@ truenas-proxmox-plugin (1:2.1.24+idk30) unstable; urgency=medium
     libjson-xs-perl del fork.
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Fri, 06 Nov 2026 12:00:00 -0500
+
+truenas-proxmox-plugin (2.1.25~beta2) unstable; urgency=medium
+
+  * GUI integration for the pve-manager 9.2.29+ custom-storage dialog.
+    When the plugin is loaded into a pve-manager that exposes
+    /plugins/storage/plugin/<type>, the new Add Storage dialog is now
+    driven by this schema and renders a readable two-column form instead
+    of the earlier flat list. Delivered via four hashes in plugindata():
+      - 'advanced-properties' (23 entries): tuning knobs admins commonly
+        touch, collapsed under an Advanced disclosure.
+      - 'hidden-properties' (19 entries): rarely-touched knobs whose
+        defaults fit every deployment seen in the field; still settable
+        via `pvesm set` or /etc/pve/storage.cfg.
+      - 'sensitive-properties' (4 entries, hash shape): API key and
+        three NVMe/iSCSI secrets. The dialog never renders their
+        stored value on edit; an empty field keeps the stored value.
+      - meta.display-name 'TrueNAS' for the Add dropdown label.
+    Nine essentials remain top-level: Content, Transport, TrueNAS host,
+    API key, TrueNAS account, Auth mechanism, Parent dataset, iSCSI
+    target IQN, iSCSI discovery portal, NVMe subsystem NQN. Each
+    property also carries a 'title' for its field label, so no field
+    falls back to the "Tn Api Username"-style auto-title.
+  * Bump $TESTED_APIVER from 16 to 17. pve-manager 9.2.30 advertises
+    APIVER 17, so older plugins log an "older storage API" warning on
+    every load; this bump silences it. No signature changes in the
+    plugin surface we exercise between 16 and 17.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 19 Nov 2026 12:47:23 -0500
+
+truenas-proxmox-plugin (2.1.25~beta1) unstable; urgency=medium
+
+  * fix(#147): cross-node stale multipath/sd cleanup after volume
+    delete. When one cluster node deletes an iSCSI+multipath volume,
+    every other node that was logged in used to keep the local SCSI
+    device and the multipath map for that LUN; ALUA then reported
+    every path as failed and multipathd logged
+    `tur checker reports path is down` every 5 s until an operator
+    cleaned up by hand, and TrueNAS LUN-number reuse risked a new
+    extent landing behind the stale sd on peer nodes. The deleting
+    node now drops a per-WWID marker under
+    /etc/pve/priv/truenas-plugin/stale-wwid/<storeid>/<wwid>, pmxcfs
+    replicates it cluster-wide, and every peer's next
+    activate_storage / status call tears down any matching local
+    sd + multipath map (scoped by target IQN so other TN storages
+    and non-TN iSCSI are never touched). A rate-limited floor sweep
+    in status() also cross-checks local WWIDs against TrueNAS's
+    current extent list for the storage's dataset and removes any
+    that stay absent longer than tn_reconcile_grace_s, fail-closed
+    on any TN query error. Three new per-storage knobs with safe
+    defaults: tn_reconcile (1), tn_reconcile_grace_s (120),
+    tn_reconcile_hint_ttl_s (600).
+  * feat(#147): tn_status_capacity_ttl_s per-storage knob. The
+    status() capacity-cache TTLs were previously hardcoded (30 s
+    in-process cache, 15 s on-disk stamp), which at N nodes * S
+    storages scale (reporter: 11 * 3) saturated the TrueNAS
+    middleware with roughly N*S pool.dataset.get_instance calls per
+    10 s. The new knob caps both TTLs together; raise it (60-120 s
+    is a good range) to reduce API churn at the cost of staler
+    `pvesm status` output. Default 30 s in-process and 15 s on-disk, as in
+    the fork (the 10 s upstream default would reopen the status-polling
+    burst that the fork already avoids).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 16 Nov 2026 14:49:32 -0500
 
 truenas-proxmox-plugin (1:2.1.24~beta6+idk28) unstable; urgency=medium
 

@@ -2,7 +2,8 @@
 # The release tag of a fork revision carries the upstream base it was cut from:
 #   idk12..idk21 -> v2.1.23-alpha1+idkNN
 #   idk22        -> v2.1.23-beta8+idk22
-#   idk23 onward -> v2.1.23-deb1+idkNN   (upstream's stable 2.1.23+deb1)
+#   idk23        -> v2.1.23-deb1+idk23
+#   idk31 onward -> v2.1.25-beta2+idkNN
 # install-idk.sh (download path) and tools/publish-apt.sh (APT publisher) each
 # carry their own copy of the mapping; a mismatch means one of them looks up a
 # tag that was never created. Both copies are exercised here and compared.
@@ -40,8 +41,9 @@ my %want = (
     idk28 => '2.1.24-beta6',
     idk29 => '2.1.24',
     idk30 => '2.1.24',
-    idk99 => '2.1.24',
-    ''    => '2.1.24',           # unparseable falls to the current base, as before
+    idk31 => '2.1.25-beta2',
+    idk99 => '2.1.25-beta2',
+    ''    => '2.1.25-beta2',           # unparseable falls to the current base, as before
 );
 for my $f (@FILES) {
     (my $label = $f) =~ s{^\Q$ROOT\E/}{};
@@ -59,7 +61,7 @@ open(my $fh, '<', $FILES[0]) or die "cannot read $FILES[0]: $!";
 my ($iv) = grep { /^INSTALLER_VERSION=/ } <$fh>;
 close $fh;
 like($iv // '', qr/^INSTALLER_VERSION='idk\d+\.\d+'$/, 'INSTALLER_VERSION matches idkN.M');
-like($iv // '', qr/'idk30\./, 'INSTALLER_VERSION is the idk30 line');
+like($iv // '', qr/'idk31\./, 'INSTALLER_VERSION is the idk31 line');
 
 # deb_version -> release tag, as .github/workflows/build-package.yml computes it.
 sub tag_for { my $v = shift; $v =~ s/~/-/g; $v =~ s/\+/-/ if $v =~ /\+deb/; return "v$v"; }
@@ -74,5 +76,8 @@ is(tag_for('2.1.24~beta6+idk28'), 'v2.1.24-beta6+idk28', 'workflow tag rule: idk
 is('v' . base_for($FILES[0], 'idk28') . '+idk28', tag_for('2.1.24~beta6+idk28'), 'scripts and workflow agree on the idk28 tag');
 is(tag_for('2.1.24+idk30'), 'v2.1.24+idk30', 'workflow tag rule: idk30 (final 2.1.24 base) keeps +idk30');
 is('v' . base_for($FILES[0], 'idk30') . '+idk30', tag_for('2.1.24+idk30'), 'scripts and workflow agree on the idk30 tag');
+
+is(tag_for('2.1.25~beta2+idk31'), 'v2.1.25-beta2+idk31', 'workflow tag rule: idk31 keeps +idk31');
+is('v' . base_for($FILES[0], 'idk31') . '+idk31', tag_for('2.1.25~beta2+idk31'), 'scripts and workflow agree on the idk31 tag');
 
 done_testing;

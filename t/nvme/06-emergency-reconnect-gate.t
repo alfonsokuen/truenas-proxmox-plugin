@@ -127,6 +127,9 @@ sub run_lookup {
     return $@;
 }
 
+# The fork keeps its guarded post-loop reconnect and its own log wording.
+my $emergency_firing = qr/EMERGENCY RECONNECT after 150-iteration budget/;
+
 sub log_matches {
     my ($rx) = @_;
     for my $e (@LOG) {
@@ -135,7 +138,7 @@ sub log_matches {
     return 0;
 }
 
-# ----- Case 1: fuser says in-use → gate must SKIP the reconnect ------
+# ----- Case 1: the probe says in-use → gate must SKIP the reconnect ------
 {
     reset_capture();
     $STUB_IN_USE = 1;
@@ -153,11 +156,11 @@ sub log_matches {
         'in-use case: log explains why');
     ok(log_matches(qr/GitHub #131/),
         'in-use case: log references the issue');
-    ok(!log_matches(qr/EMERGENCY RECONNECT after 150-iteration budget/),
+    ok(!log_matches($emergency_firing),
         'in-use case: emergency reconnect line NOT fired');
 }
 
-# ----- Case 2: fuser says clear → emergency reconnect runs ---------
+# ----- Case 2: the probe says clear → emergency reconnect runs ---------
 {
     reset_capture();
     $STUB_IN_USE = 0;
@@ -171,23 +174,22 @@ sub log_matches {
         'idle case: _nvme_connect called by the emergency path (count='
         . scalar(@CONNECTS) . ')');
 
-    ok(log_matches(qr/EMERGENCY RECONNECT after 150-iteration budget/),
-        'idle case: EMERGENCY RECONNECT log line fired');
+    ok(log_matches($emergency_firing),
+        'idle case: emergency reconnect FIRING log line fired');
     ok(!log_matches(qr/emergency reconnect SKIPPED.+subsystem is in use/),
         'idle case: SKIPPED(in-use) log line NOT fired');
 }
 
-# ----- Case 3: fuser-not-installed fallback (fail-safe assume-in-use) ---
+# ----- Case 3: an incomplete kernel probe (fail-safe assume-in-use) ---
 {
-    # _nvme_check_devices_in_use returning 1 is also what the real
-    # helper does when `fuser` is not on PATH. The gate must still skip.
+    # The fork treats an unreadable sysfs or proc view as busy.
     reset_capture();
     $STUB_IN_USE = 1;
     run_lookup();
     is(scalar @DISCONNECTS, 0,
-        'fuser-missing fallback: gate still skips (fail-safe path)');
+        'incomplete probe: gate still skips (fail-safe path)');
     ok(log_matches(qr/emergency reconnect SKIPPED/),
-        'fuser-missing fallback: SKIPPED log line fired');
+        'incomplete probe: SKIPPED log line fired');
 }
 
 done_testing();
