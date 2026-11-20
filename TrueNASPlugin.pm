@@ -11178,6 +11178,12 @@ sub _nvme_delete_namespace {
             ($_->{id} // '') ne ($owned->{id} // '') || ($_->{device_uuid} // '') ne ($owned->{device_uuid} // '')
         } @$namespaces;
     }
+    # One zvol exports one namespace. A second row (or a UUID other than the
+    # volume's) may be what another volume name points at: delete none of them.
+    die "Refusing to delete NVMe namespaces for $path: found " . scalar(@$namespaces)
+      . " namespaces for one zvol or a UUID other than " . ($uuid // 'the volume\'s')
+      . "; leaving them and the zvol in place\n"
+        if @$namespaces > 1 || (defined($uuid) && grep { lc($_->{device_uuid}) ne lc($uuid) } @$namespaces);
 
     my @failed;
     for my $ns (@$namespaces) {
@@ -14271,6 +14277,10 @@ sub _teardown_snapshot_device {
 
     _log($scfg, 1, 'info', "[TrueNAS] _teardown_snapshot_device: tearing down $clone_zname");
 
+    # Pin the clone's generation while it is still exported: an unreadable
+    # identity dies here, before the export is retired or anything deleted.
+    my @identity = _read_dataset_delete_identity($scfg, $clone_full);
+
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
@@ -14378,7 +14388,8 @@ sub _teardown_snapshot_device {
     # success while the zvol is still live (a holder has the device open), so
     # for the clone a "success" is confirmed by reading the dataset back.
     _udev_settle_bounded();
-    eval { _delete_dataset_with_retry($scfg, $clone_full, undef, { verify_gone => 1 }) };
+    eval { _delete_dataset_with_retry($scfg, $clone_full, undef,
+        { verify_gone => 1, identity => (@identity ? \@identity : undef) }) };
     if (my $err = $@) {
         die "[TrueNAS] _teardown_snapshot_device: could not delete the snapshot clone $clone_full: $err";
     }

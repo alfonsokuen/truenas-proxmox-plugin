@@ -40,6 +40,8 @@
 23. Expone el snapshot bajo el lock de almacenamiento: una activación fallida no retira la de otra.
 24. Un listado completo de namespaces vacío con UUID conocido deja el namespace y el zvol en su sitio.
 25. Un resize que no rescanea ningún controlador NVMe termina con error.
+26. Si un zvol tiene más de un namespace, o uno con otro UUID, el borrado no retira ninguno y termina con error.
+27. El desmontaje del clon de vzdump fija su identidad ZFS antes de retirar la exportación; si no puede leerla, no retira ni borra nada.
 
 Límites conocidos: un alias desde otro ID de storage o un CT remoto con `dev0` no bloquean; el sufijo `.raw` da un falso positivo; la primera actualización desde idk30 aún usa el handler TERM antiguo; el barrido iSCSI #147 se abstiene sin mapeos y puede no limpiar nunca; borrar el último namespace del array falla cerrado si TrueNAS ya no lo lista.
 

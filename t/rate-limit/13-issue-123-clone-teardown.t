@@ -219,7 +219,8 @@ eval { $pkg->_teardown_snapshot_device($scfg, $volname, $snapname) };
 like($@, qr/TN masked EBUSY/,
     'Fix A: silent-success caught by readback dies with "TN masked EBUSY"');
 is(scalar(@delete_calls), 3, "Fix A: silent-success is retried up to the engine's attempts");
-is_deeply(\@dataset_events, [qw(get delete get get delete get get delete get)],
+# The leading get pins the clone's identity before its export is retired.
+is_deeply(\@dataset_events, [qw(get get delete get get delete get get delete get)],
     'Fix A: each attempt reads identity before delete and verifies each reported success');
 
 # Case: silent-success on first attempt, real gone on second (holder released the FD)
@@ -241,7 +242,7 @@ like($@, qr/Refusing to report success|still on the array/i,
 eval { $pkg->_teardown_snapshot_device($scfg, $volname, $snapname) };
 like($@, qr/Cannot (?:confirm|verify ZFS identity)/i,
     'Fix A (fork): success + empty readback is NOT proof the clone is gone');
-is_deeply(\@dataset_events, [qw(get delete get)],
+is_deeply(\@dataset_events, [qw(get get delete get)],
     'Fix A (fork): empty post-delete readback does not trigger another delete');
 
 # ============================================================
