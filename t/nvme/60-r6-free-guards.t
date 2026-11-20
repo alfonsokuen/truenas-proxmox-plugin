@@ -44,6 +44,8 @@ local *{"${pkg}::_nvme_pending_free_mark"} = sub {};
 local *{"${pkg}::_nvme_pending_free_clear_if_exported"} = sub {};
 local *{"${pkg}::_handle_api_result_with_job_support"} = sub { { success => 1 } };
 local *{"${pkg}::_get_cached"} = sub { undef };
+# The delete worker takes the storage lock per attempt; no real cluster here.
+local *{"${pkg}::cluster_lock_storage"} = sub { $_[4]->(@_[5 .. $#_]) };
 local *{"${pkg}::_set_cache"} = sub {};
 
 # One simulated array: a zvol (by GUID) and the namespace query answers in
