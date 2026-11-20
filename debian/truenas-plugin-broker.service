@@ -21,10 +21,16 @@ NotifyAccess=main
 # A lost READY=1 would otherwise hold the start for the 90 s default and then kill
 # a broker that is in fact serving. Fail fast and let Restart= retry.
 TimeoutStartSec=30
-# The parent coordinates draining. Allow the default 90 s RPC budget, 10 s
-# each for request and response framing, plus worker cleanup. If raising
-# either broker budget above 90 s, also set this above that budget plus 25 s.
-KillMode=mixed
+# On TERM the parent signals the workers, unpublishes the socket and exits at
+# once, so a restart starts the next broker within seconds instead of after
+# the slowest in-flight RPC. Each worker finishes the request it accepted and
+# exits on its own (bounded by its own alarm, the window below). KillMode=process
+# keeps systemd from SIGKILLing those workers when the parent exits; systemd
+# will log "left-over process" for them when the next broker starts, which is
+# expected. The stop timeout still covers the default 90 s RPC budget, 10 s
+# each for request and response framing, plus worker cleanup. If raising either
+# broker budget above 90 s, also set this above that budget plus 25 s.
+KillMode=process
 TimeoutStopSec=120
 ExecStart=/usr/sbin/truenas-plugin-broker --foreground
 Restart=on-failure

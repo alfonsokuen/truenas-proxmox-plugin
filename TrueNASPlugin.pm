@@ -4064,46 +4064,59 @@ sub volume_resize {
     # IMPORTANT: Proxmox passes the ABSOLUTE target size in BYTES.
     my $req_bytes = int($new_size_bytes);
 
-    # Grow-only enforcement
-    die "shrink not supported (current=$cur_bytes requested=$req_bytes)\n"
-        if $req_bytes <= $cur_bytes;
-
-    # Align up to volblocksize to avoid middleware alignment complaints
+    # Align up to volblocksize to avoid middleware alignment complaints.
+    # Done BEFORE the grow-only check: a retry of a resize whose TrueNAS grow
+    # already landed (the first attempt died after it, e.g. no NVMe controller
+    # rescanned) asks for the same, possibly unaligned, size and must compare
+    # against the aligned value the first attempt actually wrote.
     if ($bs_bytes && $bs_bytes > 0) {
         my $rem = $req_bytes % $bs_bytes;
         $req_bytes += ($bs_bytes - $rem) if $rem;
     }
 
+    # Grow-only enforcement
+    die "shrink not supported (current=$cur_bytes requested=$req_bytes)\n"
+        if $req_bytes < $cur_bytes;
+
+    # Equal size: idempotent retry. The zvol already has the target size, so
+    # skip the grow, but still redo the initiator rescan below (and still fail
+    # when no NVMe controller is rescanned) so the host sees the new size.
+    my $already_sized = $req_bytes == $cur_bytes;
+    _log($scfg, 1, 'info', "[TrueNAS] volume_resize: $volname already has $req_bytes bytes on TrueNAS; rescanning only")
+        if $already_sized;
+
     # Compute delta AFTER alignment
     my $delta = $req_bytes - $cur_bytes;
 
-    # ---- Preflight: mirror TrueNAS middleware's ~80% headroom rule ----
-    my $pds = eval { _tn_dataset_get($scfg, $scfg->{tn_dataset}) } // {};
-    my $avail_bytes = _normalize_value($pds->{available}); # parent dataset/pool available
-    my $max_grow    = $avail_bytes ? int($avail_bytes * 0.80) : 0;
-    if ($avail_bytes && $delta > $max_grow) {
-        my $fmt_g = sub { sprintf('%.2f GiB', $_[0] / (1024*1024*1024)) };
-        die sprintf(
-            "resize refused by preflight: requested grow %s exceeds TrueNAS ~80%% headroom (%s) on dataset %s.\n".
-            "Reduce the grow amount or free space on the backing dataset/pool.\n",
-            $fmt_g->($delta), $fmt_g->($max_grow), $scfg->{tn_dataset}
+    if (!$already_sized) {
+        # ---- Preflight: mirror TrueNAS middleware's ~80% headroom rule ----
+        my $pds = eval { _tn_dataset_get($scfg, $scfg->{tn_dataset}) } // {};
+        my $avail_bytes = _normalize_value($pds->{available}); # parent dataset/pool available
+        my $max_grow    = $avail_bytes ? int($avail_bytes * 0.80) : 0;
+        if ($avail_bytes && $delta > $max_grow) {
+            my $fmt_g = sub { sprintf('%.2f GiB', $_[0] / (1024*1024*1024)) };
+            die sprintf(
+                "resize refused by preflight: requested grow %s exceeds TrueNAS ~80%% headroom (%s) on dataset %s.\n".
+                "Reduce the grow amount or free space on the backing dataset/pool.\n",
+                $fmt_g->($delta), $fmt_g->($max_grow), $scfg->{tn_dataset}
+            );
+        }
+        # ---- End preflight ----
+
+        # Perform the TrueNAS zvol grow
+        my $payload = { volsize => int($req_bytes) };
+        my $result = _api_call(
+            $scfg,
+            'pool.dataset.update',
+            [ $full, $payload ],
         );
-    }
-    # ---- End preflight ----
 
-    # Perform the TrueNAS zvol grow
-    my $payload = { volsize => int($req_bytes) };
-    my $result = _api_call(
-        $scfg,
-        'pool.dataset.update',
-        [ $full, $payload ],
-    );
-
-    # Wait for resize job completion before rescanning (prevent race condition)
-    my $job_result = _handle_api_result_with_job_support($scfg, $result, "volume resize for $volname", 60);
-    if (!$job_result->{success}) {
-        _log($scfg, 0, 'err', "[TrueNAS] volume_resize: failed for $volname: " . $job_result->{error});
-        die $job_result->{error};
+        # Wait for resize job completion before rescanning (prevent race condition)
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "volume resize for $volname", 60);
+        if (!$job_result->{success}) {
+            _log($scfg, 0, 'err', "[TrueNAS] volume_resize: failed for $volname: " . $job_result->{error});
+            die $job_result->{error};
+        }
     }
 
     _invalidate_status_capacity_cache($storeid, $scfg);

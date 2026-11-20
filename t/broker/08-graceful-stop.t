@@ -5,9 +5,13 @@ use FindBin;
 use Test::More;
 use Errno qw(EAGAIN ECHILD);
 
-my ($fork, $waitpid, $kill, $unlink);
+my ($fork, $waitpid, $kill, $unlink, @alarms);
 BEGIN {
     *CORE::GLOBAL::fork = sub () { $fork->() };
+    # The worker below runs inline (fork returns 0 in this process), so its
+    # parent is this process; it exits early if getppid() says otherwise.
+    *CORE::GLOBAL::getppid = sub () { $$ };
+    *CORE::GLOBAL::alarm = sub (;$) { push @alarms, $_[0]; 0 };
     *CORE::GLOBAL::waitpid = sub ($$) { $waitpid->(@_) };
     *CORE::GLOBAL::kill = sub { $kill->(@_) };
     *CORE::GLOBAL::exit = sub (;$) { die "exit $_[0]\n" };
@@ -57,6 +61,17 @@ my $listener = bless {}, 'BrokerTest::Socket';
 local *make_listener = sub { $listener };
 $unlink = sub { return scalar @_ };
 
+open(my $unit_fh, '<', $unit) or die "cannot read $unit: $!";
+my $service = do { local $/; <$unit_fh> };
+close $unit_fh;
+open(my $broker_fh, '<', $broker) or die "cannot read $broker: $!";
+my $broker_source = do { local $/; <$broker_fh> };
+close $broker_fh;
+my ($rpc_budget) = $broker_source =~ /my \$MAX_BUDGET = .*? \|\| (\d+);/;
+my ($client_framing) = $broker_source =~ /my \$CLIENT_READ_TIMEOUT = (\d+);/;
+my $max_request = $rpc_budget + 2 * $client_framing;
+my ($service_stop) = $service =~ /^TimeoutStopSec=(\d+)$/m;
+
 subtest 'TERM lets a mutation finish and sends its response before the worker exits' => sub {
     local $SIG{TERM};
     local $SIG{INT};
@@ -88,21 +103,20 @@ subtest 'TERM lets a mutation finish and sends its response before the worker ex
         ['sent pool.dataset.create', 'upstream replied', 'reply tank/test', 'client closed'],
         'TERM does not discard the in-flight RPC result');
     is($listener->{accepts}, 1, 'worker accepts no further connections');
+    # The parent no longer waits for or escalates a draining worker, so the
+    # worker bounds its own request with the window the parent used to allow.
+    is(scalar(@alarms), 2, 'the request is bracketed by one alarm and one disarm');
+    cmp_ok($alarms[0] // 0, '>=', $max_request, 'the worker alarm covers the RPC and both client frames');
+    is($alarms[-1], 0, 'the alarm is disarmed once the request is done');
 };
 
-open(my $unit_fh, '<', $unit) or die "cannot read $unit: $!";
-my $service = do { local $/; <$unit_fh> };
-close $unit_fh;
-open(my $broker_fh, '<', $broker) or die "cannot read $broker: $!";
-my $broker_source = do { local $/; <$broker_fh> };
-close $broker_fh;
-my ($rpc_budget) = $broker_source =~ /my \$MAX_BUDGET = .*? \|\| (\d+);/;
-my ($client_framing) = $broker_source =~ /my \$CLIENT_READ_TIMEOUT = (\d+);/;
-my $max_request = $rpc_budget + 2 * $client_framing;
-my ($service_stop) = $service =~ /^TimeoutStopSec=(\d+)$/m;
 cmp_ok($service_stop // 0, '>', $max_request, 'systemd stop timeout covers RPC and both client frames');
 
-subtest 'supervisor waits for workers but kills any who exceed the drain limit' => sub {
+# The parent used to wait up to the drain window and then SIGKILL; under
+# KillMode=mixed that held the next broker back for the whole drain. Now it
+# signals the workers and exits at once (they bound themselves, see the alarm
+# assertions above); t/broker/13 shows the in-flight reply still arrives.
+subtest 'supervisor signals the workers and exits without waiting or escalating' => sub {
     local $SIG{TERM};
     local $SIG{INT};
     @events = ();
@@ -129,12 +143,11 @@ subtest 'supervisor waits for workers but kills any who exceed the drain limit' 
     local *Time::HiRes::clock_gettime = sub { $elapsed };
     local *Time::HiRes::sleep = sub { $elapsed += $_[0] };
     eval { main() };
-    is($@, "exit 0\n", 'parent exits after bounding the wait');
-    is_deeply([grep { /^signal / } @events], ["signal TERM $pid", "signal KILL $pid"],
-        'only the lingering worker is escalated to KILL');
-    cmp_ok($elapsed, '>=', $max_request, 'worker gets the full request window to finish');
-    cmp_ok($elapsed, '<', $service_stop // 0, 'parent stops before the systemd deadline');
-    is($socket_removals, 0, 'keeps the path if a signalled worker has not exited');
+    is($@, "exit 0\n", 'parent exits right after the TERM');
+    is_deeply([grep { /^signal / } @events], ["signal TERM $pid"],
+        'the worker is signalled once and never escalated to KILL');
+    cmp_ok($elapsed, '<', 1, 'the parent does not wait for the drain');
+    is($socket_removals, 1, 'the parent unpublishes the socket for the next broker');
     $unlink = sub { return scalar @_ };
 };
 
@@ -173,7 +186,10 @@ subtest 'supervisor exits with failure when the last worker cannot be replaced' 
     is($@, "exit 1\n", 'systemd gets a failure exit when capacity reaches zero');
 };
 
-subtest 'the listener path stays published until in-flight workers exit' => sub {
+# Inverted on purpose: the old parent kept the path until the drain ended, so
+# the next broker (which can only start once the parent is gone) waited for it.
+# Clients now retry ENOENT/ECONNREFUSED until the next broker binds (t/broker/10).
+subtest 'the parent unpublishes the socket and pidfile before the in-flight worker exits' => sub {
     local $SIG{TERM};
     local $SIG{INT};
     @events = ();
@@ -184,6 +200,7 @@ subtest 'the listener path stays published until in-flight workers exit' => sub 
     $kill = sub { $started_drain = 1; return 1 };
     $unlink = sub {
         push @events, ['socket removed', $elapsed] if $_[0] =~ /broker\.sock$/;
+        push @events, ['pidfile removed', $elapsed] if $_[0] =~ /broker\.pid$/;
         return scalar @_;
     };
     $waitpid = sub {
@@ -198,12 +215,12 @@ subtest 'the listener path stays published until in-flight workers exit' => sub 
     local *Time::HiRes::clock_gettime = sub { $elapsed };
     local *Time::HiRes::sleep = sub { $elapsed += $_[0] };
     eval { main() };
-    is($@, "exit 0\n", 'supervisor drains normally');
-    is_deeply([grep { ref } @events], [['worker finished', 4], ['socket removed', 4]],
-        'no part of the four-second drain occurs without the socket path');
+    is($@, "exit 0\n", 'supervisor exits normally');
+    is_deeply([grep { ref } @events], [['socket removed', 0], ['pidfile removed', 0]],
+        'both paths go at the TERM, without waiting out the four-second request');
 };
 
-subtest 'new connections are refused for the whole drain, right after the TERM' => sub {
+subtest 'new connections are refused from the TERM until the path is unpublished' => sub {
     local $SIG{TERM};
     local $SIG{INT};
     my $elapsed = 0;
@@ -213,21 +230,21 @@ subtest 'new connections are refused for the whole drain, right after the TERM' 
     $fork = sub { $worker };
     # TERM first, so no idle worker wakes up for the refused connections.
     $kill = sub { push @order, 'TERM'; 1 };
-    $unlink = sub { return scalar @_ };
+    # By the time the parent unpublishes the path the listener must refuse.
+    $unlink = sub {
+        push @order, $listener->{shutdowns} ? 'drain refusing' : 'drain accepting'
+            if $_[0] =~ /broker\.sock$/;
+        return scalar @_;
+    };
     $waitpid = sub {
-        if (!@order) {
-            $SIG{TERM}->();
-            return 0;
-        }
-        push @order, $listener->{shutdowns} ? 'drain refusing' : 'drain accepting' if @order == 1;
-        return 0 if $elapsed < 2;
-        return $worker;
+        $SIG{TERM}->() if !@order;
+        return 0;
     };
     local *Time::HiRes::clock_gettime = sub { $elapsed };
     local *Time::HiRes::sleep = sub { $elapsed += $_[0] };
     eval { main() };
     is($@, "exit 0
-", 'supervisor drains normally');
+", 'supervisor exits normally');
     is_deeply(\@order, ['TERM', 'drain refusing'],
         'a client connecting during the drain is refused, not left in the backlog');
     is($listener->{shutdowns}, 1, 'the listener is shut down for reading exactly once');
