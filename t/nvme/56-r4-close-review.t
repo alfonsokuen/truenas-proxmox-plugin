@@ -101,7 +101,11 @@ subtest 'HIGH: an export the first lookups missed is checked for use before its 
         my (undef, $method, $args) = @_;
         if ($method eq 'nvmet.namespace.delete') { push @ns_deletes, $args->[0]; return 1 }
         die "unexpected RPC $method" unless $method eq 'nvmet.namespace.query';
-        return ++$queries <= 2 ? [] : [$row];
+        # The filtered query misses it and the full listing shows only another
+        # zvol (two empty answers are no longer absence), then the delete sees it.
+        ++$queries;
+        return $queries == 1 ? [] : $queries == 2
+            ? [{ id => 3, device_path => 'zvol/tank/pve/vm-200-disk-0', device_uuid => $uuid }] : [$row];
     };
     local *{"${pkg}::_nvme_find_device_by_subsystem"} = sub {
         return { selector_outcome => 'exact_match', selected_device_path => '/dev/nvme0n5' };
@@ -127,7 +131,10 @@ subtest 'M2: an empty full listing with a known UUID is not absence' => sub {
     $filtered = [{ id => 7, device_path => $path }];
     ok(!eval { $confirm->($scfg, $path, undef); 1 }, 'a row from the path query + empty full listing fails closed');
     $filtered = [];
-    is_deeply($confirm->($scfg, $path, undef), [], 'nothing known and nothing listed is still absence');
+    # r6: two empty answers prove nothing either; absence needs a non-empty
+    # listing without the path or the zvol answering ENOENT.
+    ok(!eval { $confirm->($scfg, $path, undef); 1 }, 'nothing known and nothing listed fails closed');
+    like($@, qr/both empty/, 'and says the two empty answers are not proof');
 };
 
 subtest 'HIGH: overlapping activations of one snapshot cannot tear down a live export' => sub {

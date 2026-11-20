@@ -10786,6 +10786,18 @@ sub _nvme_confirm_namespaces_for_path {
           . (defined($uuid) ? "the volume names UUID $uuid" : 'the path query returned a row')
           . "; leaving the namespace and its zvol in place\n"
             if !@$all && (defined($uuid) || (ref($rows) eq 'ARRAY' && @$rows));
+        # Two empty answers are not absence either, even with nothing known:
+        # callers read [] as "nothing exported" and go on to unpublish and
+        # delete. Absence needs a non-empty listing without the path, or the
+        # backing zvol itself answering ENOENT (nvmet cannot export a missing zvol).
+        if (!@$all) {
+            my ($ds) = $path =~ m{\Azvol/(.+)\z};
+            my $gone = defined($ds) && !eval { _tn_dataset_get($scfg, $ds, { retry_max => 0 }); 1 }
+                && _is_dataset_absent_error($@);
+            die "Could not verify NVMe namespace for $path: the path query and the full listing are both "
+              . "empty, which is not proof that nothing is exported; leaving the namespace and its zvol in place\n"
+                unless $gone;
+        }
         die "Could not verify NVMe namespace for $path: its UUID points at a different zvol\n"
             if defined($uuid) && grep { lc($_->{device_uuid}) eq lc($uuid) && $_->{device_path} ne $path } @$all;
         $rows = [grep { $_->{device_path} eq $path } @$all];
@@ -12675,7 +12687,6 @@ sub _free_image_nvme {
                 . "nothing exported to check for local use");
         }
     }
-    my %use_checked;
     my $assert_unused_here = sub {
         my ($uuid) = @_;
         my $found = eval { _nvme_find_device_by_subsystem($scfg, $uuid) };
@@ -12686,7 +12697,6 @@ sub _free_image_nvme {
               . "and leave the zvol $full_ds orphaned and invisible to list_images. "
               . "Stop whatever uses the volume (shut down the guest, unmount) and retry.\n";
         }
-        $use_checked{lc $uuid} = 1;
     };
     $assert_unused_here->($local_uuid) if defined $local_uuid;
 
@@ -12698,17 +12708,25 @@ sub _free_image_nvme {
 
     my $need_force_disconnect = 0;
 
-    my $assert_free = sub { _assert_nvme_cluster_unreferenced($class, $storeid, $volname, $zname, $local_uuid) };
-    # The lookups above can miss an export that the delete's own query finds:
-    # check each namespace not yet checked right before deleting it.
+    # Every UUID this free has seen for the volume: a guest config can name the
+    # disk by its by-id/UUID path only, so the cluster check must know each one.
+    my %ref_uuids = defined($local_uuid) ? (lc($local_uuid) => $local_uuid) : ();
+    my $assert_free = sub {
+        my @uuids = values %ref_uuids;
+        _assert_nvme_cluster_unreferenced($class, $storeid, $volname, $zname, $_) for @uuids ? @uuids : (undef);
+    };
+    # The lookups above can miss an export that the delete's own query finds,
+    # and a device can appear (or open) after an earlier probe found none:
+    # check the cluster with this namespace's UUID and probe local use right
+    # before deleting each namespace, never relying on an earlier answer.
     my $before_ns_delete = sub {
         my ($ns) = @_;
-        $assert_free->();
         my $ns_uuid = ref($ns) eq 'HASH' ? $ns->{device_uuid} // '' : '';
-        die "[TrueNAS] refusing to free '$volname': a namespace for it has no UUID to check for local use
-"
+        die "[TrueNAS] refusing to free '$volname': a namespace for it has no UUID to check for local use\n"
             if $ns_uuid eq '';
-        $assert_unused_here->($ns_uuid) unless $use_checked{lc $ns_uuid};
+        $ref_uuids{lc $ns_uuid} //= $ns_uuid;
+        $assert_free->();
+        $assert_unused_here->($ns_uuid);
     };
     my $dataset = _assert_no_child_datasets($scfg, $full_ds);
     $assert_free->();
