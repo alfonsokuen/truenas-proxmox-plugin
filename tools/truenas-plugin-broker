@@ -1358,14 +1358,13 @@ my $STOP_SIGNALS = POSIX::SigSet->new(SIGTERM, SIGINT);
 # accepts on its inherited fd and owns its own connections to TrueNAS.
 sub spawn_worker {
     my ($srv, $stopping, $workers) = @_;
-    my $parent = $$;
     my $pid = fork();
     if (!defined $pid) {
         lerr("fork worker failed: $!");
         return;
     }
     if ($pid == 0) {
-        worker_loop($srv, $stopping, $parent);
+        worker_loop($srv, $stopping);
         for my $e (values %POOL) {
             eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
         }
@@ -1376,17 +1375,10 @@ sub spawn_worker {
 }
 
 sub worker_loop {
-    my ($srv, $stopping, $parent) = @_;
+    my ($srv, $stopping) = @_;
     my $sel = IO::Select->new($srv);
     my $last_reap = time();
     while (!$$stopping) {
-        # The unit runs with KillMode=process, so systemd no longer kills the
-        # workers when the parent dies. A parent that vanished without
-        # signalling us (crash, SIGKILL) must not leave an orphan listener.
-        if (defined $parent && getppid() != $parent) {
-            lwarn("broker parent pid=$parent is gone; worker exiting");
-            last;
-        }
         # A TERM just before select() must not leave an idle worker waiting.
         if ($sel->can_read($WORKER_POLL) && !$$stopping) {
             my $c = $srv->accept();
@@ -1398,16 +1390,9 @@ sub worker_loop {
                 sigprocmask(SIG_BLOCK, $STOP_SIGNALS, $old_mask)
                     or die "cannot block stop signals during request: $!";
                 my $accepted_at = time();
-                # The parent no longer waits for (nor escalates) a draining
-                # worker: it exits at once so the next broker can listen. This
-                # is the worker's own bound, the same window the parent used
-                # to allow; the request has its own, shorter deadlines, so the
-                # default SIGALRM action only ends a worker that is wedged.
-                alarm($DRAIN_TIMEOUT);
                 eval { handle_request($c, $accepted_at) unless $$stopping; };
                 if ($@) { lerr("handle_request died: $@"); }
                 eval { $c->close(); };
-                alarm(0);
                 sigprocmask(SIG_SETMASK, $old_mask)
                     or die "cannot restore signal mask after request: $!";
             }
@@ -1422,18 +1407,35 @@ sub worker_loop {
 sub stop_workers {
     my ($workers, $srv) = @_;
     linfo("parent shutting down, signalling workers");
+    my $deadline = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) + $DRAIN_TIMEOUT;
+    my $escalated = 0;
     kill 'TERM', keys %$workers;
     # Nobody accepts once the workers stop: refuse new connections (after the
     # TERM, so no idle worker wakes for them) and a client gets ECONNREFUSED
     # and retries against the replacement broker instead of waiting in the
     # backlog for an EOF. Requests already accepted still finish.
     $srv->shutdown(0) or lwarn("cannot refuse new connections while draining: $!") if $srv;
-    # Do NOT wait for the drain. While this process lives, systemd does not
-    # start the replacement broker, so every RPC on the node waited out the
-    # slowest in-flight request (up to $DRAIN_TIMEOUT). The signalled workers
-    # finish their accepted request on their own, bounded by their alarm, and
-    # the unit's KillMode=process keeps systemd from killing them when we exit.
-    return;
+    while (%$workers) {
+        my $dead = waitpid(-1, WNOHANG);
+        if ($dead > 0) {
+            delete $workers->{$dead};
+            next;
+        }
+        return 1 if $dead < 0 && $!{ECHILD};
+        my $remaining = $deadline - Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC());
+        if ($remaining <= 0) {
+            return 0 if $escalated;
+            lwarn("worker shutdown deadline expired; killing remaining workers");
+            kill 'KILL', keys %$workers;
+            $escalated = 1;
+            # SIGKILL delivery is asynchronous. Give waitpid a bounded
+            # chance to confirm exit before dropping the published path.
+            $deadline += 1;
+            next;
+        }
+        Time::HiRes::sleep($remaining < $SUPERVISOR_POLL ? $remaining : $SUPERVISOR_POLL);
+    }
+    return 1;
 }
 
 sub main {
@@ -1497,12 +1499,9 @@ sub main {
         }
         Time::HiRes::sleep($SUPERVISOR_POLL) unless $stopping;
     }
-    stop_workers(\%workers, $srv) if %workers;
+    my $drained = !%workers || stop_workers(\%workers, $srv);
     $srv->close();
-    # Unpublish before exiting: the next broker binds a fresh socket here, and
-    # clients retry ENOENT/ECONNREFUSED until it does. The draining workers
-    # keep only their inherited listener fd and never touch these paths.
-    unlink $SOCKET_PATH;
+    unlink $SOCKET_PATH if $drained;
     unlink $PIDFILE;
     exit $status;
 }

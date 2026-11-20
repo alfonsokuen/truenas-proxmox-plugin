@@ -1,12 +1,12 @@
 #!/usr/bin/perl
-# A broker restart must not hold every RPC on the node for the slowest
-# in-flight request, and must not lose that request either.
+# A broker restart must not lose the in-flight request, and systemd must not
+# see the unit stopped while a worker is still serving one.
 #
-# The unit runs with KillMode=process: on TERM systemd signals only the main
-# process and starts the next broker as soon as it exits. Before this change
-# the main process waited for its workers to drain (up to ~115 s), so the next
-# broker could not start for that long. Now it signals the workers, unpublishes
-# the socket and exits; the worker that accepted a request still answers it.
+# The unit runs with KillMode=mixed: on TERM systemd signals the main process
+# and, once it exits, SIGKILLs whatever is left in the cgroup. So the main
+# process stops accepting, waits (bounded) for its workers and only then exits.
+# Known cost: no RPC is served on the node until that drain ends; the plugin
+# retries a missing or refusing socket for 30 s.
 #
 # This drives REAL processes: an upstream that answers like TrueNAS (and takes
 # 8 s for test.slow), broker 1 serving that slow request, a TERM to broker 1's
@@ -33,7 +33,6 @@ Digest::SHA->import(qw(sha1));
 require MIME::Base64; MIME::Base64->import(qw(encode_base64));
 
 my $SLOW_SECONDS = 8;
-my $RESTART_LIMIT = 5;
 
 # Keep the run dir short: a Unix socket path is capped near 108 bytes.
 my $rundir = tempdir("/tmp/brkr.XXXXXX", CLEANUP => 1);
@@ -182,48 +181,68 @@ plan skip_all => "broker socket never appeared at $SOCK" unless -S $SOCK;
 my $warm = ping_with_retry(10);
 is($warm && $warm->{result}, 'pong', 'broker 1 serves a request');
 
+# The workers of broker 1, as the kernel lists them (pid, ppid in /proc).
+sub children_of {
+    my ($parent) = @_;
+    my @kids;
+    opendir(my $dh, '/proc') or return;
+    for my $pid (grep { /^\d+$/ } readdir($dh)) {
+        open(my $fh, '<', "/proc/$pid/stat") or next;
+        my $stat = <$fh> // '';
+        close($fh);
+        push @kids, $pid if $stat =~ /^\d+ \(.*\) \S+ (\d+)/s && $1 == $parent;
+    }
+    closedir($dh);
+    return @kids;
+}
+my @workers1 = children_of($broker1);
+
 # The in-flight request: accepted by a broker 1 worker and forwarded upstream.
 my $slow = IO::Socket::UNIX->new(Peer => $SOCK, Type => SOCK_STREAM) or die "connect: $!";
 $slow->syswrite(envelope('test.slow', 30));
 $waited = 0;
 while (!-e $SLOW_SEEN && $waited < 100) { sleep 0.05; $waited++ }
+my $slow_started = time();
 ok(-e $SLOW_SEEN, 'the slow request reached the upstream before the restart');
+
 
 my $t0 = time();
 kill 'TERM', $broker1;
-# What systemd does with KillMode=process: wait for the main process only.
-my $exited = 0;
+# What systemd does with KillMode=mixed: wait for the main process to exit.
+# The reply must already sit in the client socket at that moment.
+my ($exited, $delivered_at_exit, $exit_after) = (0, 0, -1);
+my $sel = IO::Select->new($slow);
 while (time() - $t0 < $SLOW_SECONDS + 15) {
-    if (waitpid($broker1, WNOHANG) == $broker1) { $exited = 1; last }
+    if (waitpid($broker1, WNOHANG) == $broker1) {
+        $exited = 1;
+        $exit_after = time() - $slow_started;
+        $delivered_at_exit = $sel->can_read(0) ? 1 : 0;
+        last;
+    }
     sleep 0.05;
 }
 @brokers = grep { $_ != $broker1 } @brokers if $exited;
-my $main_exit = time() - $t0;
 ok($exited, 'broker 1 main process exits after TERM');
-cmp_ok($main_exit, '<', $RESTART_LIMIT, sprintf('without waiting out the in-flight request (%.2f s)', $main_exit));
-ok(!-e $PIDF, 'broker 1 removed its pidfile');
-
-my $broker2 = start_broker();
-my $first = ping_with_retry($SLOW_SECONDS + 15);
-my $restart = time() - $t0;
-is($first && $first->{result}, 'pong', 'broker 2 serves the first RPC after the restart');
-cmp_ok($restart, '<', $RESTART_LIMIT, sprintf('TERM to first RPC accepted by broker 2: %.2f s', $restart));
-
-my $reply = read_reply($slow, $SLOW_SECONDS + 15);
+cmp_ok($exit_after, '>=', $SLOW_SECONDS - 0.5,
+    sprintf('only after waiting out the in-flight request (%.2f s after it started)', $exit_after));
+ok($delivered_at_exit, 'by then the in-flight reply has been delivered to the client');
+my $reply = read_reply($slow, 5);
 is(ref($reply) eq 'HASH' && ref($reply->{result}) eq 'HASH' ? $reply->{result}{slow} : undef, 'complete',
-    'the in-flight request of broker 1 still gets its complete reply');
+    'the in-flight request of broker 1 gets its complete reply');
 is(ref($reply) eq 'HASH' && ref($reply->{result}) eq 'HASH' ? length($reply->{result}{tail} // '') : 0, 4096,
     '...with the whole payload');
+SKIP: {
+    skip 'cannot list the broker workers through /proc', 2 unless @workers1;
+    ok(scalar(@workers1), 'broker 1 had workers before the TERM: ' . join(',', @workers1));
+    is_deeply([grep { kill 0, $_ } @workers1], [],
+        'no worker of broker 1 outlives its main process, so systemd never sees a stopped unit with one');
+}
+ok(!-e $PIDF, 'broker 1 removed its pidfile');
+ok(!-e $SOCK, 'broker 1 unpublished its socket once drained');
 
-# Let broker 1's worker notice the TERM and exit, then check it left broker 2's
-# paths alone.
-sleep 2.5;
-ok(-S $SOCK, "broker 1's exiting worker did not remove broker 2's socket");
-my $pidfile = '';
-if (open(my $fh, '<', $PIDF)) { $pidfile = <$fh> // ''; close($fh) }
-chomp $pidfile;
-is($pidfile, "$broker2", "broker 1's exiting worker did not remove broker 2's pidfile");
-my $after = ping_with_retry(10);
-is($after && $after->{result}, 'pong', 'broker 2 keeps serving');
+my $broker2 = start_broker();
+my $first = ping_with_retry(15);
+is($first && $first->{result}, 'pong', 'broker 2 serves the first RPC after the restart');
+diag(sprintf('known limit: TERM to first RPC accepted by broker 2 took %.2f s (the drain)', time() - $t0));
 
 done_testing();

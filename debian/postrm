@@ -6,11 +6,32 @@ BACKUP_DIR="/var/lib/truenas-plugin-backups"
 LOG_FILE="/var/log/truenas-installer.log"
 BROKER_RUNDIR="/run/truenas-plugin"
 BROKER_LOG="/var/log/truenas-plugin-broker.log"
+BROKER_UNIT="truenas-plugin-broker.service"
+
+# prerm ignores a failed stop, so the broker (or a worker still finishing a
+# request) may outlive the removal. Its socket and pidfile live in the run
+# dir: only a positively stopped broker lets purge delete it. An unknown
+# unit state counts as running.
+broker_alive() {
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        state=$(systemctl show -p ActiveState --value "$BROKER_UNIT" 2>/dev/null) || return 0
+        case "$state" in
+            inactive|failed) ;;
+            *) return 0 ;;
+        esac
+    fi
+    pid=$(cat "$BROKER_RUNDIR/broker.pid" 2>/dev/null) || return 1
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
 
 case "$1" in
     purge)
         rm -rf "$BACKUP_DIR"
-        rm -rf "$BROKER_RUNDIR"
+        if broker_alive; then
+            echo "WARNING: $BROKER_UNIT is still running; leaving $BROKER_RUNDIR in place." >&2
+        else
+            rm -rf "$BROKER_RUNDIR"
+        fi
         rm -f "$LOG_FILE"
         rm -f "$BROKER_LOG"
 

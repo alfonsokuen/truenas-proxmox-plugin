@@ -4,9 +4,12 @@
 #      retires the export and before the delete: a clone that appeared after
 #      an initial ENOENT, or whose generation changed, keeps its export and
 #      dataset.
-#  6   a failed snapshot activation rolls back only what it created: its own
-#      namespace on a pre-existing clone is retired (C14), an export it only
-#      reused is left alone, and a pre-existing clone is never deleted.
+#  6   a failed snapshot activation rolls back only what it created, and only
+#      when it created the clone: an export it only reused is left alone, and
+#      on a pre-existing clone nothing is retired, not even a namespace this
+#      activation added (r7, rev4-astra C14: an idk26 node, which takes no
+#      lock, may already read through it). A pre-existing clone is never
+#      deleted.
 use strict;
 use warnings;
 use Test::More;
@@ -138,14 +141,21 @@ subtest 'point 6: a participant that reused the export rolls back nothing' => su
     is_deeply(\@ds_deletes, [], 'zero clone deletes: B keeps reading');
 };
 
-subtest 'point 6 / C14: a namespace added to a pre-existing clone is retired, the clone kept' => sub {
+subtest 'point 6 / C14 (r7): on a pre-existing clone the rollback retires nothing' => sub {
     reset_array('101');
     $cap_fails_for = 'A';
     my $first = $next_ns;
+    # A adds a namespace to the clone that was already there; an idk26 node
+    # (no lock) finds that namespace and starts reading; then A's cap fails.
     ok(!eval { $activate->(); 1 }, 'A creates a namespace on the existing clone and fails');
-    is_deeply(\@ns_deletes, [$first], 'exactly the namespace A created is retired');
+    is_deeply(\@ns_deletes, [], 'zero namespace retirements, even of the one A created');
     is_deeply(\@ds_deletes, [], 'the pre-existing clone is not deleted');
-    is($guid, '101', 'clone 101 survives');
+    is_deeply([$guid, map { $_->{id} } @ns], ['101', $first],
+        'clone 101 and the namespace the other reader uses survive (a safe leak)');
+    @ns_deletes = @ds_deletes = ();
+    $deactivate->();
+    is_deeply([\@ns_deletes, \@ds_deletes], [[$first], ['101']],
+        'the next ordinary teardown still retires that namespace and deletes the clone');
 };
 
 subtest 'point 6 control: a clone the failed activation created is still rolled back' => sub {

@@ -14318,14 +14318,17 @@ sub _expose_snapshot_device {
         }
     };
     if (my $err = $@) {
-        # Undo only what THIS activation created. A clone it found already
-        # there keeps living (another activation may be reading it), but an
-        # extent/namespace it added to that clone is its own and is retired,
-        # or it stayed exported with nobody left to tear it down.
-        if ($created_clone || grep { defined } values %created) {
-            eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname, \%created,
-                { keep_clone => !$created_clone }) };
+        # Undo only what THIS activation created, and only when it created
+        # the clone itself. On a clone that was already there, nothing is
+        # retired, not even an extent/namespace this call added: another
+        # activation (an idk26 node, which takes no lock) may already be
+        # reading through it. A leaked export is the safe failure.
+        if ($created_clone) {
+            eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname, \%created) };
             $class->_log_clone_teardown_failure($scfg, '_expose_snapshot_device rollback', $volname, $snapname, $@) if $@;
+        } elsif (grep { defined } values %created) {
+            _log($scfg, 0, 'warning', "[TrueNAS] _expose_snapshot_device rollback: $clone_zname existed "
+                . "before this activation; the export it added is left in place for the next teardown");
         }
         die $err;
     }
@@ -14355,7 +14358,7 @@ sub _log_clone_teardown_failure {
 }
 
 sub _teardown_snapshot_device {
-    my ($class, $scfg, $volname, $snapname, $created, $opts) = @_;
+    my ($class, $scfg, $volname, $snapname, $created) = @_;
 
     my (undef, $zname) = $class->parse_volname($volname);
     my ($clone_zname, $clone_full) = _snapshot_clone_paths($scfg, $zname, $snapname);
@@ -14374,7 +14377,16 @@ sub _teardown_snapshot_device {
     # touched. Absent from start to end stays an idempotent no-op.
     my $changed;
     my $assert_same_clone = sub {
-        my (undef, $now) = _read_dataset_delete_identity($scfg, $clone_full, $identity[0]);
+        my $now;
+        # An unreadable generation is not "unchanged": the iSCSI path only
+        # warns on its own errors, so this one must stop the whole teardown
+        # (export kept, nothing deleted) instead of falling through to it.
+        if (!eval { (undef, $now) = _read_dataset_delete_identity($scfg, $clone_full, $identity[0]); 1 }) {
+            chomp(my $why = $@ || 'unknown error');
+            $changed = "cannot re-read the generation of snapshot clone $clone_full ($why); "
+                . "leaving it and its export in place\n";
+            die $changed;
+        }
         return if !@identity && !defined($now);
         return if @identity && defined($now) && $now eq $identity[1];
         $changed = "snapshot clone $clone_full is no longer the generation this teardown pinned ("
@@ -14492,8 +14504,6 @@ sub _teardown_snapshot_device {
     # verify_gone: TrueNAS 26.0 BETA.36 can answer pool.dataset.delete with
     # success while the zvol is still live (a holder has the device open), so
     # for the clone a "success" is confirmed by reading the dataset back.
-    # A rollback that reused an existing clone retires only its own export.
-    return if $opts && $opts->{keep_clone};
     _udev_settle_bounded();
     # Without a pinned generation the delete would adopt whatever clone now
     # carries the name; one that appeared after the initial ENOENT is not ours.
