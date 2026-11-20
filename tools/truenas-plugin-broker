@@ -126,6 +126,7 @@ my $CLIENT_READ_TIMEOUT = 10;
 my $DRAIN_TIMEOUT = ($MAX_BUDGET > $UPSTREAM_TIMEOUT ? $MAX_BUDGET : $UPSTREAM_TIMEOUT)
     + 2 * $CLIENT_READ_TIMEOUT + 5;
 my $SUPERVISOR_POLL = 0.25;
+my $WORKER_RESPAWN_LIMIT = 5;
 my $WORKER_POLL = 1;
 # And a ceiling on how much we will buffer before giving up on finding the
 # newline, so a peer that never sends one cannot grow us out of memory.
@@ -1369,7 +1370,7 @@ sub spawn_worker {
         }
         exit 0;
     }
-    $workers->{$pid} = 1;
+    $workers->{$pid} = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC());
     ldebug("spawned worker pid=$pid");
 }
 
@@ -1407,6 +1408,7 @@ sub stop_workers {
     my ($workers) = @_;
     linfo("parent shutting down, signalling workers");
     my $deadline = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) + $DRAIN_TIMEOUT;
+    my $escalated = 0;
     kill 'TERM', keys %$workers;
     while (%$workers) {
         my $dead = waitpid(-1, WNOHANG);
@@ -1414,15 +1416,21 @@ sub stop_workers {
             delete $workers->{$dead};
             next;
         }
-        return if $dead < 0 && $!{ECHILD};
+        return 1 if $dead < 0 && $!{ECHILD};
         my $remaining = $deadline - Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC());
-        last if $remaining <= 0;
+        if ($remaining <= 0) {
+            return 0 if $escalated;
+            lwarn("worker shutdown deadline expired; killing remaining workers");
+            kill 'KILL', keys %$workers;
+            $escalated = 1;
+            # SIGKILL delivery is asynchronous. Give waitpid a bounded
+            # chance to confirm exit before dropping the published path.
+            $deadline += 1;
+            next;
+        }
         Time::HiRes::sleep($remaining < $SUPERVISOR_POLL ? $remaining : $SUPERVISOR_POLL);
     }
-    if (%$workers) {
-        lwarn("worker shutdown deadline expired; killing remaining workers");
-        kill 'KILL', keys %$workers;
-    }
+    return 1;
 }
 
 sub main {
@@ -1447,33 +1455,48 @@ sub main {
         linfo("prefork pool up (N=" . scalar(keys %workers) . ")");
     }
 
-    my $status = 0;
-    while (!$stopping) {
-        unless (%workers) {
-            lerr("no broker workers remain; exiting so systemd can restart the service");
-            $status = 1;
-            last;
-        }
+    my $status = %workers || $stopping ? 0 : 1;
+    lerr("no broker workers started; exiting so systemd can restart the service") if $status;
+    my $respawn_delay = $SUPERVISOR_POLL;
+    my $respawn_at = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) + $respawn_delay;
+    while (!$stopping && !$status) {
         # Polling bounds the race between testing the stop flag and waitpid().
-        my $dead = waitpid(-1, WNOHANG);
+        my $dead = %workers ? waitpid(-1, WNOHANG) : 0;
         if ($dead > 0) {
-            delete $workers{$dead};
-            unless ($stopping) {
-                lwarn("worker pid=$dead exited (status=$?), respawning");
-                spawn_worker($srv, \$stopping, \%workers);
-            }
+            my $wait_status = $?;
+            my $started = delete $workers{$dead};
+            my $now = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC());
+            $respawn_delay = $SUPERVISOR_POLL
+                if defined $started && $now - $started >= $WORKER_RESPAWN_LIMIT;
+            my $earliest = $now + $respawn_delay;
+            $respawn_at = $earliest if $earliest > $respawn_at;
+            lwarn("worker pid=$dead exited (status=$wait_status), scheduling replacement") unless $stopping;
         } elsif ($dead < 0 && !$!{EINTR}) {
             lerr("waitpid failed: $!");
             %workers = () if $!{ECHILD};
             $status = 1;
             last;
-        } elsif (!$stopping) {
-            Time::HiRes::sleep($SUPERVISOR_POLL);
         }
+
+        # A failed fork can leave vacancies without another SIGCHLD. Retry
+        # those vacancies too, backing off if workers crash at startup.
+        if (!$stopping && keys(%workers) < $PREFORK_N
+            && Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) >= $respawn_at) {
+            spawn_worker($srv, \$stopping, \%workers);
+            unless (%workers || $stopping) {
+                lerr("no broker workers remain; exiting so systemd can restart the service");
+                $status = 1;
+                last;
+            }
+            $respawn_delay *= 2;
+            $respawn_delay = $WORKER_RESPAWN_LIMIT if $respawn_delay > $WORKER_RESPAWN_LIMIT;
+            $respawn_at = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) + $respawn_delay;
+        }
+        Time::HiRes::sleep($SUPERVISOR_POLL) unless $stopping;
     }
+    my $drained = !%workers || stop_workers(\%workers);
     $srv->close();
-    unlink $SOCKET_PATH;
-    stop_workers(\%workers) if %workers;
+    unlink $SOCKET_PATH if $drained;
     unlink $PIDFILE;
     exit $status;
 }

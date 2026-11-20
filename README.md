@@ -171,10 +171,10 @@ names, the plugin expects `tn_api_*`, and the wizard fails with
 > apt update && apt dist-upgrade
 > ```
 >
-> This limitation is fixed in `2.1.25~beta1` and later (both
-> `pvedaemon` and `pveproxy` restarts are deferred past the end of the
-> package transaction). The IDK fork leaves both daemons to the
-> pve-manager dpkg trigger.
+> Upstream `2.1.25~beta1` schedules the `pvedaemon` and `pveproxy` restarts
+> with a 10-second timer and falls back to an immediate restart if scheduling
+> fails. The timer can fire while the package transaction is still running.
+> The IDK fork leaves both daemons to the pve-manager dpkg trigger.
 >
 > [#144]: https://github.com/truenas/truenas-proxmox-plugin/issues/144
 

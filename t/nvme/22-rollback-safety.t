@@ -98,6 +98,7 @@ sub snap_record {
         my ($class, $storeid, $shared, $timeout, $func, @param) = @_;
         return $func->(@param);
     };
+    *{"${PKG}::_nvme_rescan_subsystem_controllers"} = sub { 1 };
     # Answers per dataset, the way the filtered query now asks.
     *{"${PKG}::_api_call"} = sub {
         my ($scfg, $method, $params) = @_;

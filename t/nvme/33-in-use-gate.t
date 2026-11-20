@@ -9,8 +9,10 @@ use strict;
 use warnings;
 use Test::More;
 use FindBin;
+use lib "$FindBin::Bin/lib";
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use IDK::TestNVMeSysfs qw(nvme_fixture);
 
 my $PLUGIN = "$FindBin::Bin/../../TrueNASPlugin.pm";
 unless (eval { require $PLUGIN; 1 }) {
@@ -28,16 +30,12 @@ my $scfg = { tn_subsystem_nqn => $NQN };
 }
 
 # One fake host: nvme0n1 (+ partition nvme0n1p1) and its path nvme0c0n1, both
-# on our subsystem, major:minor 259:0 / 259:1 / 259:2.
+# on our subsystem. Only the head and partition have device numbers.
 sub world {
     my (%o) = @_;
     my $root = tempdir(CLEANUP => 1);
-    for my $d (['nvme0n1', '259:0'], ['nvme0c0n1', '259:2']) {
-        my ($n, $mm) = @$d;
-        make_path("$root/block/$n/device", "$root/block/$n/holders");
-        open(my $f, '>', "$root/block/$n/dev") or die; print $f "$mm\n"; close $f;
-        open($f, '>', "$root/block/$n/device/subsysnqn") or die; print $f "$NQN\n"; close $f;
-    }
+    nvme_fixture($root, 'nvme0n1', $NQN, dev => '259:0');
+    nvme_fixture($root, 'nvme0c0n1', $NQN);
     make_path("$root/block/nvme0n1/nvme0n1p1/holders");
     open(my $f, '>', "$root/block/nvme0n1/nvme0n1p1/dev") or die; print $f "259:1\n"; close $f;
     open($f, '>', "$root/mountinfo") or die;

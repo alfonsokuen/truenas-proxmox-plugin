@@ -1,7 +1,6 @@
 # Divergencia del fork IDK respecto a upstream (github.com/truenas/truenas-proxmox-plugin)
 
-Version del arbol: `1:2.1.23+deb1+idk23`, sobre upstream **2.1.23+deb1** (estable). Los nodos en
-produccion corren idk22 hasta que se despliegue idk23. Los nodos llevan un pin de APT contra el
+Version del arbol: `1:2.1.25~beta2+idk31`, sobre upstream **2.1.25~beta2**. Los nodos llevan un pin de APT contra el
 origen de upstream (`/etc/apt/preferences.d`, `Pin: origin truenas.github.io`, Pin-Priority -1):
 se mantiene aunque el epoch `1:` ya gana la comparacion de versiones.
 

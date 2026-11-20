@@ -5,6 +5,8 @@ use Test::More;
 use FindBin;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
+use lib "$FindBin::Bin/lib";
+use IDK::TestNVMeSysfs qw(write_attr);
 
 my $fake_dev;
 BEGIN {
@@ -22,7 +24,9 @@ my $cfg = { tn_dataset => 'tank/pve', tn_transport_mode => 'nvme-tcp', tn_subsys
 my $root = tempdir(CLEANUP => 1);
 $fake_dev = "$root/dev";
 my $subsystem = "$root/sys/class/nvme-subsystem/nvme-subsys0";
-make_path("$subsystem/nvme99", "$fake_dev/nvme98");
+make_path("$subsystem/nvme99", "$fake_dev/nvme98", "$fake_dev/nvme97");
+write_attr("$root/sys/class/nvme/nvme98/subsysnqn", 'nqn.2024-01.test:unrelated');
+write_attr("$root/sys/class/nvme/nvme97/subsysnqn", $nqn);
 open(my $fh, '>', "$subsystem/subsysnqn") or die $!;
 print {$fh} "$nqn\n";
 close($fh) or die $!;
@@ -53,8 +57,8 @@ local *{'PVE::Tools::run_command'} = sub { push @events, join ' ', @{$_[0]} };
 
 is($pkg->volume_resize($cfg, 'store', $vol, 2048), 2, 'resize returns the new size in KiB');
 is_deeply(\@events, ['pool.dataset.update', 'nvme ns-rescan /dev/nvme99',
-    'nvme ns-rescan /dev/nvme98', 'udevadm settle'],
-    'failed targeted NVMe rescan falls back to all controllers after resize');
+    'nvme ns-rescan /dev/nvme97', 'udevadm settle'],
+    'failed targeted NVMe rescan falls back only to a controller with the same NQN');
 
 $targeted_fails = 0;
 @events = ();
@@ -66,6 +70,21 @@ is_deeply(\@events, ['pool.dataset.update', 'nvme ns-rescan /dev/nvme99', 'udeva
 $pkg->volume_snapshot_rollback($cfg, 'store', $vol, 'snap');
 is_deeply(\@events, ['pool.snapshot.rollback', 'nvme ns-rescan /dev/nvme99', 'udevadm settle'],
     'successful NVMe rollback rescans the target before settling udev');
+
+$targeted_fails = 1;
+{
+    local *{"${pkg}::_try_run"} = sub {
+        my ($cmd) = @_;
+        push @events, join ' ', @$cmd;
+        return $cmd->[2] eq '/dev/nvme98';
+    };
+    @events = ();
+    my $ok = eval { $pkg->volume_snapshot_rollback($cfg, 'store', $vol, 'snap'); 1 };
+    ok(!$ok, 'rollback reports an error when no controller of the target was rescanned');
+    like($@, qr/no NVMe controller rescanned/i, 'rollback explains why the local size was not refreshed');
+    is(scalar(grep { /nvme98/ } @events), 0, 'rollback never rescans the unrelated controller');
+    is(scalar(grep { /pool\.snapshot\.rollback/ } @events), 1, 'rollback mutation is not retried');
+}
 
 $rollback_fails = 1;
 @events = ();

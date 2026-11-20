@@ -22,12 +22,15 @@ my $PKG = 'PVE::Storage::Custom::TrueNASPlugin';
 my $scfg = { tn_dataset => 'tank/pve', tn_api_host => '198.51.100.7', tn_transport_mode => 'nvme-tcp',
              tn_subsystem_nqn => 'nqn.x:y' };
 
-my (@calls, %get, $delete_script);
+my (@calls, %get, %deleted, $delete_script);
 {
     no strict 'refs'; no warnings 'redefine';
     *{"${PKG}::_log"} = sub { 1 };
     *CORE::GLOBAL::sleep = sub { 1 } if 0;
     *{"${PKG}::_nvme_delete_namespace"} = sub { 1 };
+    *{"${PKG}::_nvme_find_device_by_subsystem"} = sub {
+        return { selector_outcome => 'publication_mismatch', enumeration_complete => 1 };
+    };
     *{"${PKG}::_defer_after_lock"} = sub { 1 };
     *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
     *{"${PKG}::_nvme_disconnect"} = sub { 1 };
@@ -35,13 +38,15 @@ my (@calls, %get, $delete_script);
     *{"${PKG}::_tn_dataset_get"} = sub {
         my ($s, $id) = @_;
         push @calls, "get:$id";
+        die "[ENOENT] InstanceNotFound: does not exist\n" if $deleted{$id};
         my $g = $get{$id} // $get{'*'};    # '*' = answer for any other dataset
         die $g->{die} if $g && $g->{die};
-        return $g ? $g->{ret} : { id => $id };
+        return $g ? $g->{ret} : { id => $id, guid => '12059162100313530226' };
     };
     *{"${PKG}::_api_call"} = sub {
         my ($s, $m, $p) = @_; push @calls, $m;
-        return [ { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0' } ] if $m eq 'nvmet.namespace.query';
+        return [ { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0',
+            device_uuid => '11111111-2222-3333-4444-555555555555' } ] if $m eq 'nvmet.namespace.query';
         return [] if $m eq 'nvmet.subsys.query';
         return { id => 1 };
     };
@@ -49,7 +54,9 @@ my (@calls, %get, $delete_script);
         my ($s, $m, $p) = @_; push @calls, $m;
         if ($m eq 'pool.dataset.delete') {
             my $step = shift @$delete_script;
+            return { deleted => 1 } if defined $step && $step eq 'masked';
             die $step if defined $step && $step ne 'ok';
+            $deleted{$p->[0]} = 1;
             return { deleted => 1 };
         }
         return 1;
@@ -62,7 +69,6 @@ sub deletes { scalar grep { $_ eq 'pool.dataset.delete' } @calls }
     # The clone teardown now reads the dataset back after an API "success"
     # (TN 26.0 BETA.36 can answer success with the zvol still live): the array
     # must answer ENOENT for the clone, or the delete is not believed.
-    %get = ('*' => { die => "[ENOENT] InstanceNotFound: does not exist\n" });
     @calls = (); $delete_script = [ "[EBUSY] dataset is busy\n", "[EBUSY] dataset is busy\n", 'ok' ];
     my $ok = eval { $PKG->_teardown_snapshot_device($scfg, 'vol-vm-101-disk-0-ns11111111-2222-3333-4444-555555555555', 's1'); 1 };
     ok($ok, 'B1: EBUSY twice then OK -> the teardown completes') or diag($@);
@@ -71,13 +77,12 @@ sub deletes { scalar grep { $_ eq 'pool.dataset.delete' } @calls }
 {
     # B1b: the array says "deleted" but the zvol is still live (masked EBUSY):
     # that is a failed teardown, not a success. Seen on TN 26.0 BETA.36.
-    %get = ();    # default answer: the dataset exists
-    @calls = (); $delete_script = [ ('ok') x 5 ];
+    %deleted = ();    # the next scenario starts with a live clone
+    @calls = (); $delete_script = [ ('masked') x 5 ];
     local $SIG{__WARN__} = sub { };
     my $ok = eval { $PKG->_teardown_snapshot_device($scfg, 'vol-vm-101-disk-0-ns11111111-2222-3333-4444-555555555555', 's1'); 1 };
     ok(!$ok, 'B1b: delete reported success but the clone is still there -> the teardown FAILS');
     like($@ // '', qr/masked EBUSY|still finds/, '  ...saying the delete was not real');
-    %get = ('*' => { die => "[ENOENT] InstanceNotFound: does not exist\n" });
 }
 {
     @calls = (); $delete_script = [ ("[EBUSY] dataset is busy\n") x 10 ];
@@ -99,6 +104,7 @@ sub deletes { scalar grep { $_ eq 'pool.dataset.delete' } @calls }
 # --- B2 --------------------------------------------------------------------
 my $free = $PKG->can('_free_image_nvme');
 sub run_free {
+    %deleted = ();
     @calls = (); $delete_script = [ 'ok' ];
     my $ok = eval {
         my $w = $free->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-lun1', 'vm-101-disk-0', 'tank/pve/vm-101-disk-0', undef);

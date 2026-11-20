@@ -27,6 +27,7 @@ active_before="$3"
 active_after="$4"
 action_rc="$5"
 socket="$6"
+reload_rc="${7:-0}"
 attempted=0
 
 systemctl() {
@@ -45,7 +46,8 @@ systemctl() {
             attempted=1
             return "$action_rc"
             ;;
-        enable|daemon-reload) return 0;;
+        enable) return 0;;
+        daemon-reload) return "$reload_rc";;
         *) exit 127;;
     esac
 }
@@ -92,16 +94,20 @@ subtest 'upgrade only restarts a broker that is enabled and active' => sub {
 
 subtest 'a stale socket cannot hide failed startup or an inactive service' => sub {
     my ($exit_status, $output) = configure_broker('1:2.1.24+idk30', 'enabled', 3, 3, 1, 0);
-    isnt($exit_status, 0, 'failed start fails the package configuration');
-    like($output, qr/ERROR: .*\Q$broker_unit\E/, 'failure names the broker unit');
+    is($exit_status, 0, 'failed startup leaves package configuration successful');
+    like($output, qr/WARNING: .*\Q$broker_unit\E/, 'failed startup names the broker unit');
 
     ($exit_status, $output) = configure_broker('1:2.1.24+idk30', 'enabled', 0, 3, 0, 0);
-    isnt($exit_status, 0, 'inactive broker with a stale socket fails configuration');
-    like($output, qr/ERROR: .*\Q$broker_unit\E/, 'inactive service is diagnosed');
+    is($exit_status, 0, 'inactive broker with a stale socket leaves configuration successful');
+    like($output, qr/WARNING: .*\Q$broker_unit\E/, 'inactive service is diagnosed');
 
     ($exit_status, $output) = configure_broker('1:2.1.24+idk30', 'not-found', 3, 3, 0, 0);
-    isnt($exit_status, 0, 'missing systemd unit with a stale socket fails configuration');
-    like($output, qr/ERROR: .*\Q$broker_unit\E/, 'missing unit is diagnosed');
+    is($exit_status, 0, 'missing systemd unit with a stale socket leaves configuration successful');
+    like($output, qr/WARNING: .*\Q$broker_unit\E/, 'missing unit is diagnosed');
+
+    ($exit_status, $output) = configure_broker('1:2.1.24+idk30', 'enabled', 3, 3, 0, 0, 1);
+    is($exit_status, 0, 'failed daemon-reload leaves configuration successful');
+    like($output, qr/WARNING: .*\Q$broker_unit\E/, 'failed daemon-reload names the broker unit');
 
     ($exit_status, $output) = configure_broker('', 'disabled', 3, 0, 0, 0);
     is($exit_status, 0, 'first installation enables and starts the broker');

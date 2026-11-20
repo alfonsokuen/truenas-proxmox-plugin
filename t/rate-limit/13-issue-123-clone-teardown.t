@@ -152,12 +152,14 @@ no warnings 'redefine';
 };
 
 my @delete_calls;
+my @dataset_events;
 my $delete_outcomes;   # arrayref of outcomes keyed by call index
 
 *PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate = sub {
     my ($s, $method, $params) = @_;
     return 1 if $method ne 'pool.dataset.delete';
     push @delete_calls, $params->[0];
+    push @dataset_events, 'delete';
     my $idx = $#delete_calls;
     my $outcome = $delete_outcomes->[$idx] // $delete_outcomes->[-1];
     return 1 if $outcome eq 'ok' || $outcome eq 'silent_ok' || $outcome eq 'ok_empty';
@@ -168,18 +170,20 @@ my $delete_outcomes;   # arrayref of outcomes keyed by call index
     die "test harness: unknown outcome $outcome\n";
 };
 
-# Readback. Keyed on the last delete attempt:
+# The clone has a stable identity before the first delete and after a busy
+# result. Other reads observe the outcome of the last delete attempt:
 #   ok / gone     -> the array says ENOENT (really gone)
 #   silent_ok     -> the dataset is still there (TN masked EBUSY)
 #   ok_empty      -> an empty answer with no error (not proof of anything)
 #   phantom_gone  -> delete said "does not exist" but the dataset is there
-my @get_calls;
 *PVE::Storage::Custom::TrueNASPlugin::_tn_dataset_get = sub {
     my ($s, $full) = @_;
-    push @get_calls, $full;
+    push @dataset_events, 'get';
+    my $original = { id => $full, name => $full, guid => { rawvalue => '876543210123456789' } };
+    return $original unless @delete_calls;
     my $idx = $#delete_calls;
     my $outcome = $delete_outcomes->[$idx] // $delete_outcomes->[-1];
-    return { id => $full, name => $full } if $outcome eq 'silent_ok' || $outcome eq 'phantom_gone';
+    return $original if $outcome eq 'ebusy' || $outcome eq 'silent_ok' || $outcome eq 'phantom_gone';
     return undef if $outcome eq 'ok_empty';
     die "InstanceNotFound: $full does not exist\n";
 };
@@ -210,15 +214,16 @@ like($@, qr/EINVAL/, 'Fix A: EINVAL propagates');
 is(scalar(@delete_calls), 1, 'Fix A: EINVAL breaks immediately - no further attempts');
 
 # Case: TN masks EBUSY (reports delete success but readback still finds the dataset)
-@delete_calls = (); @get_calls = (); $delete_outcomes = ['silent_ok'];
+@delete_calls = (); @dataset_events = (); $delete_outcomes = ['silent_ok'];
 eval { $pkg->_teardown_snapshot_device($scfg, $volname, $snapname) };
 like($@, qr/TN masked EBUSY/,
     'Fix A: silent-success caught by readback dies with "TN masked EBUSY"');
 is(scalar(@delete_calls), 3, "Fix A: silent-success is retried up to the engine's attempts");
-is(scalar(@get_calls), 3, 'Fix A: silent-success triggers readback after every reported success');
+is_deeply(\@dataset_events, [qw(get delete get get delete get get delete get)],
+    'Fix A: each attempt reads identity before delete and verifies each reported success');
 
 # Case: silent-success on first attempt, real gone on second (holder released the FD)
-@delete_calls = (); @get_calls = (); $delete_outcomes = ['silent_ok', 'gone'];
+@delete_calls = (); @dataset_events = (); $delete_outcomes = ['silent_ok', 'gone'];
 eval { $pkg->_teardown_snapshot_device($scfg, $volname, $snapname) };
 is($@, '', 'Fix A: silent-success then gone completes without error');
 is(scalar(@delete_calls), 2, 'Fix A: silent-success-then-gone took exactly 2 delete attempts');
@@ -226,16 +231,18 @@ is(scalar(@delete_calls), 2, 'Fix A: silent-success-then-gone took exactly 2 del
 # FORK: fail-closed cases upstream's ladder treated as success.
 # (1) delete says "does not exist" but the array still has the dataset: the phrase
 #     can come from a transport failure; absence needs the array's confirmation.
-@delete_calls = (); @get_calls = (); $delete_outcomes = ['phantom_gone'];
+@delete_calls = (); @dataset_events = (); $delete_outcomes = ['phantom_gone'];
 eval { $pkg->_teardown_snapshot_device($scfg, $volname, $snapname) };
 like($@, qr/Refusing to report success|still on the array/i,
     'Fix A (fork): "does not exist" with the dataset still present is NOT success');
 # (2) delete reported success, readback returns nothing at all and no error:
 #     not an ENOENT answer, so absence is unconfirmed.
-@delete_calls = (); @get_calls = (); $delete_outcomes = ['ok_empty'];
+@delete_calls = (); @dataset_events = (); $delete_outcomes = ['ok_empty'];
 eval { $pkg->_teardown_snapshot_device($scfg, $volname, $snapname) };
-like($@, qr/Cannot confirm/i,
+like($@, qr/Cannot (?:confirm|verify ZFS identity)/i,
     'Fix A (fork): success + empty readback is NOT proof the clone is gone');
+is_deeply(\@dataset_events, [qw(get delete get)],
+    'Fix A (fork): empty post-delete readback does not trigger another delete');
 
 # ============================================================
 # Fix C — volume_snapshot_delete propagates teardown failure

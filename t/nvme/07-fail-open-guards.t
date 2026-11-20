@@ -59,16 +59,28 @@ my %fail;         # method => error string to throw
 my %ret;          # method => canned return (or coderef), overrides defaults
 my $wait_result;  # what the stubbed job wait reports; default is a timeout
 my $dataset_gone;
+my @namespaces;
+my $uuid = '5abc4321-9abc-4def-abcd-123456789012';
+my $base_uuid = '5abc4321-9abc-4def-abcd-123456789013';
+
+sub exported_namespace {
+    my ($id, $zname, $device_uuid) = @_;
+    return { id => $id, device_path => "zvol/tank/pve/$zname", device_uuid => $device_uuid,
+        nsid => $id, subsys => { id => 7 } };
+}
 
 {
     no strict 'refs';
     no warnings 'redefine';
     *{"${PKG}::_log"} = sub { push @logs, [@_[1..3]]; 1 };
     # Keep the destructive steps off any real machine while still recording
-    # the intent. Deferred work would otherwise try to touch nvme-cli.
-    *{"${PKG}::_defer_after_lock"}  = sub { 1 };
+    # the intent. The fixture's namespaces are exported but not attached here.
     *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
     *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
+    *{"${PKG}::_nvme_reap_orphan_namespaces"} = sub { 1 };
+    *{"${PKG}::_nvme_find_device_by_subsystem"} = sub {
+        { selector_outcome => 'publication_mismatch', enumeration_complete => 1 };
+    };
     *{"${PKG}::_nvme_disconnect"}   = sub { push @calls, 'nvme_disconnect'; 1 };
     *{"${PKG}::_nvme_connect"}      = sub { push @calls, 'nvme_connect'; 1 };
     *{"${PKG}::run_command"}        = sub { 1 };
@@ -89,15 +101,26 @@ my $dataset_gone;
         my ($scfg, $method, $params) = @_;
         push @calls, $method;
         die $fail{$method} if exists $fail{$method};
+        if ($method eq 'nvmet.namespace.delete') {
+            # Apply the change only once the simulated API has accepted it.
+            my $delete = $ret{$method};
+            $delete->($params) if $delete;
+            @namespaces = grep { $_->{id} != $params->[0] } @namespaces;
+            return 1;
+        }
         if (exists $ret{$method}) {
             my $r = $ret{$method};
             return ref($r) eq 'CODE' ? $r->($params) : $r;
         }
         $dataset_gone = 1 if $method eq 'pool.dataset.delete';
         die "[ENOENT] InstanceNotFound\n" if $dataset_gone && $method eq 'pool.dataset.get_instance';
-        # One namespace, pointing at our zvol.
-        return [ { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0' } ]
-            if $method eq 'nvmet.namespace.query';
+        if ($method eq 'nvmet.namespace.query') {
+            my $filter = ($params->[0] // [])->[0];
+            return [@namespaces] unless $filter;
+            my ($key, undef, $value) = @$filter;
+            my $get = $key eq 'subsys.id' ? sub { $_[0]->{subsys}{id} } : sub { $_[0]->{$key} };
+            return [grep { $get->($_) eq $value } @namespaces];
+        }
         # A real subsystem: the namespace under test exists, so an empty answer here
         # would be a transient glitch, not a clean zero (see _free_image_nvme).
         return [ { id => 7, subnqn => 'nqn.2011-06.com.example:test' } ]
@@ -105,7 +128,7 @@ my $dataset_gone;
         # The clone lookup: default is a well-formed empty answer, i.e. a
         # base image with no clones. Cases override it deliberately.
         return [] if $method eq 'pool.dataset.query';
-        return { id => 'tank/pve/some-dataset', type => 'VOLUME', children => [] }
+        return { id => $params->[0], type => 'VOLUME', guid => { rawvalue => '123456789' }, children => [] }
             if $method eq 'pool.dataset.get_instance';
         return { id => 1 };
     };
@@ -121,6 +144,7 @@ my %SCFG = (
 sub reset_world {
     @calls = (); @logs = (); %fail = (); %ret = (); $wait_result = undef;
     $dataset_gone = 0;
+    @namespaces = (exported_namespace(42, 'vm-101-disk-0', $uuid));
 }
 
 sub run_free_image {
@@ -128,6 +152,7 @@ sub run_free_image {
     reset_world();
     %fail = %{ $opt{fail} // {} };
     %ret  = %{ $opt{ret}  // {} };
+    @namespaces = (exported_namespace(51, 'base-9001-disk-0', $base_uuid));
     my $scfg = { %SCFG, %{ $opt{scfg} // {} } };
     my $ok = eval {
         my $worker = $PKG->free_image('store', $scfg, $opt{volname}, $opt{isBase}, 'raw');
@@ -143,14 +168,15 @@ sub run_free_nvme {
     reset_world();
     %fail = %{ $opt{fail} // {} };
     %ret  = %{ $opt{ret}  // {} };
+    push @namespaces, @{ $opt{other_namespaces} // [] };
     my $scfg = { %SCFG, %{ $opt{scfg} // {} } };
     # ($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata)
     my $ok = eval {
         # The dataset delete is deferred to the cleanup worker the free
         # returns (PVE forks it after releasing the storage lock); run it
         # here the way PVE would.
-        my $worker = $free_nvme->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-lun1',
-                     'vm-101-disk-0', 'tank/pve/vm-101-disk-0', undef);
+        my $worker = $free_nvme->($PKG, 'store', $scfg, "vol-vm-101-disk-0-ns$uuid",
+                     'vm-101-disk-0', 'tank/pve/vm-101-disk-0', $uuid);
         $worker->('UPID:test') if ref($worker) eq 'CODE';
         1;
     };
@@ -176,7 +202,7 @@ sub log0_matching {
     return scalar grep { $_->[0] == 0 && $_->[2] =~ $re } @$logs;
 }
 
-my $BASE_VOL = 'vol-base-9001-disk-0-nsfeedface1234';   # zname base-9001-disk-0
+my $BASE_VOL = "vol-base-9001-disk-0-ns$base_uuid";
 
 # ---------------------------------------------------------------------------
 # Defect A: the clone lookup dies - the guard must fail closed
@@ -299,14 +325,10 @@ my $BASE_VOL = 'vol-base-9001-disk-0-nsfeedface1234';   # zname base-9001-disk-0
     my ($ok, $err, $calls) = run_free_nvme(
         scfg => { tn_force_delete_on_inuse => 1 },
         fail => { 'nvmet.namespace.delete' => "Namespace is in use\n" },
-        ret  => {
-            'nvmet.subsys.query'    => [ { id => 7 } ],
-            'nvmet.namespace.query' => [
-                { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0' },
-                { id => 43, device_path => 'zvol/tank/pve/vm-102-disk-0' },
-                { id => 44, device_path => 'zvol/tank/pve/vm-103-disk-0' },
-            ],
-        },
+        other_namespaces => [
+            exported_namespace(43, 'vm-102-disk-0', '5abc4321-9abc-4def-abcd-123456789102'),
+            exported_namespace(44, 'vm-103-disk-0', '5abc4321-9abc-4def-abcd-123456789103'),
+        ],
     );
     is(disconnects($calls), 0, 'three known namespaces: no subsystem disconnect');
     # The namespace delete failed "in use" and nothing was disconnected: the

@@ -31,7 +31,7 @@ my (@sleeps, @cmds, $deletes, $mode);
         die "[EBUSY] dataset is busy\n" if $mode eq 'ebusy';
         return 1;                                   # 'masked': says success
     };
-    *{"${PKG}::_tn_dataset_get"} = sub { return { id => $_[1] } };   # still there
+    *{"${PKG}::_tn_dataset_get"} = sub { return { id => $_[1], guid => '12059162100313530226' } }; # still there
     # sleeping seam: record, never sleep
     *{"${PKG}::_backoff_sleep"} = sub { push @sleeps, $_[0]; };
 }

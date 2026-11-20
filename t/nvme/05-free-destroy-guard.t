@@ -39,32 +39,44 @@ plan skip_all => "_free_image_nvme not found" unless $free;
 
 my @calls;      # every method the code tried to call, in order
 my %fail;       # method => error string to throw
-my $gone;
+my ($gone, $namespace_gone);
+my $dataset = 'tank/pve/vm-101-disk-0';
+my $uuid = '5abc4321-9abc-4def-abcd-123456789012';
 
 {
     no strict 'refs';
     no warnings 'redefine';
     *{"${PKG}::_log"} = sub { 1 };
     # Keep the destructive steps off any real machine while still recording
-    # the intent. Deferred work would otherwise try to touch nvme-cli.
-    *{"${PKG}::_defer_after_lock"}  = sub { 1 };
+    # the intent. The fixture's namespace is exported but not attached here.
     *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
     *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
+    *{"${PKG}::_nvme_reap_orphan_namespaces"} = sub { 1 };
+    *{"${PKG}::_nvme_find_device_by_subsystem"} = sub {
+        { selector_outcome => 'publication_mismatch', enumeration_complete => 1 };
+    };
     *{"${PKG}::_nvme_disconnect"}   = sub { push @calls, 'nvme_disconnect'; 1 };
     *{"${PKG}::run_command"}        = sub { 1 };
 
     *{"${PKG}::_api_call"} = sub {
         my ($scfg, $method, $params) = @_;
         push @calls, $method;
+        if ($method eq 'nvmet.namespace.delete') {
+            # An ENOENT delete is benign only when independent reads agree.
+            $namespace_gone = 1 if !exists($fail{$method}) || $fail{$method} =~ /InstanceNotFound/;
+        }
         die $fail{$method} if exists $fail{$method};
         $gone = 1 if $method eq 'pool.dataset.delete';
         die "[ENOENT] InstanceNotFound\n" if $gone && $method eq 'pool.dataset.get_instance';
         # One namespace, pointing at our zvol.
-        return [ { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0' } ]
+        return $namespace_gone ? [] : [
+            { id => 42, device_path => "zvol/$dataset", device_uuid => $uuid, nsid => 1, subsys => { id => 7 } },
+        ]
             if $method eq 'nvmet.namespace.query';
         return [] if $method eq 'nvmet.subsys.query';
         # a real dataset object carries its (here empty) children list
-        return { id => 1, children => [] } if $method eq 'pool.dataset.get_instance';
+        return { id => $dataset, type => 'VOLUME', guid => { rawvalue => '123456789' }, children => [] }
+            if $method eq 'pool.dataset.get_instance';
         return { id => 1 };
     };
     *{"${PKG}::_api_call_mutate"} = sub { goto &{"${PKG}::_api_call"} };
@@ -77,15 +89,15 @@ my $scfg = {
 
 sub run_free {
     %fail = @_;
-    $gone = 0;
+    ($gone, $namespace_gone) = (0, 0);
     @calls = ();
     # ($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata)
     my $ok = eval {
         # The dataset delete is deferred to the cleanup worker the free
         # returns (PVE forks it after releasing the storage lock); run it
         # here the way PVE would.
-        my $worker = $free->($PKG, 'store', $scfg, 'vol-vm-101-disk-0-lun1',
-                'vm-101-disk-0', 'tank/pve/vm-101-disk-0', undef);
+        my $worker = $free->($PKG, 'store', $scfg, "vol-vm-101-disk-0-ns$uuid",
+                'vm-101-disk-0', $dataset, $uuid);
         $worker->('UPID:test') if ref($worker) eq 'CODE';
         1;
     };

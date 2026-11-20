@@ -13,7 +13,12 @@ have_systemd() {
 
 enable_broker() {
     have_systemd || return 0
-    systemctl daemon-reload || return 1
+    # A local service failure should not leave an otherwise installed
+    # package half-configured and block subsequent package transactions.
+    if ! systemctl daemon-reload; then
+        echo "WARNING: Could not reload systemd for $BROKER_UNIT." >&2
+        return 0
+    fi
 
     if [ -n "${1:-}" ]; then
         # Preserve the operator's enablement on upgrades. An unrecognized
@@ -23,14 +28,14 @@ enable_broker() {
             disabled|masked|masked-runtime) return 0 ;;
             enabled|enabled-runtime) ;;
             *)
-                echo "ERROR: Cannot determine enablement of $BROKER_UNIT (state: ${state:-unknown})." >&2
-                return 1
+                echo "WARNING: Cannot determine enablement of $BROKER_UNIT (state: ${state:-unknown})." >&2
+                return 0
                 ;;
         esac
     else
         if ! systemctl enable "$BROKER_UNIT" >/dev/null; then
-            echo "ERROR: Could not enable $BROKER_UNIT." >&2
-            return 1
+            echo "WARNING: Could not enable $BROKER_UNIT." >&2
+            return 0
         fi
     fi
 
@@ -40,15 +45,14 @@ enable_broker() {
         action=try-restart
     fi
     if ! systemctl "$action" "$BROKER_UNIT"; then
-        echo "ERROR: Could not $action $BROKER_UNIT." >&2
-        return 1
+        echo "WARNING: Could not $action $BROKER_UNIT." >&2
+        return 0
     fi
 
     # RuntimeDirectoryPreserve leaves the old socket behind after a crash.
     if ! systemctl is-active --quiet "$BROKER_UNIT" || [ ! -S /run/truenas-plugin/broker.sock ]; then
-        echo "ERROR: $BROKER_UNIT is inactive or /run/truenas-plugin/broker.sock is missing." >&2
+        echo "WARNING: $BROKER_UNIT is inactive or /run/truenas-plugin/broker.sock is missing." >&2
         echo "  Check: systemctl status $BROKER_UNIT && journalctl -u $BROKER_UNIT -n 50" >&2
-        return 1
     fi
 }
 

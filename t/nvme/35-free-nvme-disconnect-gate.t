@@ -28,7 +28,10 @@ my ($ns_answer, $subsys_answer, $busy, $disconnects, $deletes, $ns_calls, $retry
     *{"${PKG}::_defer_after_lock"} = sub { 1 };
     *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
     *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
-    *{"${PKG}::_tn_dataset_get"} = sub { die "[ENOENT] InstanceNotFound\n" };
+    *{"${PKG}::_tn_dataset_get"} = sub {
+        die "[ENOENT] InstanceNotFound\n" if $ds_deletes;
+        return { id => $_[1], guid => '12345' };
+    };
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_verify_devices_disconnected"} = sub { 1 };
     # Not attached on this node, said positively: an undef answer means "could

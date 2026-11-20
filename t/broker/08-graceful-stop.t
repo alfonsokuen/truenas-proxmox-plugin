@@ -113,6 +113,11 @@ subtest 'supervisor waits for workers but kills any who exceed the drain limit' 
     };
     my $elapsed = 0;
     my $waits = 0;
+    my $socket_removals = 0;
+    $unlink = sub {
+        ++$socket_removals if $_[0] =~ /broker\.sock$/;
+        return scalar @_;
+    };
     $waitpid = sub {
         if (++$waits == 1) {
             $SIG{TERM}->();
@@ -128,6 +133,8 @@ subtest 'supervisor waits for workers but kills any who exceed the drain limit' 
         'only the lingering worker is escalated to KILL');
     cmp_ok($elapsed, '>=', $max_request, 'worker gets the full request window to finish');
     cmp_ok($elapsed, '<', $service_stop // 0, 'parent stops before the systemd deadline');
+    is($socket_removals, 0, 'keeps the path if a signalled worker has not exited');
+    $unlink = sub { return scalar @_ };
 };
 
 subtest 'supervisor exits with failure when every worker fork fails' => sub {
@@ -163,6 +170,36 @@ subtest 'supervisor exits with failure when the last worker cannot be replaced' 
     eval { main() };
     is($attempts, 2, 'supervisor attempted a replacement');
     is($@, "exit 1\n", 'systemd gets a failure exit when capacity reaches zero');
+};
+
+subtest 'the listener path stays published until in-flight workers exit' => sub {
+    local $SIG{TERM};
+    local $SIG{INT};
+    @events = ();
+    my $elapsed = 0;
+    my $started_drain = 0;
+    my $worker = 42;
+    $fork = sub { $worker };
+    $kill = sub { $started_drain = 1; return 1 };
+    $unlink = sub {
+        push @events, ['socket removed', $elapsed] if $_[0] =~ /broker\.sock$/;
+        return scalar @_;
+    };
+    $waitpid = sub {
+        if (!$started_drain) {
+            $SIG{TERM}->();
+            return 0;
+        }
+        return 0 if $elapsed < 4;
+        push @events, ['worker finished', $elapsed];
+        return $worker;
+    };
+    local *Time::HiRes::clock_gettime = sub { $elapsed };
+    local *Time::HiRes::sleep = sub { $elapsed += $_[0] };
+    eval { main() };
+    is($@, "exit 0\n", 'supervisor drains normally');
+    is_deeply([grep { ref } @events], [['worker finished', 4], ['socket removed', 4]],
+        'no part of the four-second drain occurs without the socket path');
 };
 
 done_testing();

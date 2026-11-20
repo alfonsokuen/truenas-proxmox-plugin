@@ -15,6 +15,24 @@
 - **#17 NVMe**. Comprueba la identidad de los dispositivos en sysfs, reintenta hasta tres veces y bloquea si la vista sigue siendo inestable.
 - **#147 iSCSI**. Deriva los WWID vivos de los mapeos del target y detiene el barrido si hay mapas locales y ningún WWID vivo.
 
+1. Verifica el GUID o createtxg del zvol antes de borrar y de reintentar.
+2. Exime al dueño, detecta alias de discos y relee las configuraciones del clúster antes de mutar.
+3. Lee el NQN de las rutas NVMe por controlador en `device/subsysnqn`.
+4. Prefiere la cabecera multipath utilizable al seleccionar por UUID o NGUID.
+5. Conserva el socket durante el drenaje y reintenta la conexión hasta 30 s.
+6. Confirma las consultas NVMe vacías con un listado independiente.
+7. Revalida el uso del subsistema bajo el lock antes de desconectar.
+8. Limita el rollback de exposición a los recursos creados por esa llamada.
+9. Revalida identidad y WWID de la ruta SCSI antes de retirarla.
+10. Protege las referencias iSCSI del clúster y exige pruebas del LUN antes del logout.
+11. Acota los comandos del barrido iSCSI al presupuesto de la operación.
+12. Emite un aviso si falla el broker durante la configuración del paquete.
+13. Ejecuta el barrido y el diagnóstico de borrados pendientes en el worker y acota la espera del lock al reconectar.
+14. Rescanea solo controladores del subsistema y exige al menos un rescan al revertir.
+15. Repone los workers del broker con espera creciente entre intentos.
+16. Documenta la sonda de uso con holders, `mountinfo` y `fuser`, los reinicios de #144 y la versión idk31.
+17. Añade `tools/idk-readonly-smoke.pl` para comprobar NVMe en nodos PVE y emitir TAP.
+
 ## Version 2.1.25~beta2 (November 19, 2026)
 
 ### New Features

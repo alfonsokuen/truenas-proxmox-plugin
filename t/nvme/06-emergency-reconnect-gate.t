@@ -33,10 +33,11 @@ my $STUB_IN_USE   = 0;   # value _nvme_check_devices_in_use returns
 my @DISCONNECTS   = ();
 my @CONNECTS      = ();
 my @LOG           = ();
+my ($lock_behavior, @lock_timeouts, $lookups, $emergency_only);
 
 {
     no strict 'refs';
-    no warnings 'redefine';
+    no warnings 'redefine', 'once';
 
     # Make the retry loop instant.
     *{"${PKG}::usleep"} = sub ($) { 1 };
@@ -54,6 +55,7 @@ my @LOG           = ();
     # i==10 gate also skips. The i==35 gate still has grounds to
     # fire; see _nvme_check_devices_in_use below.
     *{"${PKG}::_nvme_find_device_by_subsystem"} = sub {
+        ++$lookups;
         return {
             selected_device_path => undef,
             linux_device_count   => 4,
@@ -76,7 +78,7 @@ my @LOG           = ();
     };
 
     # Subsystem is connected; a nonempty device path set exists.
-    *{"${PKG}::_nvme_is_connected"} = sub { 1 };
+    *{"${PKG}::_nvme_is_connected"} = sub { !$emergency_only || $lookups >= 150 };
     *{"${PKG}::_nvme_get_subsystem_device_paths"} = sub {
         return ('/dev/nvme0n1', '/dev/nvme0n2');
     };
@@ -97,7 +99,18 @@ my @LOG           = ();
     # Supporting stubs so the emergency `else` branch doesn't blow up
     # when it runs in the negative-case test.
     *{"${PKG}::_nvme_rescan_subsystem_controllers"} = sub { 1 };
-    *{"${PKG}::_nvme_reap_orphan_namespaces"}       = sub { 0 };
+    *{"${PKG}::_nvme_reap_orphan_namespaces"}       = sub {
+        $PKG->cluster_lock_storage('store', 1, undef, sub { 0 });
+    };
+    *{"${PKG}::_nvme_reap_orphan_namespaces_locked"} = sub { 0 };
+    *PVE::Storage::config = sub { {} };
+    *PVE::Storage::storage_config = sub { make_scfg() };
+    *PVE::Storage::Plugin::cluster_lock_storage = sub {
+        my (undef, $store, $shared, $timeout, $cb) = @_;
+        push @lock_timeouts, $timeout;
+        $lock_behavior->() if $lock_behavior;
+        return $cb->();
+    };
     *{"${PKG}::run_command"} = sub { 0 };
 }
 
@@ -106,10 +119,13 @@ sub reset_capture {
     @DISCONNECTS = ();
     @CONNECTS    = ();
     @LOG         = ();
+    @lock_timeouts = ();
+    $lookups = 0;
 }
 
 sub make_scfg {
     return {
+        storeid           => 'store',
         tn_dataset        => 'tank/pve',
         tn_api_host       => '203.0.113.1',
         tn_transport_mode => 'nvme-tcp',
@@ -191,5 +207,28 @@ sub log_matches {
     ok(log_matches(qr/emergency reconnect SKIPPED/),
         'incomplete probe: SKIPPED log line fired');
 }
+
+subtest '7 reconnect rechecks while locked and skips disconnect if lock acquisition fails' => sub {
+    $emergency_only = 1;
+    for my $case ('guest opened while waiting', 'lock unavailable') {
+        reset_capture();
+        $lock_behavior = sub {
+            die "storage lock timed out\n" if $case eq 'lock unavailable';
+            $STUB_IN_USE = 1;
+        };
+        run_lookup();
+        is(scalar(@DISCONNECTS), 0, "$case: zero disconnects");
+        is(scalar(@CONNECTS), 0, "$case: zero connects");
+    }
+    $lock_behavior = undef;
+};
+
+subtest '13 emergency path bounds the lock wait' => sub {
+    reset_capture();
+    $lock_behavior = sub { die "storage lock timed out\n" };
+    run_lookup();
+    is(scalar(@lock_timeouts), 1, 'only one lock acquisition attempt');
+    cmp_ok($lock_timeouts[0] // 120, '<=', 2, 'optional reaper never waits for the 120-second policy');
+};
 
 done_testing();
