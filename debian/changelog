@@ -1,8 +1,8 @@
 truenas-proxmox-plugin (1:2.1.25~beta2+idk31) unstable; urgency=medium
 
   * Base upstream: 2.1.25~beta2 (0b933da). Se adopta el formulario de
-    almacenamiento de pve-manager 9.2.29+, los titulos del esquema y
-    APIVER 17 con el limite del host. Se conservan los secretos privados
+    almacenamiento de pve-manager 9.2.29+ y los titulos del esquema.
+    APIVER se limita a 16 y al valor del host. Se conservan los secretos privados
     y la validacion de ediciones del fork.
   * iSCSI (#147): limpieza entre nodos de mapas multipath y rutas SCSI
     huerfanas, con avisos WWID en pmxcfs y barrido con periodo de gracia.
@@ -22,6 +22,18 @@ truenas-proxmox-plugin (1:2.1.25~beta2+idk31) unstable; urgency=medium
     manejo de reinicios de pvedaemon, pvestatd, pvescheduler y pveproxy,
     y recarga los daemons de HA. Se incorporan las notas de recuperacion
     de upstream y se adaptan las pruebas nuevas a las guardas del fork.
+  * #1 NVMe: el borrado comprueba referencias de invitados de todo el clúster antes de retirar el namespace y antes de destruir el zvol.
+  * #2 y #15 Broker: apagado con drenaje acotado y verificación del servicio durante la instalación y actualización.
+  * #3 NVMe: se comprueban datasets hijos antes de retirar el namespace, se marca el zvol y se verifica su borrado diferido.
+  * #10 Se ejecuta una sola creación o clonación del dataset y se consulta el destino ante una respuesta perdida.
+  * #11 NVMe: se usa el resultado del rescan al ampliar y se vuelve a escanear tras revertir un snapshot.
+  * #12 NVMe: se exige el límite MDTS también al exponer un clon temporal de snapshot.
+  * #9 NVMe: el barrido de namespaces huérfanos toma el lock de almacenamiento y revalida cada ruta antes de borrar.
+  * #13 El supervisor del broker termina con error cuando se queda sin workers para que systemd lo reinicie.
+  * #14 NVMe: si fuser tarda más de 10 s se considera que el dispositivo está en uso.
+  * #16 La edición de un almacenamiento valida el usuario requerido por SCRAM y SCRAM-PLUS antes de cambiar secretos.
+  * #17 NVMe: la sonda compara identidades de sysfs, reintenta hasta tres veces y bloquea si persiste la incertidumbre.
+  * #147 iSCSI: el barrido deriva los WWID vivos de los mapeos del target y se detiene ante un conjunto vivo vacío con mapas locales.
 
  -- Alfonso Kuen <alfonsokuen@gmail.com>  Thu, 19 Nov 2026 18:49:17 -0500
 

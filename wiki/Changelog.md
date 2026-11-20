@@ -1,5 +1,20 @@
 # TrueNAS Plugin Changelog
 
+## Versión 2.1.25~beta2+idk31 (19 de noviembre de 2026)
+
+- **#1 NVMe**. Comprueba las referencias de invitados del clúster antes de retirar el namespace y antes de destruir el zvol.
+- **#2 y #15 Broker**. Termina las peticiones en curso durante un apagado acotado y verifica el servicio al instalar o actualizar.
+- **#3 NVMe**. Comprueba los datasets hijos antes de retirar el namespace, marca el zvol y verifica el borrado diferido.
+- **#10**. Envía una sola creación o clonación del dataset y consulta el destino cuando se pierde la respuesta.
+- **#11 NVMe**. Usa el resultado del rescan al ampliar y vuelve a escanear tras revertir un snapshot.
+- **#12 NVMe**. Exige el límite MDTS al exponer un clon temporal de snapshot.
+- **#9 NVMe**. Toma el lock de almacenamiento para limpiar namespaces huérfanos y revalida cada ruta antes de borrar.
+- **#13 Broker**. Termina con error si se queda sin workers para que systemd lo reinicie.
+- **#14 NVMe**. Considera el dispositivo en uso si `fuser` supera los 10 segundos.
+- **#16**. Valida el usuario de SCRAM y SCRAM-PLUS al editar el almacenamiento, antes de cambiar secretos.
+- **#17 NVMe**. Comprueba la identidad de los dispositivos en sysfs, reintenta hasta tres veces y bloquea si la vista sigue siendo inestable.
+- **#147 iSCSI**. Deriva los WWID vivos de los mapeos del target y detiene el barrido si hay mapas locales y ningún WWID vivo.
+
 ## Version 2.1.25~beta2 (November 19, 2026)
 
 ### New Features

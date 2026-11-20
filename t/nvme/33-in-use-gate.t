@@ -120,7 +120,7 @@ is($check->($scfg), 0, 'no devices at all is free (nothing to protect)');
 {
     open(my $src, '<', $PLUGIN) or die "cannot read $PLUGIN: $!";
     local $/; my $text = <$src>; close $src;
-    like($text, qr/system\(\$fuser,\s*'-s',\s*'-m',\s*\@args\)/,
+    like($text, qr/exec\s*\{\s*\$fuser\s*\}\s*\$fuser,\s*'-s',\s*'-m',\s*\@args/,
          "the in-use gate asks fuser with -m (mount-namespace aware)");
 }
 

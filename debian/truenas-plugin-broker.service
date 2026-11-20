@@ -13,15 +13,19 @@ Before=pvestatd.service pvedaemon.service pveproxy.service
 
 [Service]
 # Type=notify pairs with sd_notify_ready() in the broker, which sends
-# READY=1 only after the listen socket is bound. Downstream services
-# with After=truenas-plugin-broker.service then wait for the socket to
-# actually be listening before they start, not just for the process to
-# be alive.
+# READY=1 only after binding the listen socket and forking a worker.
+# Downstream services with After=truenas-plugin-broker.service then
+# wait until the broker can accept connections.
 Type=notify
 NotifyAccess=main
 # A lost READY=1 would otherwise hold the start for the 90 s default and then kill
 # a broker that is in fact serving. Fail fast and let Restart= retry.
 TimeoutStartSec=30
+# The parent coordinates draining. Allow the default 90 s RPC budget, 10 s
+# each for request and response framing, plus worker cleanup. If raising
+# either broker budget above 90 s, also set this above that budget plus 25 s.
+KillMode=mixed
+TimeoutStopSec=120
 ExecStart=/usr/sbin/truenas-plugin-broker --foreground
 Restart=on-failure
 RestartSec=2

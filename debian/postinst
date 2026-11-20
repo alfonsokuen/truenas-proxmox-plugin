@@ -12,31 +12,43 @@ have_systemd() {
 }
 
 enable_broker() {
-    if have_systemd; then
-        systemctl daemon-reload || true
-        systemctl enable "$BROKER_UNIT" >/dev/null 2>&1 || true
-        # Start the broker before restarting PVE services so the plugin
-        # finds /run/truenas-plugin/broker.sock on first call. try-restart
-        # picks up a new broker binary on upgrade without a separate stop.
-        if systemctl is-active --quiet "$BROKER_UNIT"; then
-            systemctl try-restart "$BROKER_UNIT" || true
-        else
-            systemctl start "$BROKER_UNIT" || true
-        fi
+    have_systemd || return 0
+    systemctl daemon-reload || return 1
 
-        # Verify the socket appears; the plugin now refuses direct-WS mode
-        # and dies loudly if the socket is missing. Wait briefly for
-        # RuntimeDirectory + first accept() to settle.
-        i=0
-        while [ $i -lt 20 ] && [ ! -S /run/truenas-plugin/broker.sock ]; do
-            sleep 0.25
-            i=$((i + 1))
-        done
-        if [ ! -S /run/truenas-plugin/broker.sock ]; then
-            echo "WARNING: /run/truenas-plugin/broker.sock did not appear after starting $BROKER_UNIT." >&2
-            echo "  The plugin will fail with a broker-missing error until this is resolved." >&2
-            echo "  Check: systemctl status $BROKER_UNIT && journalctl -u $BROKER_UNIT -n 50" >&2
+    if [ -n "${1:-}" ]; then
+        # Preserve the operator's enablement on upgrades. An unrecognized
+        # state (including a missing unit) must not count as disabled.
+        state=$(systemctl is-enabled "$BROKER_UNIT") || true
+        case "$state" in
+            disabled|masked|masked-runtime) return 0 ;;
+            enabled|enabled-runtime) ;;
+            *)
+                echo "ERROR: Cannot determine enablement of $BROKER_UNIT (state: ${state:-unknown})." >&2
+                return 1
+                ;;
+        esac
+    else
+        if ! systemctl enable "$BROKER_UNIT" >/dev/null; then
+            echo "ERROR: Could not enable $BROKER_UNIT." >&2
+            return 1
         fi
+    fi
+
+    # Type=notify makes these operations wait for the listener and a worker.
+    action=start
+    if systemctl is-active --quiet "$BROKER_UNIT"; then
+        action=try-restart
+    fi
+    if ! systemctl "$action" "$BROKER_UNIT"; then
+        echo "ERROR: Could not $action $BROKER_UNIT." >&2
+        return 1
+    fi
+
+    # RuntimeDirectoryPreserve leaves the old socket behind after a crash.
+    if ! systemctl is-active --quiet "$BROKER_UNIT" || [ ! -S /run/truenas-plugin/broker.sock ]; then
+        echo "ERROR: $BROKER_UNIT is inactive or /run/truenas-plugin/broker.sock is missing." >&2
+        echo "  Check: systemctl status $BROKER_UNIT && journalctl -u $BROKER_UNIT -n 50" >&2
+        return 1
     fi
 }
 
@@ -78,8 +90,7 @@ restart_proxmox_services() {
     # and pve-ha-lrm only) and prints the command to run later. It does not, and
     # cannot, stop pve-manager's trigger from reloading pvedaemon / pvestatd /
     # pvescheduler / pveproxy / spiceproxy; only dpkg --no-triggers does. The
-    # truenas-plugin-broker restart in enable_broker() still runs
-    # unconditionally -- our own service, does not touch the web UI session.
+    # The broker's lifecycle is handled independently by enable_broker().
     if [ "${TRUENAS_PLUGIN_NO_RESTART:-0}" = "1" ]; then
         echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not reloading pve-ha-crm / pve-ha-lrm."
         echo "  (pve-manager's own dpkg trigger still reloads pvedaemon, pvestatd, pvescheduler and"
@@ -218,7 +229,7 @@ case "$1" in
             migrate_storage_cfg "$2"
         fi
 
-        enable_broker
+        enable_broker "${2:-}"
         # The packaged udev rule (NVMe/TCP command size cap, only for
         # namespaces whose subsystem NQN names truenas) is read at the next
         # block event; reload so it is in place without a reboot. Already-

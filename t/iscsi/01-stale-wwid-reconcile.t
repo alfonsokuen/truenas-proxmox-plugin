@@ -238,18 +238,29 @@ for my $sd (qw(sdm sdao)) {
 unlink $_ for glob "$RUNDIR/reconcile-*";
 unlink $_ for glob "$RUNDIR/orphan-*/*";
 
-# The floor sweep considers every extent NAA because datasets can share one target.
+# The floor resolves the exact target and joins its mappings with the extents.
+my $target_id = 42;
+my $surviving = { id => 2, naa => '0x' . ('a' x 32), disk => 'zvol/tank/other-storage/vol-surviving' };
+my $local_extent = { id => 1, naa => '0x6589cfc0000007e14b2248c1e5fa7768',
+    disk => 'zvol/tank/other-storage/vol-local' };
 my $tn_mode = 'orphan';
 *{"${PKG}::_api_call"} = sub {
     my ($scfg, $method, $args) = @_;
+    return [{ id => $target_id, name => 'prox' }] if $method eq 'iscsi.target.query';
+    return { basename => 'iqn.2005-10.org.freenas.ctl' } if $method eq 'iscsi.global.config';
+    if ($method eq 'iscsi.targetextent.query') {
+        is_deeply($args->[0], [['target', '=', $target_id]], 'floor queries mappings for the configured target');
+        return [] if $tn_mode eq 'empty';
+        return [{ target => $target_id, extent => 2 },
+            ($tn_mode eq 'live' || $tn_mode eq 'partial' ? { target => $target_id, extent => 1 } : ())];
+    }
     if ($method eq 'iscsi.extent.query') {
-        die "dataset filter would hide extents sharing the target\n" if @{$args->[0]};
+        die "dataset filter would hide extents sharing the target\n" if grep { $_->[0] eq 'disk' } @{$args->[0] // []};
         return undef if $tn_mode eq 'invalid';
-        return [] if $tn_mode eq 'orphan';          # orphan
         die "simulated TN failure\n" if $tn_mode eq 'fail';
-        return [ { id => 1, naa => '0x6589cfc0000007e14b2248c1e5fa7768',
-                   disk => 'zvol/tank/other-storage/vol-foo' } ]
-            if $tn_mode eq 'live';
+        return [] if $tn_mode eq 'empty';
+        return [$surviving] if $tn_mode eq 'partial';
+        return [$surviving, $local_extent];
     }
     return [];
 };
@@ -311,6 +322,18 @@ utime(time() - 9999, time() - 9999, $orphan_stamp);
 @RUN = ();
 _call('_floor_reconcile_wwids', $storeid, $floor_scfg);
 ok(!grep({ $_->[0] eq 'multipath' } @RUN), 'undefined extent reply fails closed');
+
+for my $mode (qw(empty partial)) {
+    $tn_mode = $mode;
+    unlink "$RUNDIR/reconcile-$storeid";
+    open(my $aged, '>', $orphan_stamp) or die $!;
+    close($aged) or die $!;
+    utime(time() - 9999, time() - 9999, $orphan_stamp);
+    @RUN = ();
+    _call('_floor_reconcile_wwids', $storeid, $floor_scfg);
+    ok(!grep({ $_->[0] eq 'multipath' } @RUN), "$mode live set leaves the aged local WWID alone");
+    ok(!-e "$RUNDIR/reconcile-$storeid", "$mode live set is not recorded as definitive");
+}
 
 # ---- 8. config guards ----
 

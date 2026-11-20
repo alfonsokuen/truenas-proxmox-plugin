@@ -39,6 +39,7 @@ plan skip_all => "_free_image_nvme not found" unless $free;
 
 my @calls;      # every method the code tried to call, in order
 my %fail;       # method => error string to throw
+my $gone;
 
 {
     no strict 'refs';
@@ -47,6 +48,8 @@ my %fail;       # method => error string to throw
     # Keep the destructive steps off any real machine while still recording
     # the intent. Deferred work would otherwise try to touch nvme-cli.
     *{"${PKG}::_defer_after_lock"}  = sub { 1 };
+    *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
+    *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
     *{"${PKG}::_nvme_disconnect"}   = sub { push @calls, 'nvme_disconnect'; 1 };
     *{"${PKG}::run_command"}        = sub { 1 };
 
@@ -54,6 +57,8 @@ my %fail;       # method => error string to throw
         my ($scfg, $method, $params) = @_;
         push @calls, $method;
         die $fail{$method} if exists $fail{$method};
+        $gone = 1 if $method eq 'pool.dataset.delete';
+        die "[ENOENT] InstanceNotFound\n" if $gone && $method eq 'pool.dataset.get_instance';
         # One namespace, pointing at our zvol.
         return [ { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0' } ]
             if $method eq 'nvmet.namespace.query';
@@ -72,6 +77,7 @@ my $scfg = {
 
 sub run_free {
     %fail = @_;
+    $gone = 0;
     @calls = ();
     # ($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata)
     my $ok = eval {

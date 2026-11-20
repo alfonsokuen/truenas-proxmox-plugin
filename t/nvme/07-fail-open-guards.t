@@ -58,6 +58,7 @@ my @logs;         # every _log as [level, priority, message]
 my %fail;         # method => error string to throw
 my %ret;          # method => canned return (or coderef), overrides defaults
 my $wait_result;  # what the stubbed job wait reports; default is a timeout
+my $dataset_gone;
 
 {
     no strict 'refs';
@@ -66,6 +67,8 @@ my $wait_result;  # what the stubbed job wait reports; default is a timeout
     # Keep the destructive steps off any real machine while still recording
     # the intent. Deferred work would otherwise try to touch nvme-cli.
     *{"${PKG}::_defer_after_lock"}  = sub { 1 };
+    *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
+    *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
     *{"${PKG}::_nvme_disconnect"}   = sub { push @calls, 'nvme_disconnect'; 1 };
     *{"${PKG}::_nvme_connect"}      = sub { push @calls, 'nvme_connect'; 1 };
     *{"${PKG}::run_command"}        = sub { 1 };
@@ -90,6 +93,8 @@ my $wait_result;  # what the stubbed job wait reports; default is a timeout
             my $r = $ret{$method};
             return ref($r) eq 'CODE' ? $r->($params) : $r;
         }
+        $dataset_gone = 1 if $method eq 'pool.dataset.delete';
+        die "[ENOENT] InstanceNotFound\n" if $dataset_gone && $method eq 'pool.dataset.get_instance';
         # One namespace, pointing at our zvol.
         return [ { id => 42, device_path => 'zvol/tank/pve/vm-101-disk-0' } ]
             if $method eq 'nvmet.namespace.query';
@@ -115,6 +120,7 @@ my %SCFG = (
 
 sub reset_world {
     @calls = (); @logs = (); %fail = (); %ret = (); $wait_result = undef;
+    $dataset_gone = 0;
 }
 
 sub run_free_image {

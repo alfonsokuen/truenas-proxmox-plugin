@@ -42,6 +42,8 @@ my (@events, @checked, $selector, $selector_dies, $resolve_err, $in_use, $datase
     no strict 'refs'; no warnings 'redefine';
     *{"${PKG}::_log"} = sub { 1 };
     *{"${PKG}::_defer_after_lock"} = sub { 1 };
+    *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
+    *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_assert_no_child_datasets"} = sub { 1 };
     *{"${PKG}::_nvme_disconnect"} = sub { push @events, 'nvme_disconnect'; 1 };
@@ -154,7 +156,7 @@ for my $c (@undecided) {
 # did, so this namespace is not attached here and no local guest can hold it
 # open. nguid_contradicted says the same thing from the other side: the
 # devices carry real identities that are not ours. Use on OTHER nodes is not
-# visible from here at all; that is TrueNAS's to refuse.
+# visible here. The separate cluster reference check is exercised in t/nvme/48.
 my @absent = (
     [ 'subsystem not connected on this node', {
         selector_outcome => 'publication_mismatch', mismatch_reason => 'subsystem_not_visible',

@@ -117,10 +117,13 @@ ok($PKG->plugindata->{'advanced-properties'}{tn_use_cluster_lock}, 'tn_use_clust
         my ($s, $m, $p) = @_;
         die $q{$m}{die} if $q{$m} && $q{$m}{die};
         push @deleted, $p->[0] if $m eq 'nvmet.namespace.delete';
+        if ($m eq 'nvmet.namespace.query' && @{$p->[0]} == 2) {
+            return [grep { $_->{id} == $p->[0][1][2] } @{$q{$m}{ret}}];
+        }
         return $q{$m} ? $q{$m}{ret} : [];
     };
     local *{"${PKG}::_tn_dataset_get"} = sub { my ($s, $id) = @_; die $get{$id}{die} if $get{$id}{die}; return $get{$id}{ret} };
-    my $reap = $PKG->can('_nvme_reap_orphan_namespaces');
+    my $reap = $PKG->can('_nvme_reap_orphan_namespaces_locked');
     my $rs = { tn_dataset => 'tank/pve', tn_subsystem_nqn => 'nqn.x:y' };
     my @ns = ( { id => 1, device_path => 'zvol/tank/pve/vm-1-disk-0' },
                { id => 2, device_path => 'zvol/tank/pve/vm-2-disk-0' } );
@@ -205,10 +208,10 @@ SKIP: {
     local *{"${PKG}::_tn_dataset_get"} = sub { die $get{err} };
     my $rs = { tn_dataset => 'tank/pve', tn_subsystem_nqn => 'nqn.x:y' };
     $get{err} = "[-32601] Method does not exist: pool.dataset.get_instance\n";
-    $PKG->can('_nvme_reap_orphan_namespaces')->($rs);
+    $PKG->can('_nvme_reap_orphan_namespaces_locked')->($rs);
     is(scalar(@deleted), 0, 'reaper: "Method does not exist" from the probe is NOT proof the dataset is gone');
     $get{err} = "[ENOENT] ... InstanceNotFound\n";
-    $PKG->can('_nvme_reap_orphan_namespaces')->($rs);
+    $PKG->can('_nvme_reap_orphan_namespaces_locked')->($rs);
     is_deeply([@deleted], [2], '  ...while a real InstanceNotFound still reaps');
 }
 {

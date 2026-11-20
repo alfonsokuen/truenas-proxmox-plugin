@@ -32,8 +32,8 @@ use IO::Socket::SSL;
 use IO::Socket::INET;
 use IO::Select;
 use Fcntl qw(:flock);
-use Errno qw(EAGAIN EWOULDBLOCK EINTR);
-use POSIX qw(setsid strftime WNOHANG);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR ECHILD);
+use POSIX qw(setsid strftime WNOHANG SIGTERM SIGINT SIG_BLOCK SIG_SETMASK sigprocmask);
 use Digest::SHA qw(sha1 sha1_hex);
 use MIME::Base64 qw(encode_base64);
 use JSON::PP ();
@@ -121,6 +121,12 @@ my $PING_TIMEOUT = 5;
 # expires on a client that has stopped, and it must expire: an unbounded read
 # here wedges the accept loop exactly as an unbounded upstream read did.
 my $CLIENT_READ_TIMEOUT = 10;
+# The upstream window can start after the request line has been read, and
+# the response gets its own write deadline. Allow time for worker cleanup.
+my $DRAIN_TIMEOUT = ($MAX_BUDGET > $UPSTREAM_TIMEOUT ? $MAX_BUDGET : $UPSTREAM_TIMEOUT)
+    + 2 * $CLIENT_READ_TIMEOUT + 5;
+my $SUPERVISOR_POLL = 0.25;
+my $WORKER_POLL = 1;
 # And a ceiling on how much we will buffer before giving up on finding the
 # newline, so a peer that never sends one cannot grow us out of memory.
 my $MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -1124,6 +1130,8 @@ sub make_listener {
         Listen => 128,
         Type   => SOCK_STREAM,
     ) or die "cannot bind $SOCKET_PATH: $!";
+    # Another worker can take the connection between select() and accept().
+    defined($srv->blocking(0)) or die "cannot set $SOCKET_PATH nonblocking: $!";
     chmod 0600, $SOCKET_PATH;
     return $srv;
 }
@@ -1343,113 +1351,131 @@ sub handle_request {
 }
 
 # ---------------- main ----------------
-my $srv;
-my %WORKER_PIDS;   # pid => 1
+my $STOP_SIGNALS = POSIX::SigSet->new(SIGTERM, SIGINT);
 
-# Prefork the worker pool. Parent creates listen fd, forks N children; each
-# child re-runs the accept loop against the shared fd. Kernel serializes
-# accept() among children so no race. Parent then waits and re-spawns any
-# child that dies.
+# The parent owns the listener path and supervises workers. Each child
+# accepts on its inherited fd and owns its own connections to TrueNAS.
 sub spawn_worker {
+    my ($srv, $stopping, $workers) = @_;
     my $pid = fork();
     if (!defined $pid) {
         lerr("fork worker failed: $!");
         return;
     }
     if ($pid == 0) {
-        # child: close its own WS pool cleanly on TERM; do NOT touch
-        # parent's socket file or pidfile.
-        $SIG{TERM} = $SIG{INT} = sub {
-            for my $sk (keys %POOL) {
-                my $e = $POOL{$sk};
-                eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
-            }
-            exit 0;
-        };
-        $SIG{CHLD} = 'DEFAULT';
-        worker_loop($srv);
+        worker_loop($srv, $stopping);
+        for my $e (values %POOL) {
+            eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
+        }
         exit 0;
     }
-    $WORKER_PIDS{$pid} = 1;
+    $workers->{$pid} = 1;
     ldebug("spawned worker pid=$pid");
 }
 
 sub worker_loop {
-    my ($srv) = @_;
+    my ($srv, $stopping) = @_;
     my $sel = IO::Select->new($srv);
     my $last_reap = time();
-    while (1) {
-        my @ready = $sel->can_read(60);
-        for my $fh (@ready) {
-            if ($fh == $srv) {
-                my $c = $srv->accept();
-                next unless $c;
+    while (!$$stopping) {
+        # A TERM just before select() must not leave an idle worker waiting.
+        if ($sel->can_read($WORKER_POLL) && !$$stopping) {
+            my $c = $srv->accept();
+            if ($c) {
+                # A flag alone would still let TERM interrupt select() during
+                # RPC I/O and discard the reply. Defer the signal until the
+                # request and response have completed, then stop accepting.
+                my $old_mask = POSIX::SigSet->new();
+                sigprocmask(SIG_BLOCK, $STOP_SIGNALS, $old_mask)
+                    or die "cannot block stop signals during request: $!";
                 my $accepted_at = time();
-                eval { handle_request($c, $accepted_at); };
+                eval { handle_request($c, $accepted_at) unless $$stopping; };
                 if ($@) { lerr("handle_request died: $@"); }
                 eval { $c->close(); };
+                sigprocmask(SIG_SETMASK, $old_mask)
+                    or die "cannot restore signal mask after request: $!";
             }
         }
-        if (time() - $last_reap > 60) {
+        if (!$$stopping && time() - $last_reap > 60) {
             reap_idle();
             $last_reap = time();
         }
     }
 }
 
-sub main {
-ensure_rundir();
-daemonize();
-write_pidfile();
-linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
-
-$SIG{PIPE} = 'IGNORE';
-# NOTE: parent SIG{TERM}/INT is set AFTER the prefork below so it can
-# also propagate to the worker pool. Workers install their own TERM
-# handler in spawn_worker so they close their local %POOL WS connections
-# and exit cleanly without touching parent's socket / pidfile.
-
-$srv = make_listener();
-
-# The listen fd is now bound and listening. Workers haven't been forked
-# yet, but the kernel will queue incoming connections until one does
-# accept(). From a client's perspective the socket is ready, so this is
-# the right moment to tell systemd we're up (Type=notify). See
-# sd_notify_ready() comment for the ordering rationale.
-sd_notify_ready();
-
-
-# Parent: spawn N workers, then supervise
-for (1..$PREFORK_N) { spawn_worker(); }
-linfo("prefork pool up (N=$PREFORK_N)");
-
-# Parent supervision loop: reap dead workers, respawn to keep pool full.
-# Set the parent's TERM/INT handler HERE (after workers are up) so it
-# only affects the parent process -- workers already installed their own
-# in spawn_worker.
-$SIG{TERM} = $SIG{INT} = sub {
+sub stop_workers {
+    my ($workers) = @_;
     linfo("parent shutting down, signalling workers");
-    kill 'TERM', keys %WORKER_PIDS;
-    # Give workers a moment to close their WS cleanly.
-    for (1..10) {
-        last unless keys %WORKER_PIDS;
+    my $deadline = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) + $DRAIN_TIMEOUT;
+    kill 'TERM', keys %$workers;
+    while (%$workers) {
         my $dead = waitpid(-1, WNOHANG);
-        if ($dead > 0) { delete $WORKER_PIDS{$dead}; }
-        else { select(undef, undef, undef, 0.1); }
+        if ($dead > 0) {
+            delete $workers->{$dead};
+            next;
+        }
+        return if $dead < 0 && $!{ECHILD};
+        my $remaining = $deadline - Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC());
+        last if $remaining <= 0;
+        Time::HiRes::sleep($remaining < $SUPERVISOR_POLL ? $remaining : $SUPERVISOR_POLL);
     }
-    unlink $SOCKET_PATH;
-    unlink $PIDFILE;
-    exit 0;
-};
-
-while (1) {
-    my $dead = waitpid(-1, 0);
-    if ($dead > 0) {
-        delete $WORKER_PIDS{$dead};
-        lwarn("worker pid=$dead exited (status=$?), respawning");
-        spawn_worker();
+    if (%$workers) {
+        lwarn("worker shutdown deadline expired; killing remaining workers");
+        kill 'KILL', keys %$workers;
     }
 }
+
+sub main {
+    ensure_rundir();
+    daemonize();
+    my $stopping = 0;
+    local $SIG{PIPE} = 'IGNORE';
+    # Install before forking. The child inherits the handler, and the parent
+    # records each PID before acting on TERM, including TERM during fork().
+    local $SIG{TERM} = local $SIG{INT} = sub { $stopping = 1 };
+    write_pidfile();
+    linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
+
+    my $srv = make_listener();
+    my %workers;
+    for (1..$PREFORK_N) {
+        last if $stopping;
+        spawn_worker($srv, \$stopping, \%workers);
+    }
+    if (%workers && !$stopping) {
+        sd_notify_ready();
+        linfo("prefork pool up (N=" . scalar(keys %workers) . ")");
+    }
+
+    my $status = 0;
+    while (!$stopping) {
+        unless (%workers) {
+            lerr("no broker workers remain; exiting so systemd can restart the service");
+            $status = 1;
+            last;
+        }
+        # Polling bounds the race between testing the stop flag and waitpid().
+        my $dead = waitpid(-1, WNOHANG);
+        if ($dead > 0) {
+            delete $workers{$dead};
+            unless ($stopping) {
+                lwarn("worker pid=$dead exited (status=$?), respawning");
+                spawn_worker($srv, \$stopping, \%workers);
+            }
+        } elsif ($dead < 0 && !$!{EINTR}) {
+            lerr("waitpid failed: $!");
+            %workers = () if $!{ECHILD};
+            $status = 1;
+            last;
+        } elsif (!$stopping) {
+            Time::HiRes::sleep($SUPERVISOR_POLL);
+        }
+    }
+    $srv->close();
+    unlink $SOCKET_PATH;
+    stop_workers(\%workers) if %workers;
+    unlink $PIDFILE;
+    exit $status;
 }
 
 main() unless caller;

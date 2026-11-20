@@ -29,6 +29,7 @@ my (@calls, %get, $delete_script);
     *CORE::GLOBAL::sleep = sub { 1 } if 0;
     *{"${PKG}::_nvme_delete_namespace"} = sub { 1 };
     *{"${PKG}::_defer_after_lock"} = sub { 1 };
+    *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
     *{"${PKG}::_nvme_disconnect"} = sub { 1 };
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_tn_dataset_get"} = sub {

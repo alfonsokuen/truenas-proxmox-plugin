@@ -44,6 +44,8 @@ my (@events, @checked, $in_use);
     ${"${PKG}::_NVME_SYSFS"} = $root;
     *{"${PKG}::_log"} = sub { 1 };
     *{"${PKG}::_defer_after_lock"} = sub { 1 };
+    *{"${PKG}::_assert_nvme_cluster_unreferenced"} = sub { 1 };
+    *{"${PKG}::_nvme_pending_free_mark"} = sub { 1 };
     *{"${PKG}::run_command"} = sub { 1 };
     *{"${PKG}::_assert_no_child_datasets"} = sub { 1 };
     *{"${PKG}::_verify_devices_disconnected"} = sub { 1 };

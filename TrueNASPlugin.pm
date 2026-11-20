@@ -7,7 +7,7 @@ use warnings;
 # El paquete conserva el epoch 1 para prevalecer sobre el APT de upstream.
 our $VERSION = '2.1.25~beta2+idk31';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 17;
+our $TESTED_APIVER = 16;
 use JSON::PP ();    # JSON::PP::true / JSON::PP::false stay this plugin's booleans
 # JSON::PP is pure Perl. Measured on a 352 KB answer (what dataset queries return):
 # decode 258 ms with JSON::PP against 4.8 ms with JSON::XS, and every answer goes
@@ -2039,14 +2039,34 @@ sub on_update_hook {
 # config - the exact object PVE mutates and serializes right after this
 # hook returns (`for my $k (keys %$opts) { $scfg->{$k} = $opts->{$k}; }`,
 # unconditional on api() version) - so every `delete $scfg->{$k}` below
-# reaches storage.cfg. $update/$delete are not used: a sensitive property
-# never appears in either (it is routed to $sensitive instead,
+# reaches storage.cfg. A sensitive property never appears in $update/$delete
+# (it is routed to $sensitive instead,
 # exists()-checked the same way $delete entries are: undef means "delete
 # this"). $scfg is undef when called from on_update_hook() above (a host
 # too old to have on_update_hook_full at all); every scfg mutation here is
 # guarded accordingly.
 sub on_update_hook_full {
     my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
+
+    # Validate the effective pair before a rejected edit can rotate secrets.
+    my %removed = map { $_ => 1 } @{ $delete // [] };
+    my @auth_keys = qw(tn_auth_mechanism tn_api_username);
+    my $auth_touched = grep { exists($update->{$_}) || $removed{$_} } @auth_keys;
+    my $current = $scfg;
+    if (!$current && $auth_touched) {
+        # The legacy hook only supplies changed options, without deletions.
+        $current = PVE::Storage::storage_config(PVE::Storage::config(), $storeid);
+    }
+    $current //= {};
+    my %auth = map { $_ => $current->{$_} } @auth_keys;
+    delete @auth{keys %removed};
+    $auth{$_} = $update->{$_} for grep { exists $update->{$_} } @auth_keys;
+    if (($auth{tn_auth_mechanism} // '') =~ /\Ascram(?:-plus)?\z/ && !length($auth{tn_api_username} // '')) {
+        my $err = "TrueNAS storage '$storeid': tn_api_username is required for "
+            . "$auth{tn_auth_mechanism}; set both options in one command.\n";
+        die $err if $auth_touched;
+        syslog('warning', '%s', $err);
+    }
 
     # C4 (QA round 4, Kimi): computed at most ONCE per hook call, not once
     # per secret - see _tn_strip_inline_if_cluster_ready()'s own comment.
@@ -3205,7 +3225,7 @@ sub _assert_no_child_datasets {
           . "); refusing to run a recursive delete.\n";
     }
     my @children = grep { ($_->{type} // '') ne 'SNAPSHOT' } @{$ds_info->{children}};
-    return if !@children;
+    return $ds_info if !@children;
     my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
     die "Cannot use recursive deletion: dataset $full_ds has child datasets: $child_names. " .
         "Recursive deletion would destroy these child datasets. Please remove them manually first.";
@@ -3724,9 +3744,45 @@ sub _tn_zvol_create_payload {
 sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     my $bytes = int($size_kib) * 1024;
     my $payload = _tn_zvol_create_payload($scfg, $full, $bytes, $blocksize);
-    my $result = _api_call_mutate($scfg, 'pool.dataset.create', [ $payload ]);
+    my $result = _tn_create_zvol_once($scfg, $payload);
     _invalidate_status_capacity_cache(undef, $scfg);
     return $result;
+}
+
+# Identical names and sizes cannot distinguish concurrent allocators. Include
+# an attempt-specific marker in the existing ZFS comment before sending the
+# mutation so a lost reply can be reconciled without adopting a foreign zvol.
+sub _tn_create_zvol_once($scfg, $payload) {
+    open(my $fh, '<:raw', '/dev/urandom') or die "Could not open /dev/urandom: $!\n";
+    my $read = read($fh, my $nonce, 16);
+    close($fh);
+    die "Could not read the zvol creation marker from /dev/urandom\n" unless defined($read) && $read == 16;
+    my $marker = 'Autocreated by Proxmox Plugin (' . unpack('H*', $nonce) . ')';
+    $payload->{comments} = $marker;
+
+    my $result = eval {
+        _api_call_mutate($scfg, 'pool.dataset.create', [ $payload ], { retry_opts => { retry_max => 0 } });
+    };
+    my $err = $@;
+    return $result unless $err;
+    die $err if _is_definitive_server_verdict($err)
+        || !(_is_connection_error($err) || _is_broker_transport_error($err));
+
+    my $full = $payload->{name};
+    my $confirmed = eval {
+        my $ds = _tn_dataset_get($scfg, $full, { retry_max => 0 });
+        my $comment = $ds->{comments} if ref($ds) eq 'HASH';
+        $comment = $comment->{parsed} // $comment->{value} // $comment->{rawvalue} if ref($comment) eq 'HASH';
+        ref($ds) eq 'HASH' && ($ds->{id} // '') eq $full && ($ds->{type} // '') eq 'VOLUME'
+            && defined($comment) && $comment eq $marker
+            && _normalize_value($ds->{volsize}) == $payload->{volsize} ? $ds : undef;
+    };
+    if ($confirmed) {
+        _log($scfg, 0, 'warning', "[TrueNAS] pool.dataset.create: verified $full after a lost reply: $err");
+        return $confirmed;
+    }
+    _log($scfg, 0, 'warning', "[TrueNAS] pool.dataset.create: readback failed for $full: $@") if $@;
+    die "Failed to confirm creation of $full after an ambiguous pool.dataset.create reply: $err";
 }
 sub _tn_dataset_delete($scfg, $full) {
     my $id = uri_escape($full);
@@ -3778,7 +3834,7 @@ sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     _invalidate_status_capacity_cache(undef, $scfg);
     return $result;
 }
-sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
+sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset, $reuse_snapshot_clone = 0) {
     # Clone a ZFS snapshot to create a new dataset
     # source_snapshot: pool/dataset@snapshot
     # target_dataset: pool/new-dataset
@@ -3786,7 +3842,30 @@ sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
         snapshot => $source_snapshot,
         dataset_dst => $target_dataset,
     };
-    return _api_call_mutate($scfg, 'pool.snapshot.clone', [ $payload ]);
+    my $result = eval {
+        _api_call_mutate($scfg, 'pool.snapshot.clone', [ $payload ], { retry_opts => { retry_max => 0 } });
+    };
+    my $err = $@;
+    return $result unless $err;
+    die $err if _is_definitive_server_verdict($err)
+        || !(_is_connection_error($err) || _is_broker_transport_error($err));
+
+    my $clone = eval { _tn_dataset_get($scfg, $target_dataset, { retry_max => 0 }) };
+    my $query_err = $@;
+    my $origin = $clone->{origin} if ref($clone) eq 'HASH';
+    $origin = $origin->{parsed} // $origin->{value} // $origin->{rawvalue} if ref($origin) eq 'HASH';
+    my $matches = !$query_err && ref($clone) eq 'HASH' && ($clone->{id} // '') eq $target_dataset
+        && ($clone->{type} // '') eq 'VOLUME' && defined($origin) && $origin eq $source_snapshot;
+    # Snapshot exposure uses a deterministic clone that concurrent activations
+    # intentionally share. A permanent clone needs independent ownership,
+    # which a matching origin cannot prove after losing the create reply.
+    if ($matches && $reuse_snapshot_clone) {
+        _log($scfg, 0, 'warning', "[TrueNAS] pool.snapshot.clone: verified $target_dataset after a lost reply: $err");
+        return $clone;
+    }
+    _log($scfg, 0, 'warning', "[TrueNAS] pool.snapshot.clone: readback failed for $target_dataset: $query_err") if $query_err;
+    my $why = $matches ? 'matching origin does not establish ownership' : 'could not verify the expected origin';
+    die "Failed to confirm clone $target_dataset from $source_snapshot ($why) after an ambiguous pool.snapshot.clone reply: $err";
 }
 
 # ---- WebSocket-only snapshot rollback (TrueNAS 25.10+) ----
@@ -3972,56 +4051,22 @@ sub volume_resize {
             _try_run(['multipath','-r'], "multipath map reload failed");
         }
     } elsif ($mode eq 'nvme-tcp') {
-        # NVMe namespace size updates automatically when zvol is resized
-        # Trigger device rescan to ensure kernel sees updated size
-        # Find NVMe controllers connected to our subsystem and rescan them
-        my $nqn = $scfg->{tn_subsystem_nqn};
-        my $rescanned = 0;
-
-        eval {
-            # Find all NVMe controllers for this subsystem
-            my $subsys_link = readlink("/sys/class/nvme-subsystem/nvme-subsys*");
-            opendir(my $dh, "/sys/class/nvme-subsystem") or die "Cannot open nvme-subsystem: $!";
-            while (my $subsys = readdir($dh)) {
-                next unless $subsys =~ /^(nvme-subsys\d+)$/;
-                $subsys = $1;  # Untaint via capture
-                my $subsys_nqn = eval {
-                    open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
-                    my $val = <$fh>;
-                    close $fh;
-                    chomp($val);
-                    $val;
-                };
-                next unless $subsys_nqn && $subsys_nqn eq $nqn;
-
-                # Found our subsystem, rescan all its controllers
-                opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
-                while (my $entry = readdir($sdh)) {
-                    next unless $entry =~ /^(nvme(\d+))$/;
-                    $entry = $1;  # Untaint via capture
-                    my $ctrl_dev = "/dev/nvme$2";
-                    if (-e $ctrl_dev) {
-                        eval { _try_run(['nvme', 'ns-rescan', $ctrl_dev], "nvme rescan $ctrl_dev"); };
-                        $rescanned++ unless $@;
-                    }
-                }
-                closedir($sdh);
-            }
-            closedir($dh);
-        };
-
-        # Fallback: if we couldn't find/rescan our subsystem, try rescanning all controllers
+        # Re-read the namespace size. Fall back only when no controller for
+        # this subsystem was successfully rescanned.
+        my $rescanned = _nvme_rescan_subsystem_controllers($scfg);
         if (!$rescanned) {
             eval {
                 opendir(my $dh, "/dev") or die "Cannot open /dev: $!";
                 while (my $dev = readdir($dh)) {
                     next unless $dev =~ /^(nvme\d+)$/;
-                    $dev = $1;  # Untaint via capture
-                    eval { _try_run(['nvme', 'ns-rescan', "/dev/$dev"], "nvme rescan /dev/$dev"); };
+                    $dev = $1;
+                    $rescanned++ if _try_run(['nvme', 'ns-rescan', "/dev/$dev"], "nvme rescan /dev/$dev");
                 }
                 closedir($dh);
             };
         }
+        _log($scfg, 0, 'warning', "[TrueNAS] volume_resize: no NVMe controller rescanned after resizing $volname")
+            if !$rescanned;
     }
     run_command(['udevadm','settle'], outfunc => sub {});
     select(undef, undef, undef, 0.25); # ~250ms
@@ -4301,10 +4346,7 @@ sub volume_snapshot_rollback {
         # either way; a storage plugin editing a guest config behind its back
         # was a corruption waiting for a concurrent writer.
 
-        # Refresh the initiator view. iSCSI only: on an NVMe/TCP storage
-        # there is no iSCSI session to rescan, and running iscsiadm anyway
-        # printed "No session found" on every rollback - noise that trains an
-        # operator to ignore the one time it means something.
+        # Refresh the initiator view because rollback can change the zvol size.
         my $mode = $scfg->{tn_transport_mode} // 'iscsi';
         if ($mode eq 'iscsi') {
             # Rescan only this storage's target, to avoid disrupting other
@@ -4320,6 +4362,8 @@ sub volume_snapshot_rollback {
             if ($scfg->{tn_use_multipath}) {
                 eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
             }
+        } elsif ($mode eq 'nvme-tcp') {
+            _nvme_rescan_subsystem_controllers($scfg);
         }
         eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
 
@@ -6871,7 +6915,7 @@ sub _reconcile_stale_wwids {
 }
 
 # Floor reconcile. Rate-limited sweep that compares local iSCSI sd*
-# backed by $scfg->{tn_target_iqn} against TrueNAS's current extent list.
+# backed by $scfg->{tn_target_iqn} against TrueNAS's current target mappings.
 # Any WWID present locally for this target but absent on the
 # array for at least tn_reconcile_grace_s is torn down.
 #
@@ -6898,23 +6942,38 @@ sub _floor_reconcile_wwids {
     my $local = _enum_local_iscsi_wwids_for_target($scfg);
     return unless %$local;
 
-    # Local enumeration is scoped by target IQN. Compare with every live
-    # NAA on TrueNAS because other datasets can share this target.
+    # The local scan sees every LUN on the IQN, including other datasets
+    # sharing it. Only mappings on that target keep a local WWID live.
     my %live_wwids;
     my $ok = eval {
+        my $opts = { retry_opts => { retry_max => 0 } };
+        my $target_id = _resolve_target_id($scfg, $opts);
         my $extents = _api_call($scfg, 'iscsi.extent.query',
-            [ [], { select => ['naa'] } ], { retry_opts => { retry_max => 0 } });
+            [ [], { select => ['id', 'naa'] } ], $opts);
+        # Read mappings last: a concurrently created mapping to an extent
+        # missing from the first read makes the entire result inconclusive.
+        my $maps = _api_call($scfg, 'iscsi.targetextent.query',
+            [ [ ['target', '=', $target_id] ], { select => ['target', 'extent'] } ], $opts);
         die "invalid extent list\n" unless ref($extents) eq 'ARRAY';
+        die "invalid target mapping list\n" unless ref($maps) eq 'ARRAY';
+        my %extent_naa;
         for my $e (@$extents) {
-            die "invalid extent NAA\n" unless ref($e) eq 'HASH'
-                && defined($e->{naa}) && $e->{naa} =~ /^0x[0-9a-f]{16,}$/i;
-            my $w = _naa_to_wwid($e->{naa});
-            $live_wwids{$w} = 1 if defined $w;
+            die "invalid or duplicate extent id\n" unless ref($e) eq 'HASH'
+                && ($e->{id} // '') =~ /\A[0-9]+\z/ && !exists($extent_naa{$e->{id}});
+            $extent_naa{$e->{id}} = $e->{naa};
         }
+        for my $map (@$maps) {
+            die "invalid mapping or wrong target\n" unless ref($map) eq 'HASH'
+                && ($map->{target} // '') eq $target_id && ($map->{extent} // '') =~ /\A[0-9]+\z/;
+            my $w = _naa_to_wwid($extent_naa{$map->{extent}});
+            die "mapping to extent $map->{extent} has no valid NAA in the readback\n" unless defined $w;
+            $live_wwids{$w} = 1;
+        }
+        die "empty live WWID set with locally visible paths\n" unless %live_wwids;
         1;
     };
     if (!$ok) {
-        _log($scfg, 2, 'debug', "[TrueNAS] floor reconcile: TN extent query failed, skipping sweep: " . ($@ // ''));
+        _log($scfg, 2, 'debug', "[TrueNAS] floor reconcile: live WWID set is inconclusive, skipping sweep: " . ($@ // ''));
         return;
     }
 
@@ -6979,8 +7038,26 @@ sub _floor_reconcile_wwids {
 # Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
 # Result is cached per IQN to avoid redundant API calls within the same process.
 sub _resolve_target_id {
-    my ($scfg) = @_;
+    my ($scfg, $reconcile_opts) = @_;
     my $want = $scfg->{tn_target_iqn} // die "tn_target_iqn not set in storage.cfg\n";
+
+    # A destructive sweep needs a fresh, exact IQN match. A cached ID or
+    # suffix match can compare local devices against an unrelated target.
+    if ($reconcile_opts) {
+        my $targets = _api_call($scfg, 'iscsi.target.query', [], $reconcile_opts);
+        my $global = _api_call($scfg, 'iscsi.global.config', [], $reconcile_opts);
+        die "invalid iSCSI target inventory\n" unless ref($targets) eq 'ARRAY'
+            && !grep { ref($_) ne 'HASH' } @$targets;
+        my $basename = ref($global) eq 'HASH' ? $global->{basename} : undef;
+        my @matches = grep {
+            ($_->{iqn} // '') eq $want
+                || (defined($basename) && defined($_->{name}) && "$basename:$_->{name}" eq $want)
+        } @$targets;
+        die "no unique iSCSI target ID for $want\n" unless @matches == 1
+            && ($matches[0]{id} // '') =~ /\A[0-9]+\z/;
+        return $matches[0]{id};
+    }
+
     my $api_host = _cache_host_key($scfg);
 
     # Use the TTL-based %API_CACHE (60s) so stale IDs are automatically refreshed
@@ -8837,32 +8914,37 @@ sub _nvme_disconnect {
 sub _nvme_rescan_subsystem_controllers {
     my ($scfg) = @_;
 
+    our $_NVME_SYSFS;
     my $nqn = $scfg->{tn_subsystem_nqn};
+    my $root = "$_NVME_SYSFS/class/nvme-subsystem";
+    my $rescanned = 0;
 
-    opendir(my $dh, "/sys/class/nvme-subsystem") or return;
+    opendir(my $dh, $root) or return 0;
     while (my $subsys = readdir($dh)) {
         next unless $subsys =~ /^(nvme-subsys\d+)$/;
         $subsys = $1;  # Untaint via capture
         my $subsys_nqn = eval {
-            open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
+            open my $fh, '<', "$root/$subsys/subsysnqn" or die;
             my $val = <$fh>;
             close $fh;
-            chomp($val);
+            chomp($val) if defined $val;
             $val;
         };
         next unless $subsys_nqn && $subsys_nqn eq $nqn;
 
         # Rescan all controllers in our subsystem
-        opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
+        opendir(my $sdh, "$root/$subsys") or next;
         while (my $entry = readdir($sdh)) {
-            next unless $entry =~ /^(nvme(\d+))$/;
-            my $ctrl_dev = "/dev/nvme$2";
-            eval { run_command(['nvme', 'ns-rescan', $ctrl_dev], outfunc => sub {}, errfunc => sub {}) };
+            next unless $entry =~ /^(nvme\d+)$/;
+            my $ctrl_dev = "/dev/$1";
+            next unless _try_run(['nvme', 'ns-rescan', $ctrl_dev], "nvme rescan $ctrl_dev");
+            $rescanned++;
             _log($scfg, 2, 'debug', "[TrueNAS] nvme_rescan: rescanned $ctrl_dev");
         }
         closedir($sdh);
     }
     closedir($dh);
+    return $rescanned;
 }
 
 # Find NVMe controllers belonging to our subsystem that match our configured portals.
@@ -9012,6 +9094,7 @@ my %NVME_SELECTOR_REASON_LABELS = (
     namespace_metadata_did_not_match_visible_devices      => 'TrueNAS metadata did not match any visible Linux NVMe namespace device',
     subsystem_not_visible                                 => 'NVMe subsystem is not visible in Linux sysfs',
     sysfs_enumeration_failed                              => 'a sysfs listing or attribute read failed, so the visible devices are not known',
+    sysfs_changed_during_walk                             => 'the NVMe sysfs entries kept changing during enumeration',
 );
 
 sub _nvme_selector_reason_label {
@@ -9328,16 +9411,72 @@ our $_NVME_SYSFS     = '/sys';
 our $_NVME_MOUNTINFO = '/proc/self/mountinfo';
 our $_NVME_PROC_ROOT = q(/proc);
 our $_NVME_FUSER_RC;
+our $_NVME_FUSER_TIMEOUT = 10;
 
-# One sysfs attribute: (value) when read, (undef) when the attribute does not
-# exist, and (undef, error) when it exists but could not be read. Absence is
-# an answer (the kernel hides nguid when it is zero); a failed read is not.
+my ($nvme_fuser_owner, $nvme_fuser_pending);
+
+# A fuser blocked in uninterruptible I/O cannot be reaped on demand, even
+# after SIGKILL. Keep the storage-lock holder out of any blocking wait and
+# reap a timed-out child on the next probe. Do not pile up blocked children.
+sub _nvme_run_fuser {
+    my ($scfg, $runner) = @_;
+    if (defined($nvme_fuser_pending) && $nvme_fuser_owner == $$) {
+        my $waited = waitpid($nvme_fuser_pending, POSIX::WNOHANG());
+        return undef if $waited == 0 || ($waited < 0 && !$!{ECHILD});
+    }
+    $nvme_fuser_pending = undef;
+
+    my $deadline = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) + $_NVME_FUSER_TIMEOUT;
+    my $pid = fork();
+    return undef if !defined $pid;
+    if ($pid == 0) {
+        # A stalled probe must not keep the caller's input/output pipes open.
+        open(STDIN, '<', '/dev/null') && open(STDOUT, '>', '/dev/null')
+            && open(STDERR, '>', '/dev/null') or POSIX::_exit(255);
+        my $rc = eval { $runner->() };
+        POSIX::_exit(defined($rc) && $rc =~ /\A[0-9]{1,3}\z/ && $rc <= 255 ? $rc : 255);
+    }
+
+    my ($reaped, $timed_out, $rc);
+    my $ok = eval {
+        while (1) {
+            my $waited = waitpid($pid, POSIX::WNOHANG());
+            if ($waited == $pid) {
+                my $status = $?;
+                $reaped = 1;
+                $timed_out = Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) >= $deadline;
+                $rc = $status >> 8 if !$timed_out && !($status & 127);
+                last;
+            }
+            if ($waited < 0 && $!{ECHILD}) {
+                $reaped = 1;
+                last;
+            }
+            die "waitpid for fuser: $!\n" if $waited < 0 && !$!{EINTR};
+            last if Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) >= $deadline;
+            usleep(20_000);
+        }
+        1;
+    };
+    my $error = $@;
+    if (!$reaped) {
+        kill 'KILL', $pid;
+        ($nvme_fuser_owner, $nvme_fuser_pending) = ($$, $pid);
+    }
+    die $error if !$ok;
+    _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: fuser timed out, treating as in use")
+        if !$reaped || $timed_out;
+    return $rc;
+}
+
+# Absence is valid for optional identifiers (the kernel hides a zero nguid).
+# ENOENT on a mandatory attribute leaves the device's identity unknown.
 sub _nvme_sysfs_attr {
-    my ($path) = @_;
+    my ($path, $required) = @_;
 
     my $fh;
     if (!open($fh, '<', $path)) {
-        return (undef) if $!{ENOENT};
+        return (undef) if !$required && $!{ENOENT};
         return (undef, "open $path: $!");
     }
     $! = 0;
@@ -9346,52 +9485,73 @@ sub _nvme_sysfs_attr {
     close $fh;
     return (undef, "read $path: " . ($read_err || 'no data')) if !defined $val;
     chomp($val);
+    return (undef, "read $path: no data") if $required && $val eq '';
     return ($val);
 }
 
-# The selector's answers other than a match rest on this walk having seen
-# everything; when any listing or read of it failed, "no device of ours here"
-# is not established and the result says enumeration_failed instead (the rest
-# of the result is kept, so the activate retry loop behaves as before). A match
-# stays a match: the device found is real. readdir cannot report errors in
-# Perl, so a listing cut short mid-way is not caught here.
-sub _nvme_find_device_by_subsystem {
-    my ($scfg, $device_uuid) = @_;
+# Sysfs class and block entries may be symlinks. Pin both the directory entry
+# and the target so replacing either one cannot validate a stale walk.
+sub _nvme_sysfs_inode {
+    my ($path) = @_;
+    my @entry = lstat($path);
+    return undef if !@entry;
+    return join(':', @entry[0, 1]) unless -l _;
+    my @target = stat($path);
+    return undef if !@target;
+    return join(':', @entry[0, 1], @target[0, 1]);
+}
 
-    my $nqn = $scfg->{tn_subsystem_nqn};
-    my $class_dir = "$_NVME_SYSFS/class/nvme-subsystem";
-    my $block_dir = "$_NVME_SYSFS/block";
-    my (@subsys_errors, @enum_errors);
+my $nvme_subsystem_name = qr/\A(nvme-subsys\d+)\z/;
+my $nvme_block_name = qr/\A(nvme\d+(?:c\d+)?n\d+)\z/;
 
-    my $finish = sub {
-        my ($result, @errors) = @_;
-        return { %$result, enumeration_complete => 1 } if !@errors
-            || _nvme_selector_outcome_is_success($result->{selector_outcome});
-        _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: local NVMe enumeration incomplete: "
-            . join('; ', @errors));
-        return { %$result, selector_outcome => 'enumeration_failed', enumeration_complete => 0,
-                 underlying_outcome => $result->{selector_outcome},
-                 underlying_mismatch_reason => $result->{mismatch_reason},
-                 mismatch_reason => 'sysfs_enumeration_failed', enumeration_errors => [@errors] };
-    };
-    my $not_visible = _nvme_selector_result(
-        linux_device_count => 0,
-        selector_outcome => 'publication_mismatch',
-        mismatch_reason => 'subsystem_not_visible',
-    );
-
-    # Find subsystem matching our NQN. No class directory at all means the
-    # nvme core is not loaded: there is no NVMe device on this node.
-    my $dh;
-    if (!opendir($dh, $class_dir)) {
-        return $finish->($not_visible) if $!{ENOENT};
-        return $finish->($not_visible, "opendir $class_dir: $!");
+# The directory's own identity is stored under '.', which the filter excludes.
+# The third return value distinguishes a concurrent disappearance from an I/O
+# error so the selector can retry only a changing snapshot.
+sub _nvme_sysfs_snapshot {
+    my ($dir, $filter, $optional) = @_;
+    my $parent = _nvme_sysfs_inode($dir);
+    if (!defined $parent) {
+        my $absent = $!{ENOENT};
+        return ({}) if $optional && $absent && !lstat($dir) && $!{ENOENT};
+        return (undef, "stat $dir: $!", $absent);
     }
-    while (my $subsys = readdir($dh)) {
-        next unless $subsys =~ /^(nvme-subsys\d+)$/;
-        $subsys = $1;  # Untaint via capture
 
-        my ($subsys_nqn, $nqn_err) = _nvme_sysfs_attr("$class_dir/$subsys/subsysnqn");
+    opendir(my $dh, $dir) or return (undef, "opendir $dir: $!", $!{ENOENT});
+    $! = 0;
+    my @names = readdir($dh);
+    my $list_error = $!;
+    my $closed = closedir($dh);
+    return (undef, "readdir $dir: $list_error") if $list_error;
+    return (undef, "closedir $dir: $!") if !$closed;
+
+    my %snapshot = ('.' => $parent);
+    for my $name (@names) {
+        next if $name eq '.' || $name eq '..' || $name !~ $filter;
+        my $entry = $1;  # Untaint the filtered entry.
+        my $inode = _nvme_sysfs_inode("$dir/$entry");
+        return (undef, "stat $dir/$entry: $!", $!{ENOENT}) if !defined $inode;
+        $snapshot{$entry} = $inode;
+    }
+    my $end = _nvme_sysfs_inode($dir);
+    return (undef, "stat $dir: $!", $!{ENOENT}) if !defined $end;
+    return (undef, "$dir changed during listing", 1) if $end ne $parent;
+    return (\%snapshot);
+}
+
+sub _nvme_sysfs_same_snapshot {
+    my ($before, $after) = @_;
+    return 0 if keys(%$before) != keys(%$after);
+    for my $name (keys %$before) {
+        return 0 if !exists($after->{$name}) || $after->{$name} ne $before->{$name};
+    }
+    return 1;
+}
+
+sub _nvme_find_device_by_subsystem_walk {
+    my ($nqn, $class_dir, $block_dir, $subsystems) = @_;
+    my @subsys_errors;
+    for my $subsys (grep { $_ ne '.' } sort keys %$subsystems) {
+        my ($subsys_nqn, $nqn_err) = _nvme_sysfs_attr("$class_dir/$subsys/subsysnqn", 1);
         # Any subsystem left unread might be ours; once ours is found it no
         # longer matters (an NQN names one subsystem).
         push @subsys_errors, $nqn_err if $nqn_err;
@@ -9399,41 +9559,24 @@ sub _nvme_find_device_by_subsystem {
 
         # Found our subsystem - collect all namespace devices from /sys/block
         # Controller-specific devices don't appear in subsystem directory
-        my @devices;
-        my $bdh;
-        if (!opendir($bdh, $block_dir)) {
-            push @enum_errors, "opendir $block_dir: $!";
-            closedir($dh);
-            return $finish->($not_visible, @enum_errors);
-        }
-        while (my $entry = readdir($bdh)) {
-            my $type;
-
-            # Match both nvme3n1 and nvme3c3n1 patterns
-            # Note: We no longer parse NSID from device name as it's unreliable
-            # Use capture groups to untaint $entry from readdir() for use in system calls
-            if ($entry =~ /^(nvme\d+n\d+)$/) {
-                $entry = $1;  # Untaint via capture
-                $type = 'standard';
-            } elsif ($entry =~ /^(nvme\d+c\d+n\d+)$/) {
-                $entry = $1;  # Untaint via capture
-                $type = 'controller';
-            } else {
-                next;
-            }
+        my ($block, $error, $changed) = _nvme_sysfs_snapshot($block_dir, $nvme_block_name);
+        return { snapshot_error => $error, changed => $changed } if !$block;
+        my (@devices, @required_errors, @optional_errors);
+        for my $entry (grep { $_ ne '.' } sort keys %$block) {
+            my $type = $entry =~ /c/ ? 'controller' : 'standard';
 
             # Verify this device belongs to our subsystem by checking NQN:
             # standard devices via the subsystem link, controller devices by
             # navigating to the controller then the subsystem.
-            my ($dev_nqn, $dev_nqn_err) = _nvme_sysfs_attr($type eq 'standard'
-                ? "$block_dir/$entry/device/subsysnqn"
-                : "$block_dir/$entry/device/../subsysnqn");
+            my $nqn_path = $type eq 'standard' ? "$block_dir/$entry/device/subsysnqn"
+                : "$block_dir/$entry/device/../subsysnqn";
+            my ($dev_nqn, $dev_nqn_err) = _nvme_sysfs_attr($nqn_path, 1);
             # A device whose NQN could not be read may well be ours.
-            push @enum_errors, $dev_nqn_err if $dev_nqn_err;
+            push @required_errors, $dev_nqn_err if $dev_nqn_err;
 
             if ($dev_nqn && $dev_nqn eq $nqn) {
                 # Read NSID and NGUID from sysfs (reliable sources)
-                my ($sysfs_nsid, $nsid_err) = _nvme_sysfs_attr("$block_dir/$entry/nsid");
+                my ($sysfs_nsid, $nsid_err) = _nvme_sysfs_attr("$block_dir/$entry/nsid", 1);
                 my ($sysfs_nguid, $nguid_err) = _nvme_sysfs_attr("$block_dir/$entry/nguid");
                 # The namespace UUID, which the kernel exposes alongside nguid and
                 # the API returns as device_uuid. Measured against a live target:
@@ -9444,7 +9587,8 @@ sub _nvme_find_device_by_subsystem {
                 my ($sysfs_uuid, $uuid_err) = _nvme_sysfs_attr("$block_dir/$entry/uuid");
                 # An identity that could not be read leaves "this device is not
                 # ours" unproven.
-                push @enum_errors, grep { defined } $nsid_err, $nguid_err, $uuid_err;
+                push @required_errors, $nsid_err if $nsid_err;
+                push @optional_errors, grep { defined } $nguid_err, $uuid_err;
 
                 push @devices, {
                     path => "/dev/$entry",
@@ -9456,18 +9600,77 @@ sub _nvme_find_device_by_subsystem {
                 };
             }
         }
-        closedir($bdh);
-
-        my $device_count = scalar(@devices);
-        _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found $device_count device(s) for subsystem $nqn");
-        my $namespace_meta = _nvme_get_namespace_selector_metadata($scfg, $device_uuid);
-        my $result = _nvme_select_namespace_device($scfg, $device_uuid, \@devices, $namespace_meta);
-        closedir($dh);
-        return $finish->($result, @enum_errors);
+        return { block => $block, devices => \@devices, required_errors => \@required_errors,
+            optional_errors => \@optional_errors };
     }
-    closedir($dh);
+    return { required_errors => \@subsys_errors };
+}
 
-    return $finish->($not_visible, @subsys_errors);
+sub _nvme_find_device_by_subsystem {
+    my ($scfg, $device_uuid) = @_;
+
+    my $nqn = $scfg->{tn_subsystem_nqn};
+    my $class_dir = "$_NVME_SYSFS/class/nvme-subsystem";
+    my $block_dir = "$_NVME_SYSFS/block";
+    my $not_visible = _nvme_selector_result(
+        linux_device_count => 0,
+        selector_outcome => 'publication_mismatch',
+        mismatch_reason => 'subsystem_not_visible',
+    );
+    my $failed = sub {
+        my ($result, $reason, @errors) = @_;
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: local NVMe enumeration incomplete: "
+            . join('; ', @errors));
+        return { %$result, selector_outcome => 'enumeration_failed', enumeration_complete => 0,
+                 underlying_outcome => $result->{selector_outcome},
+                 underlying_mismatch_reason => $result->{mismatch_reason},
+                 mismatch_reason => $reason, enumeration_errors => \@errors };
+    };
+
+    my ($last_change, $device_count) = ('sysfs entries changed', 0);
+    ATTEMPT: for (1 .. 3) {
+        # The class may be absent when NVMe core is not loaded at all.
+        my ($class, $error, $changed) = _nvme_sysfs_snapshot($class_dir, $nvme_subsystem_name, 1);
+        if (!$class) {
+            return $failed->($not_visible, 'sysfs_enumeration_failed', $error) unless $changed;
+            $last_change = $error;
+            next;
+        }
+        my $walk = _nvme_find_device_by_subsystem_walk($nqn, $class_dir, $block_dir, $class);
+        if ($walk->{snapshot_error}) {
+            return $failed->($not_visible, 'sysfs_enumeration_failed', $walk->{snapshot_error}) unless $walk->{changed};
+            $last_change = $walk->{snapshot_error};
+            next;
+        }
+        my @checks = ([$class_dir, $nvme_subsystem_name, $class, 1]);
+        unshift @checks, [$block_dir, $nvme_block_name, $walk->{block}] if $walk->{block};
+        $device_count = scalar(@{ $walk->{devices} // [] });
+        for my $check (@checks) {
+            my ($dir, $filter, $before, $optional) = @$check;
+            my ($after, $err, $raced) = _nvme_sysfs_snapshot($dir, $filter, $optional);
+            return $failed->($not_visible, 'sysfs_enumeration_failed', $err) if !$after && !$raced;
+            if (!$after || !_nvme_sysfs_same_snapshot($before, $after)) {
+                $last_change = $err // "$dir changed during the walk";
+                next ATTEMPT;
+            }
+        }
+
+        my $result = $not_visible;
+        if (my $devices = $walk->{devices}) {
+            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found $device_count device(s) for subsystem $nqn");
+            my $meta = _nvme_get_namespace_selector_metadata($scfg, $device_uuid);
+            $result = _nvme_select_namespace_device($scfg, $device_uuid, $devices, $meta);
+        }
+        my @errors = @{ $walk->{required_errors} };
+        # A positive match may still stand if just an optional identifier
+        # could not be read. A missing mandatory field leaves a gap in the walk.
+        push @errors, @{ $walk->{optional_errors} // [] }
+            unless _nvme_selector_outcome_is_success($result->{selector_outcome});
+        return $failed->($result, 'sysfs_enumeration_failed', @errors) if @errors;
+        return { %$result, enumeration_complete => 1 };
+    }
+    return $failed->({ %$not_visible, linux_device_count => $device_count },
+        'sysfs_changed_during_walk', $last_change);
 }
 
 # Collect /dev/nvmeXnY paths for all block devices belonging to our subsystem NQN
@@ -9629,7 +9832,7 @@ sub _nvme_warn_target_no_mdts {
 # "free": a mounted filesystem or a dm/LVM holder has no process with the node
 # open, and fuser's rc=1 mixes "nobody has it" with "could not look".
 #
-# In use when: (a) fuser exits 0; (b) fuser exits > 1, dies, or is missing;
+# In use when: (a) fuser exits 0; (b) fuser fails, times out, or is missing;
 # (c) the device, its partitions or the head of a multipath path device is the
 # source of a mount in any mount namespace (matched by major:minor and by
 # /dev name);
@@ -9653,52 +9856,44 @@ sub _nvme_check_devices_in_use {
         $names{"nvme$1n$2"} = 1 if $name =~ /^nvme(\d+)c\d+n(\d+)$/;
     }
 
-    my (%majmin, %devnames, @existing);
+    my (%majmin, %devnames, @existing, @snapshots, %device_state);
+    my $holder_name = qr/\A([^\/]+)\z/;
+    my $unsafe_sysfs = sub {
+        my ($reason) = @_;
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $reason, treating as in use");
+        return 1;
+    };
     for my $name (sort keys %names) {
         my $dir = "$sys/block/$name";
-        if (!-d $dir) {
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $dir not readable, treating as in use");
-            return 1;
-        }
-        my @units = ($name);
-        if (opendir(my $dh, $dir)) {
-            push @units, grep { /^\Q$name\Ep?\d+$/ } readdir($dh);
-            closedir($dh);
-        } else {
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot list $dir ($!), treating as in use");
-            return 1;
-        }
+        my $partition = qr/\A(\Q$name\Ep?\d+)\z/;
+        my ($units, $error) = _nvme_sysfs_snapshot($dir, $partition);
+        return $unsafe_sysfs->($error) if !$units;
+        push @snapshots, [$dir, $partition, $units];
+        my @units = ($name, grep { $_ ne '.' } sort keys %$units);
         for my $u (@units) {
             my $base = ($u eq $name) ? $dir : "$dir/$u";
-            my $mm;
-            if (open(my $fh, '<', "$base/dev")) { local $/; $mm = <$fh>; close $fh; }
             # A multipath path device (nvmeXcYnZ) is a HIDDEN gendisk: it has no
             # dev number and no /dev node, only its head does. Anything else
             # without a readable dev number cannot be examined: in use.
             my $hidden = ($u eq $name && $name =~ /^nvme\d+c\d+n\d+$/ && -e "$base/hidden");
-            if (!$hidden && (!defined $mm || $mm !~ /^(\d+:\d+)/)) {
-                _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot read $base/dev, treating as in use");
-                return 1;
-            }
             if (!$hidden) {
+                my ($mm, $dev_error) = _nvme_sysfs_attr("$base/dev", 1);
+                return $unsafe_sysfs->($dev_error // "invalid dev number in $base/dev")
+                    if !defined($mm) || $mm !~ /\A(\d+:\d+)\z/;
                 $majmin{$1} = 1;
+                $device_state{$base} = $mm;
                 $devnames{"/dev/$u"} = 1;
                 push @existing, "/dev/$u" if -e "/dev/$u";
             }
             my $holders = "$base/holders";
-            if (-d $holders) {
-                my $hh;
-                if (!opendir($hh, $holders)) {
-                    _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: cannot list $holders, treating as in use");
-                    return 1;
-                }
-                my @h = grep { !/^\.\.?$/ } readdir($hh);
-                closedir($hh);
-                if (@h) {
-                    _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $u has holders (@h)");
-                    return 1;
-                }
+            my ($holder_state, $holder_error) = _nvme_sysfs_snapshot($holders, $holder_name, 1);
+            return $unsafe_sysfs->($holder_error) if !$holder_state;
+            my @holders = grep { $_ ne '.' } keys %$holder_state;
+            if (@holders) {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme in-use check: $u has holders (@holders)");
+                return 1;
             }
+            push @snapshots, [$holders, $holder_name, $holder_state, 1];
         }
     }
 
@@ -9801,9 +9996,9 @@ sub _nvme_check_devices_in_use {
     }
 
     # Processes that hold a device node open (QEMU, tools, anything).
-    my $rc;
+    my $runner;
     if ($_NVME_FUSER_RC) {
-        $rc = $_NVME_FUSER_RC->(@existing);
+        $runner = sub { $_NVME_FUSER_RC->(@existing) };
     } else {
         my ($fuser) = grep { -x $_ } ('/usr/bin/fuser', '/bin/fuser');
         if (!$fuser) {
@@ -9811,16 +10006,27 @@ sub _nvme_check_devices_in_use {
             return 1;
         }
         my @args = map { m{^(/dev/[A-Za-z0-9]+)$} ? $1 : () } @existing;
-        if (@args) {
-            my $st = system($fuser, '-s', '-m', @args);
-            $rc = ($st == -1 || ($st & 127)) ? undef : ($st >> 8);
-        } else {
-            $rc = 1;    # nothing to ask fuser about; the sysfs and mount checks stand
-        }
+        $runner = sub { exec { $fuser } $fuser, '-s', '-m', @args or POSIX::_exit(255) } if @args;
     }
+    # If there is no node to ask about, the sysfs and mount checks stand.
+    my $rc = $runner ? _nvme_run_fuser($scfg, $runner) : 1;
     # fuser: 0 = a process uses it, 1 = none, anything else = it did not work.
-    return 0 if defined $rc && $rc == 1;
-    return 1;
+    return 1 if !defined($rc) || $rc != 1;
+
+    # Names and major:minor pairs can both be recycled while inspecting
+    # mounts, holders, or fuser.
+    for my $base (keys %device_state) {
+        my ($mm, $error) = _nvme_sysfs_attr("$base/dev", 1);
+        return $unsafe_sysfs->($error // "$base/dev changed during the check")
+            if !defined($mm) || $mm ne $device_state{$base};
+    }
+    for my $snapshot (@snapshots) {
+        my ($dir, $filter, $before, $optional) = @$snapshot;
+        my ($after, $error) = _nvme_sysfs_snapshot($dir, $filter, $optional);
+        return $unsafe_sysfs->($error // "$dir changed during the check")
+            if !$after || !_nvme_sysfs_same_snapshot($before, $after);
+    }
+    return 0;
 }
 
 # The gate used before every reconnect: enumerate the subsystem's devices and
@@ -10660,7 +10866,24 @@ sub _nvme_create_namespace_idempotent {
 #
 # Returns the number of namespaces reaped, or undef on setup failure.
 # Never dies -- best-effort cleanup, called from deferred paths.
+our %_storage_lock_held;
+
 sub _nvme_reap_orphan_namespaces {
+    my ($scfg, $storeid) = @_;
+    $storeid //= $scfg->{storeid};
+    return undef if !defined($storeid) || !length($storeid) || !($scfg->{tn_use_cluster_lock} // 1);
+
+    # create_base changes the backing dataset and its published path under
+    # this same lock. Reuse it if activation is already inside a storage op.
+    return _nvme_reap_orphan_namespaces_locked($scfg) if $_storage_lock_held{$storeid};
+    return __PACKAGE__->cluster_lock_storage($storeid, 1, undef, sub {
+        # The configured lock policy may have changed since the caller read it.
+        return undef unless $_storage_lock_held{$storeid};
+        return _nvme_reap_orphan_namespaces_locked($scfg);
+    });
+}
+
+sub _nvme_reap_orphan_namespaces_locked {
     my ($scfg) = @_;
 
     my $nqn = $scfg->{tn_subsystem_nqn};
@@ -10746,12 +10969,24 @@ sub _nvme_reap_orphan_namespaces {
 
     my $reaped = 0;
     for my $ns (@orphans) {
-        my $ns_id = $ns->{id};
+        my $ns_id = $ns->{id} // next;
         my $dp    = $ns->{device_path} // '<undef>';
         my $uuid  = $ns->{device_uuid} // '<undef>';
         my $nsid  = $ns->{nsid}        // '<undef>';
+
+        # Recheck the exact record just before deletion. A rename or a
+        # reused namespace ID must not turn a live namespace into an orphan.
+        my $fresh = eval {
+            _api_call($scfg, 'nvmet.namespace.query',
+                [ [ [ 'subsys.id', '=', $subsys_id ], [ 'id', '=', $ns_id ] ] ],
+                { retry_opts => { retry_max => 0 } });
+        };
+        next if $@ || ref($fresh) ne 'ARRAY' || @$fresh != 1 || ref($fresh->[0]) ne 'HASH';
+        my $current = $fresh->[0];
+        next if ($current->{id} // '') ne $ns_id || ($current->{device_path} // '') ne $dp
+            || ($current->{device_uuid} // '<undef>') ne $uuid || ($current->{nsid} // '<undef>') ne $nsid;
         eval {
-            _api_call($scfg, 'nvmet.namespace.delete', [ $ns_id ]);
+            _api_call($scfg, 'nvmet.namespace.delete', [ $ns_id ], { retry_opts => { retry_max => 0 } });
         };
         if (my $err = $@) {
             if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
@@ -11206,16 +11441,11 @@ sub alloc_image {
         $create_error = undef;
 
         my $create_payload = _tn_zvol_create_payload($scfg, $full_ds, $bytes, $blocksize);
-        $create_payload->{comments} = 'Autocreated by Proxmox Plugin';
         # Pass compression algorithm if configured (otherwise inherits from parent dataset)
         $create_payload->{compression} = uc($scfg->{tn_compression}) if $scfg->{tn_compression};
 
         eval {
-            $create_result = _api_call(
-                $scfg,
-                'pool.dataset.create',
-                [ $create_payload ],
-            );
+            $create_result = _tn_create_zvol_once($scfg, $create_payload);
         };
 
         if ($@) {
@@ -12155,6 +12385,109 @@ sub _nvme_free_local_device {
 }
 
 # NVMe-specific deletion
+sub _assert_nvme_cluster_unreferenced {
+    my ($class, $storeid, $volname, $zname) = @_;
+    my $volid = "$storeid:$volname";
+    my $root = $_PRUNE_PVE_ROOT;
+    my ($node, $vmid);
+    my $ok = eval {
+        require PVE::Cluster;
+        die "pmxcfs has no quorum\n" unless PVE::Cluster::check_cfs_quorum(1);
+        # Read pmxcfs directly: a failed cfs_update can leave a stale cached
+        # get_vmlist. The raw configs also include pending/unused/snapshot refs.
+        my $index_text = _prune_read_file("$root/.vmlist");
+        my $index = JSON::PP::decode_json($index_text);
+        die "invalid pmxcfs guest list\n" if ref($index) ne 'HASH' || ref($index->{ids}) ne 'HASH';
+        for my $id (keys %{$index->{ids}}) {
+            my ($guestid) = $id =~ /\A([0-9]+)\z/;
+            my $entry = $index->{ids}{$id};
+            die "invalid pmxcfs guest entry '$id'\n" if !defined($guestid) || ref($entry) ne 'HASH';
+            my ($guestnode) = ($entry->{node} // '') =~ /\A([A-Za-z0-9_-]+)\z/;
+            my $type = $entry->{type} // '';
+            die "invalid pmxcfs location for guest $id\n" unless defined($guestnode) && ($type eq 'qemu' || $type eq 'lxc');
+            my $kind = $type eq 'qemu' ? 'qemu-server' : 'lxc';
+            my $text = _prune_read_file("$root/nodes/$guestnode/$kind/$guestid.conf");
+            while ($text =~ /(?<![A-Za-z0-9._-])\Q$storeid\E:([A-Za-z0-9._:\/-]+)/g) {
+                my $ref = $1;
+                my (undef, $name, undef, $base) = eval { $class->parse_volname($ref) };
+                if ($ref eq $volname || ($name // '') eq $zname || ($name // '') eq "$zname.raw"
+                    || ($base // '') eq $zname) {
+                    ($node, $vmid) = ($guestnode, $guestid);
+                    last;
+                }
+            }
+            last if defined $vmid;
+        }
+        die "pmxcfs guest list or quorum changed during verification\n"
+            unless PVE::Cluster::check_cfs_quorum(1) && _prune_read_file("$root/.vmlist") eq $index_text;
+        1;
+    };
+    die "[TrueNAS] refusing to free '$volid': could not verify guest references across the cluster: $@" unless $ok;
+    die "[TrueNAS] refusing to free '$volid': referenced by guest $vmid on node '$node'.\n" if defined $vmid;
+}
+
+use constant NVME_PENDING_FREE_PROPERTY => 'org.truenas-pve:pending-free';
+
+sub _nvme_pending_free_mark {
+    my ($scfg, $full_ds, $value) = @_;
+    my $change = { key => NVME_PENDING_FREE_PROPERTY };
+    if (defined $value) {
+        $change->{value} = $value;
+    } else {
+        $change->{remove} = JSON::PP::true;
+    }
+    my $result = _api_call_mutate($scfg, 'pool.dataset.update', [ $full_ds, { user_properties_update => [$change] } ],
+        { retry_opts => { retry_max => 0 } });
+    die "could not confirm pending-free property update on $full_ds\n"
+        if ref($result) ne 'HASH' || ($result->{id} // '') ne $full_ds;
+}
+
+sub _nvme_pending_free_clear_if_exported {
+    my ($scfg, $full_ds) = @_;
+    my $path = "zvol/$full_ds";
+    my $namespaces = eval { _nvme_namespaces_for_device_path($scfg, $path) };
+    return if $@ || ref($namespaces) ne 'ARRAY'
+        || !grep { ref($_) eq 'HASH' && defined($_->{id}) && ($_->{device_path} // '') eq $path } @$namespaces;
+    # Clear only with positive evidence that the zvol is still exported.
+    eval { _nvme_pending_free_mark($scfg, $full_ds, undef) };
+    _log($scfg, 0, 'warning', "[TrueNAS] could not clear pending-free marker on $full_ds: $@") if $@;
+}
+
+sub _nvme_find_pending_free_zvols {
+    my ($scfg, $storeid) = @_;
+    my $prefix = "$scfg->{tn_dataset}/";
+    my $datasets = eval {
+        _api_call($scfg, 'pool.dataset.query', [ [ [ 'id', '^', $prefix ] ] ],
+            { retry_opts => { retry_max => 0 } });
+    };
+    return [] if $@ || ref($datasets) ne 'ARRAY';
+
+    my @pending;
+    for my $ds (@$datasets) {
+        next unless ref($ds) eq 'HASH' && index($ds->{id} // '', $prefix) == 0;
+        next unless ref($ds->{user_properties}) eq 'HASH';
+        my $prop = $ds->{user_properties}{+NVME_PENDING_FREE_PROPERTY};
+        next unless ref($prop) eq 'HASH' && ($prop->{source} // '') eq 'LOCAL';
+        my ($marked_at) = ($prop->{value} // '') =~ /\A(\d+):\Q$storeid\E:.+\z/;
+        next unless defined($marked_at) && time() - $marked_at >= 15 * 60;
+        push @pending, $ds->{id};
+    }
+    return [] unless @pending;
+
+    # This is diagnostic only. Any unknown export path invalidates the view.
+    my $exports = eval {
+        _api_call($scfg, 'nvmet.namespace.query', [ [ [ 'device_path', '^', "zvol/$prefix" ] ] ],
+            { retry_opts => { retry_max => 0 } });
+    };
+    return [] if $@ || ref($exports) ne 'ARRAY';
+    my %exported;
+    for my $ns (@$exports) {
+        return [] if ref($ns) ne 'HASH' || !defined($ns->{device_path}) || !length($ns->{device_path});
+        $exported{$ns->{device_path}} = 1;
+    }
+    return [grep { !$exported{"zvol/$_"} } @pending];
+}
+
 sub _free_image_nvme {
     my ($class, $storeid, $scfg, $volname, $zname, $full_ds, $device_uuid) = @_;
 
@@ -12172,8 +12505,7 @@ sub _free_image_nvme {
     # before; for an attached one _nvme_check_devices_in_use answers "in use" on
     # every doubt. A lookup that cannot tell (see _nvme_free_local_device) dies
     # here: skipping the check then would delete the namespace under a guest
-    # that may still have it open. Other nodes' use is not visible from here
-    # (TrueNAS refuses that).
+    # that may still have it open. Check pmxcfs separately for other guests.
     my $local_uuid = $device_uuid;
     if (!defined $local_uuid) {
         $local_uuid = eval { _resolve_nvme_uuid($scfg, $zname, undef) };
@@ -12209,6 +12541,22 @@ sub _free_image_nvme {
 
     my $need_force_disconnect = 0;
 
+    _assert_nvme_cluster_unreferenced($class, $storeid, $volname, $zname);
+    my $dataset = _assert_no_child_datasets($scfg, $full_ds);
+    my $marked = $dataset && eval {
+        _nvme_pending_free_mark($scfg, $full_ds, join(':', int(time()), $storeid, $volname));
+        1;
+    };
+    if ($dataset && !$marked) {
+        my $err = $@;
+        # Only a definite schema rejection proves this TrueNAS does not
+        # support the marker. A lost reply must leave the export in place.
+        die "[TrueNAS] refusing to unpublish $full_ds: could not mark pending free: $err"
+            unless $err =~ /\bEINVAL\b/i && $err =~ /user_properties_update/i
+                && $err =~ /unsupported|not supported|unknown|unexpected|extra inputs/i;
+        _log($scfg, 0, 'warning', "[TrueNAS] pending-free markers are unsupported on $full_ds: $err");
+    }
+
     # 1) Delete NVMe namespace
     my $ok = eval {
         _nvme_delete_namespace($scfg, $zname, $full_ds);
@@ -12230,6 +12578,7 @@ sub _free_image_nvme {
             # and any initiator still attached. Refuse instead: an undeleted
             # volume is recoverable, a destroyed one that is still exported is
             # not. The operator can retry once the cause is addressed.
+            _nvme_pending_free_clear_if_exported($scfg, $full_ds) if $marked;
             die "[TrueNAS] refusing to destroy $full_ds: its NVMe namespace could not be "
               . "removed, so the volume may still be exported. Resolve this and retry.\n"
               . "  cause: $err";
@@ -12287,6 +12636,7 @@ sub _free_image_nvme {
             _log($scfg, 0, 'warning',
                 "[TrueNAS] _free_image_nvme: skipping subsystem disconnect for $zname: "
               . "active namespace count unknown, assuming subsystem is shared: $count_msg");
+            _nvme_pending_free_clear_if_exported($scfg, $full_ds) if $marked;
             die "[TrueNAS] refusing to destroy $full_ds: its namespace is still in use, "
               . "and the disconnect-and-retry step was skipped because the active "
               . "namespace count could not be determined. Retry once the TrueNAS API "
@@ -12302,6 +12652,7 @@ sub _free_image_nvme {
             # read) stops the free here, like an unknown count does.
             my ($ns_busy, @busy_devs) = _nvme_subsystem_busy($scfg);
             if ($ns_busy) {
+                _nvme_pending_free_clear_if_exported($scfg, $full_ds) if $marked;
                 die "[TrueNAS] refusing to destroy $full_ds: its namespace is still in use "
                   . "and the NVMe subsystem has device(s) in use on this node ("
                   . join(', ', @busy_devs) . "), so the disconnect-and-retry step was "
@@ -12335,6 +12686,7 @@ sub _free_image_nvme {
                     $reconnect_note = "  WARNING: reconnecting the subsystem also failed, so this node may have no "
                         . "NVMe paths until status() repairs them: $conn_err\n";
                 }
+                _nvme_pending_free_clear_if_exported($scfg, $full_ds) if $marked;
                 die "[TrueNAS] refusing to destroy $full_ds: namespace still exported "
                   . "(it could not be deleted even after disconnecting the subsystem; "
                   . "it may be in use by another cluster node).\n  cause: $retry_err"
@@ -12353,6 +12705,7 @@ sub _free_image_nvme {
             _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: skipping disconnect - $active_ns_count other namespaces active");
             # Its delete failed "in use" and the subsystem is shared, so the
             # namespace is still exported: the free stops here.
+            _nvme_pending_free_clear_if_exported($scfg, $full_ds) if $marked;
             die "[TrueNAS] refusing to destroy $full_ds: namespace still exported "
               . "(its delete failed as in use and the subsystem is shared with "
               . "$active_ns_count namespaces, so no disconnect was attempted).\n";
@@ -12386,11 +12739,6 @@ sub _free_image_nvme {
         }
     }
 
-    # 3) Safety check (sync) then defer dataset delete to cleanup_worker.
-    # Same rationale as _free_image_iscsi: hoist the slow pool.dataset.delete
-    # out of the caller's synchronous path so qm destroy returns quickly.
-    _assert_no_child_datasets($scfg, $full_ds);
-
     # 4) Defer udev cleanup after lock release, then reap any orphan
     # namespaces on our subsystem. Under multi-node load a namespace
     # teardown occasionally fails partway (network glitch, TN transient);
@@ -12406,7 +12754,10 @@ sub _free_image_nvme {
     _defer_after_lock(sub {
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image_nvme deferred: udev settle");
         eval { run_command(['udevadm','settle'], outfunc=>sub{}) };
-        eval { _nvme_reap_orphan_namespaces($deferred_scfg) };
+        eval { _nvme_reap_orphan_namespaces($deferred_scfg, $storeid) };
+        for my $pending (@{_nvme_find_pending_free_zvols($deferred_scfg, $storeid)}) {
+            _log($deferred_scfg, 0, 'warning', "[TrueNAS] $pending has a pending-free marker and no namespace; review for manual cleanup");
+        }
     });
 
     # Return cleanup_worker for the slow dataset delete (see _free_image_iscsi
@@ -12416,23 +12767,21 @@ sub _free_image_nvme {
     return sub {
         my $upid = shift;
         eval {
-            _delete_dataset_with_retry($delete_scfg, $delete_full_ds);
+            _assert_nvme_cluster_unreferenced($class, $storeid, $volname, $zname);
+            _assert_no_child_datasets($delete_scfg, $delete_full_ds);
+            eval { _delete_dataset_with_retry($delete_scfg, $delete_full_ds, undef, { verify_gone => 1 }); 1 }
+                or do {
+                    my $err = $@;
+                    die $err unless _is_dataset_absent_error($err);
+                    _confirm_dataset_gone($delete_scfg, $delete_full_ds, $err);
+                };
         };
         if (my $err = $@) {
-            if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
-                # looks gone; make sure before calling it done
-                _confirm_dataset_gone($delete_scfg, $delete_full_ds, $err);
-            } else {
-                # The namespace is already deleted (that happened synchronously
-                # before this worker was handed out), so a failure here leaves
-                # the zvol behind with no namespace: list_images will not show
-                # it. Name it so the operator can remove it by hand.
-                chomp(my $cause = $err);
-                die "Failed to delete dataset $delete_full_ds: $cause\n"
-                  . "The NVMe namespace was already removed, so zvol $delete_full_ds is LEFT BEHIND "
-                  . "(orphaned, not listed by list_images). Delete it manually on TrueNAS "
-                  . "(zfs destroy -r $delete_full_ds) once nothing holds it.\n";
-            }
+            chomp(my $cause = $err);
+            die "Failed to delete dataset $delete_full_ds: $cause\n"
+              . "The NVMe namespace was already removed. The zvol may be LEFT BEHIND "
+              . "(orphaned, not listed by list_images). Check its " . NVME_PENDING_FREE_PROPERTY . " marker "
+              . "and verify it has no references or child datasets before deleting it manually on TrueNAS.\n";
         }
     };
 }
@@ -13584,7 +13933,7 @@ sub _clone_snapshot_zvol {
     my ($scfg, $source_full, $snapname, $clone_full) = @_;
     my $source_snapshot = "$source_full\@$snapname";
 
-    my $clone_result = eval { _tn_dataset_clone($scfg, $source_snapshot, $clone_full) };
+    my $clone_result = eval { _tn_dataset_clone($scfg, $source_snapshot, $clone_full, 1) };
     if (my $err = $@) {
         # Already present from a prior activate - reuse it. Match both the
         # older "dataset already exists" and TN 25.10.x's
@@ -13611,6 +13960,27 @@ sub _clone_snapshot_zvol {
 
     _invalidate_status_capacity_cache(undef, $scfg);
     return;
+}
+
+# The target can silently fail an I/O larger than its undeclared MDTS (#96).
+# A failure on any path, including having no queue to check, blocks exposure.
+sub _nvme_require_request_size_cap {
+    my ($scfg, $volname, $dev) = @_;
+    my $cap_wanted = $scfg->{tn_nvme_max_io_kb} // NVME_DEFAULT_MAX_IO_KB;
+    my (undef, $cap_failed, $cap_total) = eval { _nvme_cap_max_io($scfg, 'activate', $dev) };
+    my $cap_died = $@;
+    if ($cap_died || $cap_failed || ($cap_wanted && !$cap_total)) {
+        my $why = $cap_died ? "the cap call failed: $cap_died"
+                : $cap_failed ? "$cap_failed of $cap_total queue(s) could not be capped (see the warning above)"
+                : "no queue/max_sectors_kb was found for it";
+        chomp $why;
+        _log($scfg, 0, 'err', "[TrueNAS] activate_volume: refusing to expose $dev: $why");
+        die "[TrueNAS] refusing to activate '$volname': the request size cap (tn_nvme_max_io_kb, issue #96) "
+          . "could not be applied to $dev ($why). The target declares no MDTS, so an I/O larger than "
+          . "the cap makes the target fail requests silently and can corrupt or lose data; the disk is "
+          . "therefore not exposed. Check that /sys/block/nvme*/queue/max_sectors_kb is writable "
+          . "(udev rule tools/udev/99-nvme-tcp-max-sectors.rules) and retry.\n";
+    }
 }
 
 # Expose <zvol>@<snapname> as a temporary block device. Returns the device path.
@@ -13701,7 +14071,9 @@ sub _expose_snapshot_device {
             _nvme_connect($scfg);
             eval { _nvme_rescan_subsystem_controllers($scfg) };
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
-            return _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
+            my $snapshot_dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
+            _nvme_require_request_size_cap($scfg, "$volname\@$snapname", $snapshot_dev);
+            return $snapshot_dev;
 
         } else {
             die "Unknown transport mode: $mode\n";
@@ -13972,30 +14344,9 @@ sub activate_volume {
         }
 
         # The device is about to carry I/O: cap it before qemu-img or QEMU opens
-        # it, and do not expose it if the cap did not take. An I/O larger than
-        # the target's (undeclared) MDTS is failed silently by the target and
-        # has already lost data (#96), so a device that could not be capped is
-        # worse than no device. Kept outside the locate eval above so the error
-        # does not read as "device not found". No cap configured ->
-        # _nvme_cap_max_io returns (0,0,0) and nothing changes. A died call is
-        # a failure too, and so is a cap that is set but found no writable
-        # max_sectors_kb for the device at all (total 0): nothing was capped,
-        # so nothing is known to be safe.
-        my $cap_wanted = $scfg->{tn_nvme_max_io_kb} // NVME_DEFAULT_MAX_IO_KB;
-        my ($cap_changed, $cap_failed, $cap_total) = eval { _nvme_cap_max_io($scfg, 'activate', $dev) };
-        my $cap_died = $@;
-        if ($cap_died || $cap_failed || ($cap_wanted && !$cap_total)) {
-            my $why = $cap_died ? "the cap call failed: $cap_died"
-                    : $cap_failed ? "$cap_failed of $cap_total queue(s) could not be capped (see the warning above)"
-                    : "no queue/max_sectors_kb was found for it";
-            chomp $why;
-            _log($scfg, 0, 'err', "[TrueNAS] activate_volume: refusing to expose $dev: $why");
-            die "[TrueNAS] refusing to activate '$volname': the request size cap (tn_nvme_max_io_kb, issue #96) "
-              . "could not be applied to $dev ($why). The target declares no MDTS, so an I/O larger than "
-              . "the cap makes the target fail requests silently and can corrupt or lose data; the disk is "
-              . "therefore not exposed. Check that /sys/block/nvme*/queue/max_sectors_kb is writable "
-              . "(udev rule tools/udev/99-nvme-tcp-max-sectors.rules) and retry.\n";
-        }
+        # it. Keep this outside the locate eval so a cap failure is reported
+        # with its own cause.
+        _nvme_require_request_size_cap($scfg, $volname, $dev);
     }
 
     return 1;
@@ -15213,7 +15564,10 @@ sub cluster_lock_storage {
     # upstream's bypass.
     my $result;
     if ($scfg->{tn_use_cluster_lock} // 1) {
-        $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $wrapped, @param);
+        $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, sub {
+            local $_storage_lock_held{$storeid} = 1 if $shared;
+            return $wrapped->(@_);
+        }, @param);
     } else {
         $result = $wrapped->(@param);
     }
